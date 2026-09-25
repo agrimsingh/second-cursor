@@ -266,14 +266,20 @@ final class ExtensionLink: @unchecked Sendable {
         return Array(active.keys)
     }
 
-    func closeSession(_ params: [String: Any]) async {
-        let ids = instanceIDs()
-        for id in ids {
+    /// Sends a session-wide method to every connected browser; unreachable ones are skipped.
+    func broadcast(_ method: String, _ params: [String: Any], timeout: TimeInterval = 60) async -> [[String: Any]] {
+        var replies: [[String: Any]] = []
+        for id in instanceIDs() {
             var context = Execution.context
             context.browserID = id
             context.sessionID = params["session_id"] as? String ?? context.sessionID
-            _ = try? await Execution.$context.withValue(context) { try await call("session.close", params) }
+            if let reply = try? await Execution.$context.withValue(context, operation: {
+                try await call(method, params, timeout: timeout)
+            }) {
+                replies.append(reply)
+            }
         }
+        return replies
     }
 
     private func promote(_ connection: Connection, message: [String: Any]) {

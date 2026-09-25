@@ -49,7 +49,7 @@ enum Pointer {
                 else { return }
                 stamp(event, pid: pid, wid: wid, location: location, clickState: clickState, buttonNumber: 0, group: group)
                 event.flags = flags
-                SkyLight.post(event, to: pid, authenticated: false)
+                postBoth(event, pid: pid)
                 usleep(delayMs * 1000)
             }
             post(.mouseMoved, from, clickState: 0, delayMs: 15)
@@ -66,12 +66,14 @@ enum Pointer {
         }
     }
 
+    /// SkyLight delivery is asynchronous: the target needs ~40 ms to take its synthetic focus, and keeps
+    /// it ~100 ms after the last event so Chromium's renderer hop consumes the mouse-up before it goes.
     private static func withFocus(pid: pid_t, wid: CGWindowID, _ body: () -> Void) {
         let handoff = SkyLight.focusWithoutRaise(pid: pid, wid: wid)
-        if handoff != nil { usleep(50_000) }
+        if handoff != nil { usleep(40_000) }
         body()
         if let handoff {
-            usleep(50_000)
+            usleep(100_000)
             SkyLight.restore(handoff)
         }
     }
@@ -99,7 +101,7 @@ enum Pointer {
             stamp(event, pid: pid, wid: wid, location: step.location, clickState: step.clickState, buttonNumber: 0, group: group)
             SkyLight.setField(event, Field.mouseEventNumber, step.phase)
             event.flags = step.location.screen == offscreen.screen ? [] : flags
-            SkyLight.post(event, to: pid, authenticated: false)
+            postBoth(event, pid: pid)
             if step.delayMs > 0 { usleep(step.delayMs * 1000) }
         }
     }

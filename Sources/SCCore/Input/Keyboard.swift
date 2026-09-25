@@ -27,8 +27,8 @@ enum Keyboard {
             "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34,
             "p": 35, "l": 37, "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45, "m": 46,
             ".": 47, "`": 50,
-            "kp_0":82,"kp_1":83,"kp_2":84,"kp_3":85,"kp_4":86,"kp_5":87,"kp_6":88,"kp_7":89,"kp_8":91,"kp_9":92,
-            "kp_enter":76,"kp_add":69,"kp_subtract":78,"kp_multiply":67,"kp_divide":75,"kp_decimal":65,
+            "kp0":82,"kp1":83,"kp2":84,"kp3":85,"kp4":86,"kp5":87,"kp6":88,"kp7":89,"kp8":91,"kp9":92,
+            "kpenter":76,"kpadd":69,"kpsubtract":78,"kpmultiply":67,"kpdivide":75,"kpdecimal":65,
             "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "backspace": 51,
             "escape": 53, "esc": 53, "forwarddelete": 117, "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
             "left": 123, "right": 124, "down": 125, "up": 126,
@@ -45,10 +45,21 @@ enum Keyboard {
         "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\", ":": ";", "\"": "'", "<": ",", ">": ".", "?": "/", "~": "`",
     ]
 
+    /// X11 keysym spellings (xdotool, OpenAI computer-use) that differ from the names above. xdotool's
+    /// "Delete" is forward delete, but "delete" keeps the macOS meaning (backspace) here.
+    private static let aliases: [String: String] = ["prior": "pageup", "next": "pagedown"]
+
+    /// Names are case-insensitive, and `_`/`-` inside a multi-character name are ignored ("Page_Down", "KP_Enter").
+    private static func normalized(_ name: String) -> String {
+        var name = name.trimmingCharacters(in: .whitespaces).lowercased()
+        if name.count > 1 { name.removeAll { $0 == "_" || $0 == "-" } }
+        return aliases[name] ?? name
+    }
+
     static func flags(_ names: [String]) throws -> CGEventFlags {
         var flags: CGEventFlags = []
         for name in names {
-            guard let flag = modifierFlags[name.trimmingCharacters(in: .whitespaces).lowercased()] else {
+            guard let flag = modifierFlags[normalized(name)] else {
                 throw SCError.invalidArgument("Unknown modifier \"\(name)\"; use cmd, shift, alt, ctrl or fn")
             }
             flags.insert(flag)
@@ -56,10 +67,10 @@ enum Keyboard {
         return flags
     }
 
-    /// Parses `+`-separated chords such as "cmd+shift+t", "return", "cmd++".
+    /// Parses `+`-separated chords such as "cmd+shift+t", "return", "cmd++", "super+Page_Down".
     static func parse(_ keys: String) throws -> KeyChord {
         let trimmed = keys.trimmingCharacters(in: .whitespaces).lowercased()
-        var tokens = trimmed.split(separator: "+", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+        var tokens = trimmed.split(separator: "+", omittingEmptySubsequences: false).map { normalized(String($0)) }
         if trimmed == "+" || trimmed.hasSuffix("++") {
             tokens.removeLast(2)
             tokens.append("+")
@@ -82,7 +93,7 @@ enum Keyboard {
             || key.hasPrefix("f") && key.count > 1 {
             flags.insert(.maskSecondaryFn)
         }
-        if key.hasPrefix("kp_") { flags.insert(.maskNumericPad) }
+        if key.hasPrefix("kp") { flags.insert(.maskNumericPad) }
         if ["up", "down", "left", "right"].contains(key) { flags.insert(.maskNumericPad) }
         return KeyChord(keyCode: code, flags: flags, key: key)
     }

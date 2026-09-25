@@ -16,6 +16,7 @@ final class ToolRouter: Sendable {
     let agentDisplay: AgentDisplayControlling
     let browser: BrowserControlling
     let appGuard: AppGuard
+    let appApprovals: AppApprovals
     let log = ActionLog()
     let sessions: Sessions
     let connectionCount: @Sendable () -> Int
@@ -30,6 +31,7 @@ final class ToolRouter: Sendable {
         self.agentDisplay = agentDisplay
         self.browser = browser
         self.appGuard = AppGuard(config: config)
+        self.appApprovals = AppApprovals(config: config)
         self.sessions = Sessions(
             claimIdleSeconds: config.claimIdleSeconds ?? 300,
             retentionSeconds: config.operationRetentionSeconds ?? 3600)
@@ -42,9 +44,12 @@ final class ToolRouter: Sendable {
         if name == "browser_command", let nested = raw.removeValue(forKey: "arguments")?.objectValue {
             raw.merge(nested) { envelope, _ in envelope }
         }
-        let args = Arguments(raw)
+        // A retry is identified by what the client sent, not by the window an app name resolved to.
+        let requested = raw
         do {
             guard Self.toolNames.contains(name) else { throw SCError.invalidArgument("Unknown tool: \(name)") }
+            raw = try await resolveAppTarget(name, raw)
+            let args = Arguments(raw)
             let session = try args.optionalString("session_id") ?? "legacy"
             if name == "session" {
                 switch try args.string("action") {
@@ -53,6 +58,7 @@ final class ToolRouter: Sendable {
                 case "close":
                     sessions.close(session)
                     desktop.closeSession(session)
+                    appApprovals.clear(session: session)
                     let payload = try JSONSerialization.data(withJSONObject: ["session_id": session])
                     _ = try? await browser.command("session.close", params: payload)
                     return Self.success(ToolOutput(json: ["closed": true]))
@@ -67,7 +73,7 @@ final class ToolRouter: Sendable {
                 return Self.success(ToolOutput(json: info))
             }
             if name == "bind_target" {
-                return try await bindTarget(args, session: session)
+                return try await bindTarget(args, session: session, deadline: receivedAt.addingTimeInterval(60))
             }
             let timeout = Double(min(60_000, max(1, try args.int("timeout_ms", default: 60_000)))) / 1000
             let deadline = receivedAt.addingTimeInterval(timeout)
@@ -75,35 +81,40 @@ final class ToolRouter: Sendable {
             let id = suppliedID ?? UUID().uuidString
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
-            let signature = name + String(decoding: try encoder.encode(Value.object(raw)), as: UTF8.self)
+            let signature = name + String(decoding: try encoder.encode(Value.object(requested)), as: UTF8.self)
             let (operation, fresh) = try sessions.reserve(
                 id: id, session: session, signature: signature, deadline: deadline, retain: suppliedID != nil)
             if !fresh {
                 if let output = sessions.output(operation) { return Self.success(output) }
                 return Self.success(ToolOutput(json: try sessions.info(id, session: session)))
             }
+            var admitted = false
             do {
                 let owner = try await checkGates(name, args)
                 var configuredTools = [name]
                 if name == "batch" {
                     configuredTools += try args.objects("steps").compactMap { $0["tool"]?.stringValue?.lowercased() }
                 }
-                var approvals = Set(configuredTools).intersection(appGuard.config.confirmationRequiredTools)
-                let browserApprovals = name == "browser_command" ? try BrowserPolicy.approvals(raw) : []
-                approvals.formUnion(browserApprovals.map { "browser.\($0)" })
-                if !approvals.isEmpty {
-                    let allowed = await Approval.request(
-                        tool: approvals.sorted().joined(separator: ", "),
-                        target:
-                            "session=\(session); browser=\(try args.optionalString("browser_id") ?? "default"); \(args.logTarget ?? "")",
-                        deadline: deadline,
-                        stillAllowed: { [sessions] in sessions.mayApprove(operation) })
-                    guard allowed, sessions.mayApprove(operation) else {
-                        throw SCError.notAllowed("Local approval denied, cancelled, or expired; nothing was dispatched")
-                    }
+                var grants = Set(configuredTools).intersection(appGuard.config.confirmationRequiredTools).sorted().map {
+                    ApprovalGrant(
+                        title: "Allow Second Cursor to \($0.replacingOccurrences(of: "_", with: " "))?",
+                        summary: $0.replacingOccurrences(of: "_", with: " "), detail: "Just this once.")
                 }
-                // Record admission only after approval. Denials are recorded separately below.
+                let browserApprovals = name == "browser_command" ? try BrowserPolicy.approvals(raw) : []
+                if !browserApprovals.isEmpty {
+                    let page = appApprovals.mode == .prompt ? await browserPage(args, session: session, deadline: deadline) : nil
+                    grants += browserApprovals.sorted().map { BrowserPolicy.grant($0, args, page: page) }
+                }
+                var app = try await appNeedingApproval(name, args, owner: owner)
+                if let target = app, appApprovals.isApproved(target, session: session) { app = nil }
+                if app != nil || !grants.isEmpty {
+                    try await approve(
+                        ApprovalRequest(app: app, grants: grants, session: session),
+                        deadline: deadline, stillAllowed: { [sessions] in sessions.mayApprove(operation) })
+                }
+                // Record admission only after approval. Refusals are recorded once below.
                 _ = try await admit(name, args)
+                admitted = true
                 let mutating = ToolCatalog.actionTools.contains(name)
                 let target = mutating ? try args.optionalInt("window_id").map { "window:\($0)" } : nil
                 let context = ExecutionContext(
@@ -123,6 +134,7 @@ final class ToolRouter: Sendable {
                                 : try await self.runDesktop(name, args, owner: owner)
                         }
                         if suppliedID != nil { result.json["operation_id"] = id }
+                        self.noteObservation(name, args, owner: owner, output: result, session: session)
                         self.sessions.finish(operation, result: result, error: nil)
                         return result
                     } catch {
@@ -135,12 +147,15 @@ final class ToolRouter: Sendable {
                 sessions.keepForReconciliation(operation)
                 return Self.failure(
                     SCError.actionFailed(
-                        "Call deadline exceeded [operation_id=\(id); reconcile with operation_status]"))
+                        "Call deadline exceeded; the target app may be busy or hung. Check get_window_state before retrying. [operation_id=\(id); reconcile with operation_status]"
+                    ))
             } catch {
                 sessions.finish(operation, result: nil, error: Self.message(for: error))
-                log.record(
-                    ActionLogEntry(
-                        tool: name, target: args.logTarget, detail: "refused or failed: \(Self.message(for: error))"))
+                // Each logged call gets exactly one line: its admission, or this refusal.
+                if !admitted && Self.isLogged(name, args) {
+                    log.record(
+                        ActionLogEntry(tool: name, target: args.logTarget, detail: "refused: \(Self.message(for: error))"))
+                }
                 return Self.failure(error)
             }
         } catch {
@@ -148,7 +163,7 @@ final class ToolRouter: Sendable {
         }
     }
 
-    private func bindTarget(_ args: Arguments, session: String) async throws -> CallTool.Result {
+    private func bindTarget(_ args: Arguments, session: String, deadline: Date) async throws -> CallTool.Result {
         let target = try args.string("target")
         guard target.hasPrefix("window:"), let windowID = UInt32(target.dropFirst(7)) else {
             throw SCError.invalidArgument("Native target must be window:<id>")
@@ -156,8 +171,17 @@ final class ToolRouter: Sendable {
         if try args.optionalString("action") == "release" {
             sessions.release(target, session: session)
         } else {
-            _ = try appGuard.checkWindow(windowID)
+            var owner = try appGuard.checkWindow(windowID)
             if PauseState.isPaused { throw SCError.paused }
+            let app = appApprovals.appApprovalRequired ? AppGuard.windowTarget(owner) : nil
+            if let app, !appApprovals.isApproved(app, session: session) {
+                try await approve(
+                    ApprovalRequest(app: app, grants: [], session: session),
+                    deadline: deadline, stillAllowed: { [sessions] in (try? sessions.validate(session)) != nil })
+                // The user may have paused, or the window may have closed, while the prompt was up.
+                owner = try appGuard.checkWindow(windowID)
+                if PauseState.isPaused { throw SCError.paused }
+            }
             try sessions.claim(target, session: session)
             let snapshot = try await Self.withTimeout(seconds: 60, tool: "bind_target") {
                 try await Execution.$context.withValue(ExecutionContext(sessionID: session)) {
@@ -165,6 +189,7 @@ final class ToolRouter: Sendable {
                         windowID: windowID, options: SnapshotOptions(includeScreenshot: false))
                 }
             }
+            noteObserved(windowID, owner: owner, session: session)
             return Self.success(
                 ToolOutput(json: [
                     "target": target, "session_id": session, "observation": await snapshotJSON(snapshot),
@@ -173,23 +198,74 @@ final class ToolRouter: Sendable {
         return Self.success(ToolOutput(json: ["target": target, "session_id": session]))
     }
 
-    /// Checks the pause and blocked-app gates, then writes the action log line.
-    /// Refused calls are logged too, so the log accounts for every attempted action.
+    /// Rechecks the pause and blocked-app gates (the user may have acted during approval), then writes
+    /// the action log line. `call` logs refusals, so the log accounts for every attempted action.
     private func admit(_ name: String, _ args: Arguments) async throws -> WindowOwner? {
-        let logged =
-            name == "browser_command" || ToolCatalog.actionTools.contains(name)
-            || (name == "agent_display" && (try? args.string("action"))?.lowercased() != "status")
-        do {
-            let owner = try await checkGates(name, args)
-            if logged { log.record(ActionLogEntry(tool: name, target: args.logTarget, detail: args.logDetail)) }
-            return owner
-        } catch {
-            if logged {
-                log.record(
-                    ActionLogEntry(tool: name, target: args.logTarget, detail: "refused: \(Self.message(for: error))"))
-            }
-            throw error
+        let owner = try await checkGates(name, args)
+        if Self.isLogged(name, args) {
+            log.record(ActionLogEntry(tool: name, target: args.logTarget, detail: args.logDetail))
         }
+        return owner
+    }
+
+    /// The action log covers state-changing calls only.
+    private static func isLogged(_ name: String, _ args: Arguments) -> Bool {
+        name == "browser_command" || ToolCatalog.actionTools.contains(name)
+            || (name == "agent_display" && (try? args.string("action"))?.lowercased() != "status")
+    }
+
+    /// The app a call would read or operate, when per-app approval applies to it.
+    private func appNeedingApproval(_ name: String, _ args: Arguments, owner: WindowOwner?) async throws -> AppTarget? {
+        guard appApprovals.appApprovalRequired else { return nil }
+        if name == "launch_app" {
+            return try await AppGuard.launchTarget(try args.string("app")) { [desktop] in
+                await desktop.listApps(includeNotRunning: true)
+            }
+        }
+        guard ToolCatalog.windowScopedTools.contains(name), let owner else { return nil }
+        return AppGuard.windowTarget(owner)
+    }
+
+    /// Host and title of the tab a browser prompt is about. Best effort: a prompt without them still works.
+    private func browserPage(_ args: Arguments, session: String, deadline: Date) async -> BrowserPage? {
+        guard let tabID = (try? args.optionalInt("tab_id")) ?? nil,
+            let params = try? JSONSerialization.data(withJSONObject: ["tabId": tabID])
+        else { return nil }
+        let context = ExecutionContext(
+            sessionID: session, browserID: (try? args.optionalString("browser_id")) ?? nil, deadline: deadline)
+        guard let data = try? await Execution.$context.withValue(context, operation: {
+                try await browser.command("tab.info", params: params)
+            }),
+            let info = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return nil }
+        return BrowserPage(url: info["url"] as? String, title: info["title"] as? String)
+    }
+
+    private func approve(
+        _ request: ApprovalRequest, deadline: Date, stillAllowed: @escaping @Sendable () -> Bool
+    ) async throws {
+        guard await appApprovals.authorize(request, deadline: deadline, stillAllowed: stillAllowed), stillAllowed()
+        else {
+            throw SCError.notAllowed("Local approval denied, cancelled, or expired; nothing was dispatched")
+        }
+    }
+
+    /// Called after every assistant turn. The session's next read of each window is full again, `app` must be
+    /// observed again before acting by name, its "Allow for this session" app approvals lapse (including one
+    /// answered after this point on a prompt already showing), and personal tabs it claimed are released (tabs
+    /// the agent opened stay open). The session itself stays open, and work already in flight is not cancelled.
+    func endTurn(session: String) async -> [String: Any] {
+        desktop.closeSession(session)
+        sessions.forgetObservations(session: session)
+        let cleared = appApprovals.clear(session: session)
+        var released = 0
+        if let params = try? JSONSerialization.data(withJSONObject: ["session_id": session]),
+            let data = try? await browser.command("session.end_turn", params: params),
+            let reply = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        {
+            released = (reply["released_tabs"] as? NSNumber)?.intValue ?? 0
+        }
+        return ["ok": true, "session_id": session, "released_tabs": released, "cleared_app_approvals": cleared]
     }
 
     private func checkGates(_ name: String, _ args: Arguments) async throws -> WindowOwner? {

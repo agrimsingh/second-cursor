@@ -83,8 +83,10 @@ extension ToolRouter {
             return ToolOutput(json: Shape.screenshot(shot), images: [shot])
 
         case "browser_close":
-            try await browser.closeTab(tabID: try args.int("tab_id"))
-            return ToolOutput(json: Shape.ok)
+            let params = try JSONSerialization.data(withJSONObject: ["tabId": try args.int("tab_id")])
+            let reply = try JSONSerialization.jsonObject(with: await browser.command("tabs.close", params: params))
+                as? [String: Any] ?? [:]
+            return ToolOutput(json: Shape.ok.merging(reply) { $1 })
 
         default:
             throw SCError.invalidArgument("Unknown tool \"\(name)\"")

@@ -1,32 +1,59 @@
 #!/usr/bin/env python3
 """End-to-end suite for Second Cursor.
 
-Drives the running app over MCP HTTP exactly like a client would, checks results through the
-tools themselves, and checks the "never interrupt the user" invariants with an independent observer.
+Drives the app over MCP HTTP exactly like a client would, checks results through the tools
+themselves, and checks the "never interrupt the user" invariants with an independent observer.
+By default every suite runs against a fresh, disposable test instance (see TestInstance) launched
+from the installed bundle with its own SC_HOME, port, token and config; the user's running app and
+config are never read, written or restarted.
 
-Usage:  e2e/run.py [scenario ...]        (default: every scenario, in order)
-Output: e2e/artifacts/<run-id>/report.md, results.json, transcript.jsonl, screenshots/
+Usage:  e2e/run.py [scenario ...] [--installed] [--browser | --no-browser]
+        --installed    target the user's running app and config instead (also SC_E2E_TARGET=installed)
+        --browser      always start the isolated test browser (default: only when a selected scenario
+                       uses browser tools); --no-browser never starts it
+        --approvals    human-attended only: the test instance uses "approvals": "prompt" and may show real
+                       approval dialogs (default "allow"; scenarios may override to "deny")
+        SC_E2E_APP=build/SecondCursor.app   launch test instances from another bundle
+Output: e2e/artifacts/<run-id>/report.md, results.json, transcript.jsonl, screenshots/, instance/ (app logs)
 """
+import atexit
 import base64
 import datetime
 import http.server
+import importlib.util
+import inspect
 import json
 import os
 import pathlib
 import re
+import secrets
+import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
 
+# `from run import ...` inside scenarios must see this module's rebound globals even when run.py is __main__.
+sys.modules.setdefault("run", sys.modules[__name__])
+
 ROOT = pathlib.Path(__file__).resolve().parent
+INSTALLED_APP = pathlib.Path.home() / "Applications/SecondCursor.app"
+APP_BUNDLE = pathlib.Path(os.environ.get("SC_E2E_APP") or INSTALLED_APP).expanduser().resolve()
+APP_BINARY = APP_BUNDLE / "Contents/MacOS/SecondCursor"
+# The user's instance. Run rebinds both to the test instance's files, so scenarios can keep using them.
 CONFIG_PATH = pathlib.Path.home() / "Library/Application Support/SecondCursor/config.json"
 ACTION_LOG = pathlib.Path.home() / "Library/Logs/SecondCursor/actions.jsonl"
-APP_BINARY = pathlib.Path.home() / "Applications/SecondCursor.app/Contents/MacOS/SecondCursor"
+# Mirrors SCConfig.defaultBlockedBundleIDs.
+DEFAULT_BLOCKED_BUNDLE_IDS = [
+    "com.apple.keychainaccess", "com.agilebits.onepassword7", "com.1password.1password",
+    "com.apple.systempreferences", "com.apple.preference.security",
+]
 PROTOCOL_VERSION = "2025-06-18"
 
 EXPECTED_TOOLS = {
@@ -51,8 +78,8 @@ class Skip(Exception):
 
 
 class MCP:
-    def __init__(self, url, token, transcript):
-        self.url, self.token, self.transcript = url, token, transcript
+    def __init__(self, url, token, transcript=None, timeout=90):
+        self.url, self.token, self.transcript, self.timeout = url, token, transcript, timeout
         self.next_id = 1
         self.lock = threading.Lock()
         self.protocol = PROTOCOL_VERSION
@@ -68,7 +95,7 @@ class MCP:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(self.url, data=json.dumps(payload).encode(), headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return resp.status, resp.headers.get("Content-Type", ""), resp.read().decode()
         except urllib.error.HTTPError as e:
             return e.code, e.headers.get("Content-Type", ""), e.read().decode(errors="replace")
@@ -81,7 +108,8 @@ class MCP:
         started = time.time()
         status, ctype, body = self.raw(payload)
         message = parse_body(ctype, body)
-        self.transcript.write(payload, message, status, time.time() - started)
+        if self.transcript:
+            self.transcript.write(payload, message, status, time.time() - started)
         if status != 200 or message is None:
             raise ToolError(f"HTTP {status}: {body[:300]}")
         if "error" in message:
@@ -151,6 +179,225 @@ def observe():
         binary.parent.mkdir(exist_ok=True)
         subprocess.run(["swiftc", "-O", str(source), "-o", str(binary)], check=True, capture_output=True)
     return json.loads(subprocess.run([str(binary)], check=True, capture_output=True, text=True).stdout)
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def terminate(pid, grace=15):
+    """SIGTERM gives the app time to return hosted windows; SIGKILL if it hangs."""
+    for sig, seconds in ((signal.SIGTERM, grace), (signal.SIGKILL, 3)):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return
+        deadline = time.time() + seconds
+        while alive(pid) and time.time() < deadline:
+            time.sleep(0.1)
+        if not alive(pid):
+            return
+
+
+def tail(path, lines=20):
+    try:
+        return "\n".join(pathlib.Path(path).read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return ""
+
+
+def load_start_browser():
+    spec = importlib.util.spec_from_file_location("start_browser", ROOT / "start-browser.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestInstance:
+    """A disposable Second Cursor instance: its own SC_HOME, a free localhost port, a random token and a
+    fresh config, launched from an app bundle through LaunchServices so it keeps the bundle's TCC identity.
+    It never reads or writes the user's config, logs or pause flag, and stop() only signals the process
+    that was launched with its SC_HOME. The constructor starts it and returns once MCP initialize works.
+    Config defaults to "approvals": "allow" and "appApproval": "off" so no approval UI can appear;
+    "approvals": "deny" is allowed, "prompt" only with the --approvals flag.
+
+        with TestInstance({"claimIdleSeconds": 2}, browser=True) as app:
+            app.mcp.call("status")
+            subprocess.run([app.binary, "--pause"], env=app.env)
+    """
+
+    def __init__(self, config_overrides=None, app=None, browser=False, timeout=30):
+        self.app = pathlib.Path(app or APP_BUNDLE).expanduser().resolve()
+        self.binary = self.app / "Contents/MacOS/SecondCursor"
+        self.overrides = dict(config_overrides or {})
+        self.want_browser, self.timeout = browser, timeout
+        self.home = self.pid = self.port = self.token = self.url = self.mcp = self.config = self.browser = None
+        self.started = False
+        self.start()
+
+    @property
+    def config_path(self):
+        return self.home / "config.json"
+
+    @property
+    def action_log(self):
+        return self.home / "logs/actions.jsonl"
+
+    @property
+    def base_url(self):
+        return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def env(self):
+        """Environment for subprocesses (CLI flags, SDK, native host) that must reach this instance."""
+        return {**os.environ, "SC_HOME": str(self.home)}
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+
+    def start(self):
+        if self.started:
+            return self
+        self.started = True
+        # Tests must never show UI: "prompt" (also the app's default for a missing value) opens real approval
+        # dialogs, so only a human running with --approvals may ask for it.
+        approvals = self.overrides.get("approvals", "allow")
+        if approvals not in ("allow", "deny") and "--approvals" not in sys.argv:
+            raise RuntimeError(f'approvals={approvals!r} can show approval dialogs; use "allow" or "deny", '
+                               "or run with --approvals")
+        if not self.binary.exists():
+            raise RuntimeError(f"{self.binary} not found; build or install the app first")
+        # Short on purpose: the browser socket lives here and Unix socket paths cap at 104 bytes.
+        self.home = pathlib.Path(tempfile.mkdtemp(prefix="sc-e2e-", dir="/tmp"))
+        atexit.register(self.stop)
+        if threading.current_thread() is threading.main_thread() and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
+        self.config = {"port": free_port(), "token": secrets.token_hex(16), "blockedBundleIDs": DEFAULT_BLOCKED_BUNDLE_IDS,
+                       "confirmationRequiredTools": [], "appApproval": "off", "approvals": "allow", **self.overrides}
+        self.port, self.token = self.config["port"], self.config["token"]
+        self.url = f"{self.base_url}/mcp"
+        self.mcp = MCP(self.url, self.token, timeout=5)
+        self.config_path.write_text(json.dumps(self.config, indent=2))
+        logs = self.home / "logs"
+        logs.mkdir()
+        for name in ("stdout.log", "stderr.log"):
+            (logs / name).touch()
+        launched = subprocess.run(
+            ["open", "-n", "-g", "--env", f"SC_HOME={self.home}", "--stdout", str(logs / "stdout.log"),
+             "--stderr", str(logs / "stderr.log"), "-a", str(self.app)],
+            capture_output=True, text=True,
+        )
+        if launched.returncode:
+            self._fail(f"open failed: {launched.stderr.strip()}")
+        deadline, last = time.time() + self.timeout, None
+        while True:
+            self.pid = self._pid_file() or self.pid
+            if self.pid and not alive(self.pid):
+                self._fail(f"pid {self.pid} exited during startup")
+            try:
+                self.mcp.initialize()
+                break
+            except (OSError, ToolError) as e:
+                last = e
+            if time.time() > deadline:
+                self._fail(f"no answer to MCP initialize on {self.url} within {self.timeout}s ({last})")
+            time.sleep(0.25)
+        self.pid = self._pid_file() or self.pid
+        self.mcp.timeout = 90
+        if self.want_browser:
+            try:
+                self.start_browser()
+            except Exception:
+                self.stop()
+                raise
+        return self
+
+    def start_browser(self, timeout=45):
+        """Starts an isolated headless Chrome for Testing whose extension reaches this instance, and waits
+        until the instance reports the connection."""
+        if self.browser is None:
+            self.browser = load_start_browser().launch(sc_home=self.home, app=self.app)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.browser.running():
+                raise RuntimeError(f"test browser exited during startup:\n{tail(self.browser.log)}")
+            if self.browser_connected():
+                return self.browser
+            time.sleep(0.5)
+        raise RuntimeError(f"extension did not connect to the test instance within {timeout}s:\n{tail(self.browser.log)}")
+
+    def browser_connected(self):
+        for tool, key in (("browser_instances", "browsers"), ("browser_status", "connected")):
+            try:
+                return bool(self.mcp.call(tool)[0].get(key))
+            except ToolError:
+                continue
+        return False
+
+    def stop(self, keep_logs=None):
+        """Stops the browser and the app, optionally copies the app's logs to `keep_logs`, deletes SC_HOME.
+        Idempotent; also runs at exit."""
+        if self.home is None:
+            return
+        if self.browser:
+            try:
+                if keep_logs:
+                    pathlib.Path(keep_logs).mkdir(parents=True, exist_ok=True)
+                    shutil.copy(self.browser.log, pathlib.Path(keep_logs) / "browser.log")
+                self.browser.stop()
+            except Exception as e:
+                print(f"warning: could not stop the test browser: {e}", file=sys.stderr)
+            self.browser = None
+        pids = set(self._launched_pids())
+        pid = self._pid_file() or self.pid
+        if pid and alive(pid) and "Contents/MacOS/SecondCursor" in self._command(pid):
+            pids.add(pid)
+        for pid in pids:
+            terminate(pid)
+        if keep_logs and (self.home / "logs").exists():
+            shutil.copytree(self.home / "logs", keep_logs, dirs_exist_ok=True)
+        shutil.rmtree(self.home, ignore_errors=True)
+        self.home = None
+
+    def _pid_file(self):
+        try:
+            return int((self.home / "instance.pid").read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _command(self, pid):
+        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+
+    def _launched_pids(self):
+        """App processes started with this SC_HOME, found through their environment, so a bundle that
+        ignores SC_HOME (and never writes instance.pid) is still stopped."""
+        marker = f" SC_HOME={self.home} "
+        listing = subprocess.run(["ps", "-Eww", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+        return [int(line.split(None, 1)[0]) for line in listing.splitlines()
+                if "Contents/MacOS/SecondCursor" in line and marker in line + " "]
+
+    def _fail(self, reason):
+        logs = "\n".join(f"--- {p.name}:\n{tail(p)}" for p in sorted((self.home / "logs").glob("*.log")) if tail(p))
+        hint = "" if self.pid or self._pid_file() else (
+            f"\n{self.app} never wrote instance.pid; if it predates SC_HOME support it exits because the user's app "
+            "holds the instance lock. Install a current build, or set SC_E2E_APP=build/SecondCursor.app.")
+        self.stop()
+        raise RuntimeError(f"test instance from {self.app} did not start: {reason}{hint}\n{logs}".rstrip())
 
 
 class Context:
@@ -235,6 +482,17 @@ def scenario(fn):
     return fn
 
 
+BROWSER_TOOLS = re.compile(r"""["']browser_\w+["']""")
+
+
+def uses_browser(fn):
+    """Scenarios whose source names a browser_* tool get the isolated test browser started for them."""
+    try:
+        return bool(BROWSER_TOOLS.search(inspect.getsource(fn)))
+    except (OSError, TypeError):
+        return False
+
+
 @scenario
 def server_auth(ctx):
     init = {"jsonrpc": "2.0", "id": 0, "method": "initialize",
@@ -284,7 +542,9 @@ def textedit_background(ctx):
     ctx.call("type_text", window_id=wid, text=" gamma", element_index=area)
     ctx.check("type_text inserted text", "gamma" in ctx.tree(wid, include_screenshot=False))
 
-    ctx.call("press_key", window_id=wid, keys="cmd+a")
+    pressed = ctx.call("press_key", window_id=wid, keys="cmd+a")
+    ctx.check("cmd+a pressed the Select All menu item and the app confirmed it",
+              pressed.get("route") == "ax_menu_shortcut" and pressed.get("verified") is True, pressed)
     ctx.call("type_text", window_id=wid, text="replaced")
     tree = ctx.tree(wid)
     ctx.check("cmd+a chord selected all, typing replaced the selection", 'value="replaced"' in tree, tree[:400])
@@ -516,7 +776,8 @@ def agent_cursor_visible(ctx):
     wid = window["id"]
     _, frame = text_area(ctx, wid)
     local = (frame[0] + 3, frame[1] + 6)
-    ctx.call("click", window_id=wid, x=local[0], y=local[1])
+    # The arrow fades soon after the click; waiting for a post-action observation could miss it.
+    ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none")
 
     screen_x, screen_y = window["frame"]["x"] + local[0], window["frame"]["y"] + local[1]
     region = ctx.run.dir / "screenshots" / f"{ctx.name}-around-click.png"
@@ -542,12 +803,16 @@ def tree_diffs(ctx):
     base_id = full["snapshot_id"]
     full_len = len(full["tree"])
 
-    ctx.call("set_value", window_id=wid, element_index=area, value="alpha beta gamma")
-    diff = ctx.call("get_window_state", window_id=wid, include_screenshot=False)
-    ctx.check("second snapshot defaults to a diff", diff.get("is_diff"), diff)
+    acted = ctx.call("set_value", window_id=wid, element_index=area, value="alpha beta gamma")
+    diff = acted.get("observation") or {}
+    ctx.check("the set_value result itself carries a diff observation", diff.get("is_diff"), acted)
+    ctx.check("action result names the window it acted on", acted.get("window_id") == wid, acted)
     ctx.check("diff names the snapshot it is based on", diff.get("diff_base") == base_id, diff.get("diff_base"))
-    ctx.check("diff shows the changed value as an added line", re.search(r'^\+.*value="alpha beta gamma"', diff["tree"], re.M), diff["tree"][:400])
-    ctx.check("diff is much smaller than the full tree", len(diff["tree"]) < full_len, (len(diff["tree"]), full_len))
+    ctx.check("diff shows the changed value as an added line", re.search(r'^\+.*value="alpha beta gamma"', diff.get("tree", ""), re.M), diff.get("tree", "")[:400])
+    ctx.check("diff is much smaller than the full tree", len(diff.get("tree", "")) < full_len, (len(diff.get("tree", "")), full_len))
+    after = ctx.call("get_window_state", window_id=wid, include_screenshot=False)
+    ctx.check("the action advanced the baseline: the next read reports no changes",
+              after.get("is_diff") and "no changes" in after["tree"].lower(), after["tree"][:300])
 
     # Stable indexes: the index from the first full snapshot still addresses the same element.
     reused = ctx.call("set_value", window_id=wid, element_index=area, value="stable")
@@ -559,6 +824,252 @@ def tree_diffs(ctx):
 
     again_full = ctx.call("get_window_state", window_id=wid, include_screenshot=False, full=True)
     ctx.check("full=true returns the whole tree again", not again_full.get("is_diff") and "AXTextArea" in again_full["tree"])
+
+
+def shown(tree):
+    """What a full tree or a diff says is on screen now: a diff's '-' lines are gone."""
+    return "\n".join(line for line in tree.splitlines() if not line.startswith("-"))
+
+
+def refused(ctx, tool, **args):
+    """The error text when the call is refused, else None."""
+    try:
+        ctx.call(tool, **args)
+    except ToolError as e:
+        return str(e)
+    return None
+
+
+@scenario
+def action_observations(ctx):
+    tools = {t["name"]: t["inputSchema"]["properties"] for t in ctx.mcp.rpc("tools/list")["tools"]}
+    ctx.check("observe is advertised on native actions only",
+              all("observe" in tools[n] for n in ["click", "type_text", "set_value", "press_key", "select_text", "paste"])
+              and not any("observe" in tools[n] for n in ["get_window_state", "screenshot", "browser_click"]))
+
+    calc = ctx.call("launch_app", app="Calculator", new_instance=True)
+    ctx.kill_on_exit(calc["app"]["pid"])
+    wid = ctx.wait_for_window("Calculator", pid=calc["app"]["pid"])["id"]
+    first = ctx.call("get_window_state", window_id=wid, full=True)
+    buttons = {label: element_index(first["tree"], "AXButton", label) for label in ["7", "8", "9"]}
+    ctx.require("digit buttons are indexed", None not in buttons.values(), first["tree"][:400])
+
+    pressed = ctx.call("click", window_id=wid, element_index=buttons["7"])
+    seen = pressed.get("observation") or {}
+    tree = seen.get("tree", "")
+    ctx.check("click returns an observation without a second call", seen.get("snapshot_id"), pressed)
+    ctx.check("the observation shows the display reading 7", 'value="7"' in shown(tree), tree[:400])
+    ctx.check("it is a diff against the previous read",
+              seen.get("is_diff") and seen.get("diff_base") == first["snapshot_id"], {k: seen.get(k) for k in ("is_diff", "diff_base")})
+    ctx.check("no screenshot unless asked", "screenshot" not in seen and not ctx.screenshots, list(seen))
+
+    # The action's snapshot is now the window's current observation, so its id admits the next action.
+    blind = ctx.call("click", window_id=wid, element_index=buttons["7"], observe="none", observation_id=seen.get("snapshot_id"))
+    ctx.check('observe="none" returns no observation key', blind.get("ok") and "observation" not in blind, blind)
+
+    data, images = ctx.mcp.call("click", window_id=wid, element_index=buttons["8"], observe="both",
+                                observation_id=seen.get("snapshot_id"))
+    for i, image in enumerate(images):
+        ctx.save_image(f"observe-both-{i}", image)
+    both = data.get("observation") or {}
+    ctx.check('observe="both" attaches one image', len(images) == 1 and both.get("screenshot", {}).get("width", 0) > 0,
+              (len(images), both.get("screenshot")))
+    ctx.check('observe="both" still returns the tree (7, 7, 8 reads 778)', 'value="778"' in shown(both.get("tree", "")),
+              both.get("tree", "")[:400])
+
+    stale = refused(ctx, "click", window_id=wid, element_index=buttons["9"], observation_id=first["snapshot_id"])
+    ctx.check("an observation_id older than the last action's observation is refused", stale and "stale" in stale.lower(), stale)
+    bad = refused(ctx, "click", window_id=wid, element_index=buttons["9"], observe="everything")
+    ctx.check("an invalid observe value is refused before acting", bad and "observe" in bad, bad)
+    after = ctx.call("get_window_state", window_id=wid, full=True)["tree"]
+    ctx.check("the refused calls did not press 9", 'value="778"' in after, after[:400])
+
+
+@scenario
+def orientation_lines(ctx):
+    long_run = "x" * 300
+    window = ctx.launch_scratch_textedit("orientation.txt", f"hello brave new world\n{long_run}\nend")
+    wid = window["id"]
+    full = ctx.call("get_window_state", window_id=wid, full=True)
+    area = element_index(full["tree"], "AXTextArea")
+    ctx.require("text area is indexed", area is not None, full["tree"][:300])
+
+    selected = ctx.call("select_text", window_id=wid, element_index=area, text="brave")
+    diff = (selected.get("observation") or {}).get("tree", "")
+    ctx.check('the select_text result reports selected text: "brave"', re.search(r'^\+?selected text: "brave"$', diff, re.M), diff[-400:])
+    tree = ctx.call("get_window_state", window_id=wid, full=True)["tree"]
+    ctx.check("a full read names the focused text area by index", re.search(rf'^focused: \[{area}\] AXTextArea ', tree, re.M), tree[-400:])
+    ctx.check("a full read ends with the selected text", tree.splitlines()[-1] == 'selected text: "brave"', tree[-400:])
+
+    moved = ctx.call("select_text", window_id=wid, element_index=area, text="world")
+    diff = (moved.get("observation") or {}).get("tree", "")
+    ctx.check("a selection change shows up as a -/+ pair",
+              re.search(r'^-selected text: "brave"$', diff, re.M) and re.search(r'^\+selected text: "world"$', diff, re.M), diff[:400])
+    ctx.check("an unchanged focus is not repeated in the diff", "focused:" not in diff, diff[:400])
+
+    long = ctx.call("select_text", window_id=wid, element_index=area, text=long_run)
+    diff = (long.get("observation") or {}).get("tree", "")
+    ctx.check("selected text is cut at 200 characters", f'+selected text: "{"x" * 200}…"' in diff, diff[:400])
+
+    caret = ctx.call("select_text", window_id=wid, element_index=area, text="end", selection_type="cursor_after")
+    diff = (caret.get("observation") or {}).get("tree", "")
+    ctx.check("an empty selection removes the selected text line", "selected text:" not in shown(diff) and "-selected text:" in diff, diff[:400])
+
+    scoped = ctx.call("get_window_state", window_id=wid, scope=area)["tree"]
+    ctx.check("scoped reads carry no orientation lines", "focused:" not in scoped and "selected text:" not in scoped, scoped[-300:])
+
+
+@scenario
+def app_target(ctx):
+    tools = {t["name"]: t["inputSchema"] for t in ctx.mcp.rpc("tools/list")["tools"]}
+    ctx.check("window tools advertise app and no longer require window_id",
+              all("app" in tools[n]["properties"] and "window_id" not in tools[n].get("required", [])
+                  for n in ["get_window_state", "click", "press_key", "scroll", "screenshot", "batch"]))
+    ctx.check("Codex argument aliases stay unadvertised",
+              "click_count" not in tools["click"]["properties"] and "key" not in tools["press_key"]["properties"])
+
+    title = f"app-target-{int(time.time())}.txt"
+    window = ctx.launch_scratch_textedit(title, "line")
+    wid, pid = window["id"], window["pid"]
+    windows = ctx.call("list_windows", app="TextEdit")["windows"]
+    others = [w for w in windows if w["pid"] != pid]
+    front = observe()["frontmost"]
+    user_front = any(w["pid"] == front["pid"] for w in others)
+
+    # Several TextEdit processes: the frontmost one wins, else the most recently launched (this scratch one).
+    try:
+        got, error = ctx.call("get_window_state", app="TextEdit")["window"], None
+    except ToolError as e:
+        got, error = None, str(e)
+    if not user_front:
+        ctx.check(f"app=TextEdit resolves to the scratch window ({len(others)} other TextEdit windows)",
+                  got and got["id"] == wid, got or error)
+    else:
+        ctx.check("the user's frontmost TextEdit wins: its main window, or an error listing candidate window ids",
+                  (got and got["pid"] == front["pid"])
+                  or (error and "window_id" in error and any(str(w["id"]) in error for w in windows)), got or error)
+    if not others:
+        pressed = ctx.call("press_key", app="TextEdit", keys="right")
+        ctx.check("an action addressed by app reports the resolved window_id", pressed.get("window_id") == wid, pressed)
+
+    missing = refused(ctx, "get_window_state", app="NoSuchApp-SecondCursorE2E")
+    ctx.check("an app without windows is refused with a launch_app hint", missing and "launch_app" in missing, missing)
+    neither = refused(ctx, "press_key", keys="right")
+    ctx.check("no window_id and no app is refused", neither and "window_id" in neither, neither)
+
+    # Aliases are exercised on window_id so nothing here can reach a user's TextEdit window.
+    tree = ctx.tree(wid)
+    area = element_index(tree, "AXTextArea")
+    frame = element_frame(tree, area) if area is not None else None
+    ctx.require("text area and its frame are reported", frame is not None, tree[:400])
+    ctx.call("select_text", window_id=wid, element_index=area, text="line", selection_type="cursor_after", observe="none")
+    ctx.call("press_key", window_id=wid, key="Return", observe="none")
+    ctx.call("type_text", window_id=wid, text="next", observe="none")
+    value = value_of(ctx.tree(wid))
+    ctx.check('press_key accepts key="Return"', value == "line\nnext", value)
+
+    ctx.call("click", window_id=wid, x=frame[0] + 12, y=frame[1] + 6, click_count=2, mouse_button="left", observe="none")
+    ctx.call("type_text", window_id=wid, text="WORD", observe="none")
+    value = value_of(ctx.tree(wid))
+    ctx.check("click_count=2 double-clicked (the word was selected and replaced)", value == "WORD\nnext", value)
+    bad_button = refused(ctx, "click", window_id=wid, element_index=area, mouse_button="sideways")
+    ctx.check("mouse_button is read as button", bad_button and "button" in bad_button, bad_button)
+    bad_pages = refused(ctx, "scroll", window_id=wid, direction="down", pages="lots")
+    ctx.check("pages is read as the scroll amount", bad_pages and "pages" in bad_pages, bad_pages)
+    ctx.check("pages=1 scrolls", ctx.call("scroll", window_id=wid, element_index=area, direction="down", pages=1).get("ok"))
+
+
+def untitled_window(ctx, window):
+    """A second window in the scratch window's own TextEdit process. Each is read once while it is the app's main
+    window: on an inactive Space, accessibility only lists the main window until something has touched the others."""
+    ctx.call("get_window_state", window_id=window["id"])
+    ctx.call("press_key", window_id=window["id"], keys="cmd+n", observe="none")
+    untitled = ctx.wait_for_window("TextEdit", pid=window["pid"], title="Untitled")
+    ctx.call("get_window_state", window_id=untitled["id"])
+    return untitled
+
+
+@scenario
+def app_target_pins_observed_window(ctx):
+    """Actions and element reads addressed by app name go to the window this session last observed, not to whichever
+    window is the app's main window when the call arrives."""
+    first = ctx.launch_scratch_textedit(f"pin-{int(time.time())}.txt", "one")
+    pid = first["pid"]
+    windows = {first["id"]: "one", untitled_window(ctx, first)["id"]: ""}
+    one, two = windows
+    sid = ctx.call("session", action="create")["session_id"]
+    ctx.cleanups.append(lambda: ctx.mcp.call("session", action="close", session_id=sid))
+
+    # Refused before anything is sent, so these can never reach a user's own TextEdit window.
+    for tool, extra in [("press_key", {"keys": "right"}), ("click", {"x": 5, "y": 5}), ("inspect_element", {"element_index": 1})]:
+        error = refused(ctx, tool, app="TextEdit", session_id=sid, **extra)
+        ctx.check(f"{tool} by app before this session observed the app is refused",
+                  error and "observe the app first" in error, error)
+
+    for wid in (one, two, one):
+        tree = ctx.call("get_window_state", window_id=wid, session_id=sid, full=True)["tree"]
+        area = element_index(tree, "AXTextArea")
+        ctx.require("text area is indexed", area is not None, tree[:300])
+        pressed = ctx.call("press_key", app="TextEdit", session_id=sid, keys="right", observe="none")
+        ctx.check(f"press_key by app acts on the window just observed ({wid})", pressed.get("window_id") == wid, pressed)
+        clicked = ctx.call("click", app="TextEdit", session_id=sid, element_index=area, observe="none")
+        ctx.check(f"click by app with an element index acts on that window ({wid})", clicked.get("window_id") == wid, clicked)
+        text = ctx.call("inspect_element", app="TextEdit", session_id=sid, element_index=area)["text"]
+        ctx.check(f"inspect_element by app reads that window's element ({wid})", text == windows[wid], text)
+        scoped = ctx.call("get_window_state", app="TextEdit", session_id=sid, scope=area)["window"]
+        ctx.check(f"a scoped read by app stays on that window ({wid})", scoped["id"] == wid, scoped)
+
+    request = urllib.request.Request(
+        ctx.mcp.url.rsplit("/", 1)[0] + "/turn-ended", data=json.dumps({"session_id": sid}).encode(), method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {ctx.mcp.token}"})
+    urllib.request.urlopen(request, timeout=30).read()
+    error = refused(ctx, "press_key", app="TextEdit", session_id=sid, keys="right")
+    ctx.check("after the turn ends the app must be observed again", error and "observe the app first" in error, error)
+
+    ctx.call("get_window_state", window_id=two, session_id=sid)
+    os.kill(pid, signal.SIGKILL)
+    deadline = time.time() + 10
+    while any(w["pid"] == pid for w in ctx.call("list_windows", app="TextEdit")["windows"]) and time.time() < deadline:
+        time.sleep(0.3)
+    error = refused(ctx, "press_key", app="TextEdit", session_id=sid, keys="right")
+    ctx.check("once the observed window is gone, acting by app is refused and says so",
+              error and "gone" in error and str(two) in error, error)
+
+
+@scenario
+def paste_restores_clipboard(ctx):
+    wid = ctx.launch_scratch_textedit("paste.txt", "")["id"]
+    text_area(ctx, wid)
+    before = subprocess.run(["pbpaste"], capture_output=True).stdout
+    pasted = ctx.call("paste", window_id=wid, text="pasted text", format="text")
+    after = subprocess.run(["pbpaste"], capture_output=True).stdout
+    ctx.check("paste reports the app confirmed the menu press", pasted.get("verified") is True, pasted)
+    ctx.check("the user's clipboard is back once the paste is confirmed", before == after)
+    ctx.check("the text arrived", value_of(ctx.tree(wid)) == "pasted text")
+
+
+@scenario
+def structured_opt_in(ctx):
+    window = ctx.launch_scratch_textedit("structured.txt", "structured")
+    wid = window["id"]
+    sid = ctx.call("session", action="create")["session_id"]
+    ctx.cleanups.append(lambda: ctx.mcp.call("session", action="close", session_id=sid))
+    first = (ctx.call("press_key", window_id=wid, session_id=sid, keys="right").get("observation") or {})
+    ctx.check("an action with no earlier read returns the full tree", first.get("tree") and not first.get("is_diff"),
+              {k: first.get(k) for k in ("is_diff", "snapshot_id")})
+    ctx.check("action observations never carry elements", "elements" not in first, list(first))
+
+    plain = ctx.call("get_window_state", window_id=wid, full=True)
+    ctx.check("a full read without structured has no elements", "elements" not in plain, list(plain))
+    rich = ctx.call("get_window_state", window_id=wid, full=True, structured=True)
+    area = element_index(rich["tree"], "AXTextArea")
+    ctx.check("structured=true adds the elements array", any(e["index"] == area for e in rich.get("elements", [])), list(rich))
+    diff = ctx.call("get_window_state", window_id=wid, structured=True)
+    ctx.check("a diff never carries elements, even with structured=true", diff.get("is_diff") and "elements" not in diff, list(diff))
+    scoped = ctx.call("get_window_state", window_id=wid, scope=area, structured=True)
+    ctx.check("a scoped read honors structured=true", any(e["index"] == area for e in scoped.get("elements", [])), list(scoped))
+    bare = ctx.call("get_window_state", window_id=wid, scope=area)
+    ctx.check("a scoped read without structured has no elements", "elements" not in bare, list(bare))
 
 
 @scenario
@@ -721,14 +1232,41 @@ ACTION_TOOLS = {"launch_app", "batch", "click", "drag", "type_text", "set_value"
 
 
 class Run:
-    def __init__(self):
+    def __init__(self, config_overrides=None, browser=None, installed=None):
+        """Runs against a fresh TestInstance (merged with `config_overrides`) unless `installed`
+        (default: --installed or SC_E2E_TARGET=installed) targets the user's running app.
+        `browser`: True always starts the isolated test browser, False never, None (default, or the
+        --browser / --no-browser flags) starts it when a selected scenario uses browser tools."""
+        if installed is None:
+            installed = "--installed" in sys.argv or os.environ.get("SC_E2E_TARGET") == "installed"
+        if browser is None and {"--browser", "--no-browser"} & set(sys.argv):
+            browser = "--browser" in sys.argv
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.dir = ROOT / "artifacts" / stamp
         (self.dir / "screenshots").mkdir(parents=True)
         self.current = "setup"
         self.transcript = Transcript(self.dir / "transcript.jsonl", self)
-        config = json.loads(CONFIG_PATH.read_text())
-        self.mcp = MCP(f"http://127.0.0.1:{config['port']}/mcp", config["token"], self.transcript)
+        self.browser, self.instance, self.notes = browser, None, []
+        self.saved_sc_home = os.environ.get("SC_HOME")
+        if installed:
+            if config_overrides:
+                raise SystemExit(f"config overrides {config_overrides} need a test instance; drop --installed")
+            os.environ.pop("SC_HOME", None)
+            config = json.loads(CONFIG_PATH.read_text())
+            url, token = f"http://127.0.0.1:{config['port']}/mcp", config["token"]
+            self.target = f"installed app (config {CONFIG_PATH})"
+        else:
+            if "--approvals" in sys.argv:
+                config_overrides = {"approvals": "prompt", **(config_overrides or {})}
+            self.instance = TestInstance(config_overrides)
+            # Scenarios read these module globals and run APP_BINARY --pause/--resume without an env,
+            # so point both at the test instance.
+            globals().update(CONFIG_PATH=self.instance.config_path, ACTION_LOG=self.instance.action_log)
+            os.environ["SC_HOME"] = str(self.instance.home)
+            url, token = self.instance.url, self.instance.token
+            self.target = f"test instance of {self.instance.app} (SC_HOME={self.instance.home}, pid {self.instance.pid})"
+        print(f"Target: {self.target}")
+        self.mcp = MCP(url, token, self.transcript)
         self.baseline = observe()
         self.action_log_start = len(ACTION_LOG.read_text().splitlines()) if ACTION_LOG.exists() else 0
         self.results = []
@@ -765,39 +1303,73 @@ class Run:
         ]
 
     def run(self, names):
-        self.mcp.initialize()
-        for fn in SCENARIOS:
-            if names and fn.__name__ not in names:
-                continue
-            self.current = fn.__name__
-            ctx = Context(self, fn.__name__)
-            before, started = observe(), time.time()
-            status, error = "PASS", None
-            try:
-                fn(ctx)
-            except Skip as e:
-                status, error = "SKIP", str(e)
-            except Exception as e:
-                status, error = "FAIL", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}"
-            finally:
-                for cleanup in reversed(ctx.cleanups):
-                    try:
-                        cleanup()
-                    except Exception:
-                        pass
-            seconds = time.time() - started
-            invariants = self.invariants(before, observe(), seconds)
-            if status == "PASS" and not all(c["ok"] for c in ctx.checks + invariants):
-                status = "FAIL"
-            self.results.append({"scenario": fn.__name__, "status": status, "seconds": round(seconds, 1), "error": error,
-                                 "checks": ctx.checks, "invariants": invariants, "screenshots": ctx.screenshots})
-            print(f"{status:4}  {fn.__name__}  ({seconds:.1f}s){'  ' + error.splitlines()[0] if error else ''}")
-        self.write_report()
+        """One-shot: runs the selected scenarios (flags in `names` are ignored), writes the report and
+        stops the test instance."""
+        names = {n for n in names if not n.startswith("--")}
+        selected = [fn for fn in SCENARIOS if not names or fn.__name__ in names]
+        try:
+            self.mcp.initialize()
+            self.start_browser_if_needed(selected)
+            for fn in selected:
+                self.run_scenario(fn)
+        finally:
+            self.write_report()
+            self.close()
         return all(r["status"] != "FAIL" for r in self.results)
 
+    def run_scenario(self, fn):
+        self.current = fn.__name__
+        ctx = Context(self, fn.__name__)
+        before, started = observe(), time.time()
+        status, error = "PASS", None
+        try:
+            fn(ctx)
+        except Skip as e:
+            status, error = "SKIP", str(e)
+        except Exception as e:
+            status, error = "FAIL", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}"
+        finally:
+            for cleanup in reversed(ctx.cleanups):
+                try:
+                    cleanup()
+                except Exception:
+                    pass
+        seconds = time.time() - started
+        invariants = self.invariants(before, observe(), seconds)
+        if status == "PASS" and not all(c["ok"] for c in ctx.checks + invariants):
+            status = "FAIL"
+        self.results.append({"scenario": fn.__name__, "status": status, "seconds": round(seconds, 1), "error": error,
+                             "checks": ctx.checks, "invariants": invariants, "screenshots": ctx.screenshots})
+        print(f"{status:4}  {fn.__name__}  ({seconds:.1f}s){'  ' + error.splitlines()[0] if error else ''}")
+
+    def start_browser_if_needed(self, selected):
+        wanted = self.browser if self.browser is not None else any(uses_browser(fn) for fn in selected)
+        if not wanted or self.instance is None:
+            return
+        try:
+            self.instance.start_browser()
+            self.notes.append(f"Isolated test browser connected (Chrome pid {self.instance.browser.pid}).")
+        except Exception as e:
+            if self.browser:
+                raise
+            self.notes.append(f"Test browser unavailable; browser scenarios will skip or fail: {e}")
+        print(self.notes[-1])
+
+    def close(self):
+        if self.instance is None:
+            return
+        self.instance.stop(keep_logs=self.dir / "instance")
+        self.instance = None
+        if self.saved_sc_home is None:
+            os.environ.pop("SC_HOME", None)
+        else:
+            os.environ["SC_HOME"] = self.saved_sc_home
+
     def write_report(self):
-        (self.dir / "results.json").write_text(json.dumps({"baseline": self.baseline, "results": self.results}, indent=2))
+        (self.dir / "results.json").write_text(json.dumps(
+            {"target": self.target, "notes": self.notes, "baseline": self.baseline, "results": self.results}, indent=2))
         lines = [f"# Second Cursor E2E — {self.dir.name}", "",
+                 f"Target: {self.target}", "", *[f"- {note}" for note in self.notes], *([""] if self.notes else []),
                  f"Frontmost at start: {self.baseline['frontmost']['name']} · active Space {self.baseline['active_space']} · "
                  f"{len(self.baseline['displays'])} display(s)", "",
                  "| Scenario | Result | Time |", "| --- | --- | --- |"]

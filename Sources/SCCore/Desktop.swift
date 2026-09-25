@@ -117,6 +117,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         (try? await run(on: listQueue) { self.windows(matching: appQuery) }) ?? []
     }
 
+    public func appWindow(_ query: String) async throws -> UInt32 {
+        try await run(on: listQueue) { try self.preferredWindow(query) }
+    }
+
     public func launchApp(_ query: String, urls: [URL], newInstance: Bool) async throws -> AppInfo {
         try Execution.context.beforeDispatch()
         guard let app = Apps.resolve(query) else { throw SCError.appNotFound(query) }
@@ -271,31 +275,42 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             withKeyWindow(record) { Keyboard.press(chord, pid: record.pid) }
             return ActionResult(route: "pid_keyboard")
         }
+        // The handoff serializes input for every app, so an app that does not answer is found out before it.
+        let bar = MenuShortcut.menuBar(pid: record.pid)
         // Menu key equivalents only fire in an AppKit-active app with a key window, so hand the target
         // AppKit focus (no raise, no Space change) for the duration of the chord, then give it back.
         let handoff = SkyLight.focusWithoutRaise(pid: record.pid, wid: wid)
         defer { if let handoff { usleep(50_000); SkyLight.restore(handoff) } }
         var route = "pid_keyboard_focus_handoff"
+        var verified: Bool?
         var note: String?
         withKeyWindow(record) {
-            if let item = MenuShortcut.find(chord, pid: record.pid),
-               [.success, .cannotComplete].contains(item.perform(kAXPressAction)) {
+            // The walk has to happen inside the handoff (see MenuShortcut.find), so it gets a hard budget.
+            let found = bar.flatMap { MenuShortcut.find(chord, in: $0, deadline: Date().addingTimeInterval(1.5)) }
+            let pressed = found?.item.perform(kAXPressAction)
+            if pressed == .success || pressed == .cannotComplete {
                 route = "ax_menu_shortcut"
-                note = item.string(kAXTitleAttribute).map { "pressed menu item \"\($0)\"" }
+                // .cannotComplete only means the app did not answer in time; the item may still run later.
+                verified = pressed == .success ? true : nil
+                note = found?.title.map { "pressed menu item \"\($0)\"" }
+                if pressed == .cannotComplete {
+                    note = (note.map { $0 + "; " } ?? "") + "app did not reply in time; the action may still run"
+                }
             } else {
                 Keyboard.press(chord, pid: record.pid)
             }
         }
-        return ActionResult(route: route, note: note)
+        return ActionResult(route: route, verified: verified, note: note)
     }
 
     private func performNamedAction(_ wid: CGWindowID, elementIndex: Int, action: String) throws -> ActionResult {
         let (_, element) = try element(wid, elementIndex)
         let available = element.element.actions
-        guard available.contains(action) else {
-            throw SCError.invalidArgument("Element \(elementIndex) has no action \(action); available: \(available.isEmpty ? "none" : available.joined(separator: ", "))")
+        guard let match = available.first(where: { $0 == action || TreeBuilder.actionName($0) == action }) else {
+            let names = available.map(TreeBuilder.actionName)
+            throw SCError.invalidArgument("Element \(elementIndex) has no action \(action); available: \(names.isEmpty ? "none" : names.joined(separator: ", "))")
         }
-        let error = element.element.perform(action)
+        let error = element.element.perform(match)
         guard error == .success || error == .cannotComplete else {
             throw SCError.actionFailed("\(action) failed (AXError \(error.rawValue))")
         }
@@ -420,6 +435,37 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         return result
     }
 
+    /// Several windows: the matching process that is frontmost, else the most recently launched, and
+    /// then its only window or its AX main (else focused) window.
+    private func preferredWindow(_ query: String) throws -> UInt32 {
+        let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
+        let matches = windows(matching: needle)
+        let exact = matches.filter { $0.appName.lowercased() == needle || $0.bundleID?.lowercased() == needle }
+        let candidates = exact.isEmpty ? matches : exact
+        guard let only = candidates.first else {
+            throw SCError.invalidArgument("No window for app \"\(query)\"; call launch_app first")
+        }
+        if candidates.count == 1 { return only.id }
+
+        func rank(_ pid: pid_t) -> (Int, Date) {
+            let app = NSRunningApplication(processIdentifier: pid)
+            return (app?.isActive == true ? 1 : 0, app?.launchDate ?? .distantPast)
+        }
+        let pid = Set(candidates.map(\.pid)).max { rank($0) < rank($1) } ?? only.pid
+        let own = candidates.filter { $0.pid == pid }
+        if own.count == 1 { return own[0].id }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 1)
+        if let main = [kAXMainWindowAttribute, kAXFocusedWindowAttribute].lazy
+            .compactMap({ app.element($0)?.windowID }).first(where: { id in own.contains { $0.id == id } }) {
+            return main
+        }
+        let listed = candidates.prefix(20).map { "\($0.id) \"\($0.title)\" (\($0.appName), pid \($0.pid))" }
+        throw SCError.invalidArgument(
+            "\(candidates.count) windows match app \"\(query)\" and none is clearly its main window; pass window_id, one of: "
+                + listed.joined(separator: "; ") + (candidates.count > 20 ? "; …" : ""))
+    }
+
     private func windowInfo(_ record: CGWindowRecord, window: AXUIElement?) -> WindowInfo {
         let app = NSRunningApplication(processIdentifier: record.pid)
         var title = record.title
@@ -460,11 +506,13 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         }
 
         var builder = TreeBuilder()
-        let menuBar = options.includeMenuBar ? AXUIElementCreateApplication(record.pid).element(kAXMenuBarAttribute) : nil
+        let app = AXUIElementCreateApplication(record.pid)
+        let menuBar = options.includeMenuBar ? app.element(kAXMenuBarAttribute) : nil
         builder.build(window: window, menuBar: menuBar)
         let title = window.string(kAXTitleAttribute) ?? record.title
-        let out = TreeRenderer.full(title: title, size: frame.size, windowOrigin: frame.origin, nodes: builder.nodes,
+        var out = TreeRenderer.full(title: title, size: frame.size, windowOrigin: frame.origin, nodes: builder.nodes,
                                     table: tree.table, maxElements: options.maxElements)
+        out.appendOrientation(focused: app.element(kAXFocusedUIElementAttribute))
         tree.table.retain(keys: Set(builder.nodes.map(\.key)))
         let base = tree.snapshotID
         let diff = options.full ? nil : tree.lines.flatMap { TreeRenderer.diff(previous: $0, current: out.lines) }
@@ -559,16 +607,30 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 item.setString(plain, forType: .string)
             } else { item.setString(text, forType: .string) }
             pb.writeObjects([item]); let owned = pb.changeCount
-            defer {
-                if pb.changeCount == owned {
-                    pb.clearContents()
-                    let items = saved.map { entries -> NSPasteboardItem in let item = NSPasteboardItem(); for (type, data) in entries { item.setData(data, forType: type) }; return item }
-                    if !items.isEmpty { pb.writeObjects(items) }
-                }
+            func restore() {
+                guard pb.changeCount == owned else { return }
+                pb.clearContents()
+                let items = saved.map { entries -> NSPasteboardItem in let item = NSPasteboardItem(); for (type, data) in entries { item.setData(data, forType: type) }; return item }
+                if !items.isEmpty { pb.writeObjects(items) }
             }
-            let result = try self.performKey(windowID, chord: Keyboard.parse("cmd+v"))
-            self.settleNow(windowID)
-            return ActionResult(route: "clipboard_paste", note: "format=\(format); Markdown is pasted as source. " + (result.note ?? ""))
+            let result: ActionResult
+            do {
+                result = try self.performKey(windowID, chord: Keyboard.parse("cmd+v"))
+            } catch {
+                restore()
+                throw error
+            }
+            var note = "format=\(format); Markdown is pasted as source. " + (result.note ?? "")
+            // An unconfirmed press or queued keystrokes may read the clipboard later; restoring now could paste
+            // the user's own clipboard into the app instead.
+            if result.verified == true {
+                self.settleNow(windowID)
+                restore()
+            } else {
+                note += (note.hasSuffix(" ") ? "" : "; ")
+                    + "the app did not confirm the paste, so the pasted content was left on the clipboard (the previous clipboard was not restored)"
+            }
+            return ActionResult(route: "clipboard_paste", verified: result.verified, note: note)
         }
     }
 

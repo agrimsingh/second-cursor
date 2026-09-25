@@ -1,9 +1,12 @@
 import AppKit
 import SCShared
 
-// The e2e suite and scripts flip the pause flag through the installed binary while the app runs;
-// these must not start a second server or UI.
+// Commands run from shells, hooks and MCP hosts while the app runs; they must not start a second server or UI.
 let arguments = CommandLine.arguments.dropFirst()
+if arguments.contains("--help") || arguments.contains("-h") {
+    print(CLI.usage)
+    exit(0)
+}
 if arguments.contains("--pause") {
     do {
         try PauseState.pause()
@@ -19,8 +22,26 @@ if arguments.contains("--resume") {
     print("Second Cursor resumed")
     exit(0)
 }
+if arguments.contains("--turn-ended") {
+    exit(TurnEnded.run(session: CLI.value(after: "--session", in: arguments)))
+}
+switch arguments.first {
+case "mcp":
+    exit(MCPProxy.run())
+case "doctor":
+    exit(Doctor.run(json: arguments.contains("--json")))
+case "install-mcp":
+    exit(InstallMCP.run(arguments.dropFirst()))
+default:
+    break
+}
 
 guard InstanceLock.acquire() else {
+    if arguments.contains("--show-onboarding") {
+        OnboardingPanel.requestFromRunningInstance()
+        print("Asked the running Second Cursor to show its onboarding panel")
+        exit(0)
+    }
     FileHandle.standardError.write(Data("Second Cursor is already running\n".utf8))
     exit(0)
 }

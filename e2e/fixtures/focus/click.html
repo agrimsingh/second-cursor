@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>focus clicks=0</title>
+<style>
+  body { margin: 0; font: 16px -apple-system, sans-serif; }
+  #target { position: absolute; left: 40px; top: 40px; width: 260px; height: 140px; font-size: 24px; }
+  #count { position: absolute; left: 40px; top: 200px; }
+</style>
+<button id="target">Click me</button>
+<p id="count">clicks=0</p>
+<script>
+  const token = new URLSearchParams(location.search).get("token") || "focus";
+  let clicks = 0;
+  const show = () => {
+    document.title = `${token} clicks=${clicks}`;
+    document.getElementById("count").textContent = `clicks=${clicks}`;
+  };
+  document.getElementById("target").addEventListener("click", () => { clicks += 1; show(); });
+  show();
+</script>

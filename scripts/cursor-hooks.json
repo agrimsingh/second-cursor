@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "stop": [
+      {
+        "command": "\"$HOME/Applications/SecondCursor.app/Contents/MacOS/SecondCursor\" --turn-ended",
+        "timeout": 10
+      }
+    ]
+  }
+}

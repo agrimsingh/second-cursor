@@ -75,9 +75,21 @@ struct Arguments {
     }
 
     func windowID() throws -> UInt32 {
-        let id = try int("window_id")
+        guard let id = try optionalInt("window_id") else {
+            throw SCError.invalidArgument("window_id is required, or pass app to use that app's main window")
+        }
         guard let windowID = UInt32(exactly: id) else { throw SCError.invalidArgument("window_id must be a positive integer") }
         return windowID
+    }
+
+    /// Reads other clients' names for our arguments (Codex's `click_count` for `count`, …).
+    /// The canonical name wins when both are present.
+    func aliasing(_ aliases: [String: String]) -> Arguments {
+        var merged = raw
+        for (alias, canonical) in aliases where present(canonical) == nil {
+            if let value = present(alias) { merged[canonical] = value }
+        }
+        return Arguments(merged)
     }
 
     func direction() throws -> ScrollDirection {

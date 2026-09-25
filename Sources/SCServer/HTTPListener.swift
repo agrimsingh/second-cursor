@@ -107,7 +107,7 @@ private final class MCPHTTPHandler: ChannelInboundHandler {
         let loop = context.eventLoop
         let boundContext = NIOLoopBound(context, eventLoop: loop)
 
-        guard requestPath == path || requestPath == "/api" else {
+        guard requestPath == path || requestPath == "/api" || requestPath == "/turn-ended" else {
             Self.write(.error(statusCode: 404, .invalidRequest("Not Found")), for: head, to: context)
             return
         }

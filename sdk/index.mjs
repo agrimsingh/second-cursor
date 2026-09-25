@@ -19,7 +19,7 @@ export class SecondCursor {
       { homedir } = await import("node:os");
     const config = JSON.parse(
       await readFile(
-        `${homedir()}/Library/Application Support/SecondCursor/config.json`,
+        `${process.env.SC_HOME || `${homedir()}/Library/Application Support/SecondCursor`}/config.json`,
         "utf8",
       ),
     );
@@ -138,18 +138,21 @@ export class App {
   async observe(options = {}) {
     this.observation = await this.client.call("get_window_state", {
       window_id: this.id,
+      structured: true,
       ...options,
     });
     return this.observation;
   }
-  act(tool, args = {}) {
-    return this.client.call(tool, {
+  async act(tool, args = {}) {
+    const result = await this.client.call(tool, {
       window_id: this.id,
       ...(this.observation
         ? { observation_id: this.observation.snapshot_id }
         : {}),
       ...args,
     });
+    if (result.observation?.snapshot_id) this.observation = result.observation;
+    return result;
   }
   click(target, options = {}) {
     return this.act("click", {
@@ -207,10 +210,8 @@ export class App {
   screenshot() {
     return this.client.call("screenshot", { window_id: this.id });
   }
-  async batch(steps, options = {}) {
-    const result = await this.act("batch", { steps, ...options });
-    if (result.observation?.snapshot_id) this.observation = result.observation;
-    return result;
+  batch(steps, options = {}) {
+    return this.act("batch", { steps, ...options });
   }
   release() {
     return this.client.call("bind_target", {

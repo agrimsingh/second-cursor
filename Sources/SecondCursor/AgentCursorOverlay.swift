@@ -39,7 +39,7 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
 
         arrow.contents = Self.arrowImage()
         arrow.frame = CGRect(x: 0, y: 0, width: 28, height: 28)
-        arrow.anchorPoint = CGPoint(x: 0.12, y: 0.9) // the arrow's tip
+        arrow.anchorPoint = CGPoint(x: 3.0 / 28, y: 1 - 4.0 / 28) // the arrow's tip
         arrow.opacity = 0
         root.addSublayer(arrow)
 
@@ -142,7 +142,8 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
 
     private static func arrowImage() -> CGImage {
         let size = CGSize(width: 28, height: 28)
-        let image = NSImage(size: size, flipped: false) { _ in
+        // The path is in top-left-origin coordinates (tip at 3,4).
+        let image = NSImage(size: size, flipped: true) { _ in
             let path = NSBezierPath()
             path.move(to: NSPoint(x: 3, y: 25))
             path.line(to: NSPoint(x: 3, y: 4))

@@ -44,6 +44,15 @@ struct TreeBuilder {
     /// Chrome that never helps an agent and would crowd out real content.
     static let prunedRoles: Set<String> = ["AXScrollBar", "AXColumn", "AXValueIndicator"]
     static let passiveActions: Set<String> = ["AXShowMenu", "AXScrollToVisible", "AXShowDefaultUI", "AXShowAlternateUI", "AXRaise"]
+    /// Implied by an indexed element or harmless; only the rest are printed as `actions=[...]`.
+    static let obviousActions = passiveActions.union([kAXPressAction, kAXConfirmAction])
+
+    /// Custom actions arrive as "Name:<title>\nTarget:…\nSelector:…"; the title is what the outline shows
+    /// and what `perform_action` accepts.
+    static func actionName(_ action: String) -> String {
+        guard action.hasPrefix("Name:") else { return action }
+        return String(action.dropFirst(5).prefix { $0 != "\n" })
+    }
 
     private static let attributeNames = [
         kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, "AXLabel", kAXPlaceholderValueAttribute,
@@ -189,6 +198,25 @@ enum TreeRenderer {
         var indexedCount: Int
         var truncated: Bool
         var structured: [ElementInfo]
+
+        /// Appends "focused:" and "selected text:" lines for the app's focused element. They join the
+        /// line set diffs compare, so a focus or selection change shows up as a -/+ pair. Costs one
+        /// multi-attribute AX call; the focused element is matched to an index without further IPC.
+        mutating func appendOrientation(focused: AXUIElement?) {
+            guard let focused else { return }
+            let values = focused.attributes([
+                kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, "AXLabel", kAXPlaceholderValueAttribute,
+                kAXSelectedTextAttribute,
+            ])
+            let role = values[0] as? String ?? "AXUnknown"
+            let label = values[1...4].lazy.compactMap { $0 as? String }.first { !$0.isEmpty } ?? ""
+            let index = elements.first { CFEqual($0.value.element, focused) }?.key
+            lines.append("focused: \(index.map { "[\($0)] " } ?? "")\(role) \"\(TreeBuilder.escape(label, limit: 120))\"")
+            if let selected = AX.text(values[5]), !selected.isEmpty {
+                lines.append("selected text: \"\(TreeBuilder.escape(selected, limit: 200))\"")
+            }
+            text = lines.joined(separator: "\n")
+        }
     }
 
     /// Renders the window header plus every node, numbering indexed elements from `table`.
@@ -239,6 +267,11 @@ enum TreeRenderer {
                     if let value = node.states[name] ?? nil, value == (name != "enabled") {
                         line += " \(name)=\(value)"
                     }
+                }
+                let secondary = node.actions.filter { !TreeBuilder.obviousActions.contains($0) }
+                if !secondary.isEmpty {
+                    let names = secondary.map { TreeBuilder.escape(TreeBuilder.actionName($0), limit: 60) }
+                    line += " actions=[\(names.joined(separator: ","))]"
                 }
             }
             lines.append(line)

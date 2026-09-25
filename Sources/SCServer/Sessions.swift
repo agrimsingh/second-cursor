@@ -34,11 +34,21 @@ final class Sessions: @unchecked Sendable {
         }
     }
 
+    /// A window a session read, so `app` can keep addressing the window whose indexes and coordinates the agent holds.
+    struct ObservedWindow {
+        let windowID: UInt32
+        let pid: Int32
+        let appName: String
+        let bundleID: String?
+        var at = Date()
+    }
+
     private let lock = NSLock()
     private let claimIdleSeconds: TimeInterval
     private let retentionSeconds: TimeInterval
     private var live: Set<String> = ["legacy"]
     private var owners: [String: Claim] = [:]
+    private var observed: [String: [UInt32: ObservedWindow]] = [:]
     private var operations: [String: Operation] = [:]
     // FIFO queues make expiry and payload eviction amortized O(1), without sorting history.
     private var completed: [(id: String, generation: UUID, expires: Date)] = []
@@ -116,9 +126,31 @@ final class Sessions: @unchecked Sendable {
         }
     }
 
+    func noteObserved(_ window: ObservedWindow, session: String) {
+        locked {
+            var windows = observed[session] ?? [:]
+            windows[window.windowID] = window
+            // Only the latest window per app is ever used; the cap bounds sessions that never end a turn.
+            if windows.count > 64, let oldest = windows.values.min(by: { $0.at < $1.at }) {
+                windows[oldest.windowID] = nil
+            }
+            observed[session] = windows
+        }
+    }
+
+    /// The session's observed windows, most recent first.
+    func observations(session: String) -> [ObservedWindow] {
+        locked { (observed[session] ?? [:]).values.sorted { $0.at > $1.at } }
+    }
+
+    func forgetObservations(session: String) {
+        locked { observed[session] = nil }
+    }
+
     func close(_ id: String) {
         locked {
             if id != "legacy" { live.remove(id) }
+            observed[id] = nil
             owners = owners.filter { $0.value.session != id }
             for op in operations.values where op.session == id {
                 op.cancelled = true
@@ -149,6 +181,11 @@ final class Sessions: @unchecked Sendable {
 
     func claim(_ target: String, session: String) throws {
         try locked { try claimLocked(target, session: session, automatic: false) }
+    }
+
+    /// Admits a batch step's window the way `dispatch` admits a single action's target.
+    func use(_ target: String, session: String) throws {
+        try locked { try claimLocked(target, session: session, automatic: true) }
     }
 
     func release(_ target: String, session: String) {

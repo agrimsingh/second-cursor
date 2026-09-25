@@ -508,6 +508,7 @@ const PRIVATE_OPERATIONS = new Set([
   "history",
   "clipboard",
   "cdp",
+  "upload",
 ]);
 const CDP_ALLOWLIST = new Set([
   "Page.getLayoutMetrics",
@@ -517,7 +518,8 @@ const CDP_ALLOWLIST = new Set([
 ]);
 const OPERATION_ARGUMENTS = {
   user_tabs: "No arguments. Local approval required.",
-  claim: "tab_id. Local approval required.",
+  claim:
+    "tab_id. Local approval required. Control lasts until release, session close, turn end (default session), or 5 idle minutes. browser_close on a claimed tab only releases it.",
   release: "tab_id. Release ownership without closing the tab.",
   retain: "mode: ephemeral | deliverable | handoff",
   dom_snapshot: "tab_id",
@@ -543,7 +545,7 @@ const OPERATION_ARGUMENTS = {
   dialog:
     "omit accept to inspect; accept boolean and optional prompt_text to answer",
   upload:
-    "files array of absolute paths; optional locator, otherwise intercepted chooser",
+    "files array of absolute paths; optional locator, otherwise intercepted chooser. Local approval required.",
   downloads: "tab_id",
   logs: "tab_id",
   history:

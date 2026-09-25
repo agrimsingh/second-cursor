@@ -17,6 +17,11 @@ enum ToolCatalog {
         "screenshot", "move_to_agent_display", "return_window",
     ]
 
+    /// Native actions that return an observation of their window (see `observe`).
+    static let observingTools: Set<String> = [
+        "click", "drag", "type_text", "set_value", "press_key", "scroll", "perform_action", "select_text", "paste",
+    ]
+
     static let tools: [Tool] =
         ([
             Tool(
@@ -59,7 +64,7 @@ enum ToolCatalog {
             Tool(
                 name: "get_window_state",
                 description:
-                    "Read a window: an indented accessibility outline where actionable elements carry [index] markers and window-local frames, with an optional screenshot (off by default). The first read of a window returns the whole outline; later reads return only what changed since the previous read (is_diff=true): lines starting with + are new or changed, lines starting with - are gone, and \"(no changes)\" means the UI is the same. An element generally keeps its index while its label and place in the UI stay the same; use the latest observation after a label or structure change. Pass full=true to get the whole outline again, and scope=<index> to read everything inside one element at full depth when the outline is truncated or a region needs detail.",
+                    "Read a window: an indented accessibility outline where actionable elements carry [index] markers and window-local frames, with an optional screenshot (off by default). The first read of a window returns the whole outline; later reads return only what changed since the previous read (is_diff=true): lines starting with + are new or changed, lines starting with - are gone, and \"(no changes)\" means the UI is the same. An element generally keeps its index while its label and place in the UI stay the same; use the latest observation after a label or structure change. Pass full=true to get the whole outline again, and scope=<index> to read everything inside one element at full depth when the outline is truncated or a region needs detail. The outline ends with the focused element and any selected text. Action tools already return this diff for their window, so call this for a first look, a full view, or after waiting.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
@@ -69,7 +74,10 @@ enum ToolCatalog {
                             "Return the whole outline instead of a diff from the previous read.", default: false),
                         "scope": integer(
                             "Return only the subtree under this element index, at full depth. Not a diff."),
-                    ], required: ["window_id"]),
+                        "structured": boolean(
+                            "Also return an elements JSON array on full and scoped reads, for code consumers.",
+                            default: false),
+                    ]),
                 annotations: .init(readOnlyHint: true)
             ),
             Tool(
@@ -109,7 +117,7 @@ enum ToolCatalog {
                             default: true),
                         "full": boolean(
                             "Return the whole outline in the observation instead of a diff.", default: false),
-                    ], required: ["window_id", "steps"])
+                    ], required: ["steps"])
             ),
             Tool(
                 name: "click",
@@ -123,7 +131,7 @@ enum ToolCatalog {
                         "y": number("Window-local y in points."),
                         "button": string("Mouse button.", enumValues: ["left", "right", "middle"], default: "left"),
                         "count": integer("Click count; 2 for a double-click.", default: 1),
-                    ], required: ["window_id"])
+                    ])
             ),
             Tool(
                 name: "drag",
@@ -136,7 +144,7 @@ enum ToolCatalog {
                         "from_y": number("Start y, window-local points."),
                         "to_x": number("End x, window-local points."),
                         "to_y": number("End y, window-local points."),
-                    ], required: ["window_id", "from_x", "from_y", "to_x", "to_y"])
+                    ], required: ["from_x", "from_y", "to_x", "to_y"])
             ),
             Tool(
                 name: "type_text",
@@ -149,7 +157,7 @@ enum ToolCatalog {
                         "element_index": elementIndex,
                         "keystrokes_only": boolean(
                             "Send real key events instead of an accessibility insert.", default: false),
-                    ], required: ["window_id", "text"])
+                    ], required: ["text"])
             ),
             Tool(
                 name: "set_value",
@@ -160,7 +168,7 @@ enum ToolCatalog {
                         "window_id": windowID,
                         "element_index": elementIndex,
                         "value": string("New value."),
-                    ], required: ["window_id", "element_index", "value"])
+                    ], required: ["element_index", "value"])
             ),
             Tool(
                 name: "press_key",
@@ -170,7 +178,7 @@ enum ToolCatalog {
                     [
                         "window_id": windowID,
                         "keys": string("A +-separated chord of modifiers and one key."),
-                    ], required: ["window_id", "keys"])
+                    ], required: ["keys"])
             ),
             Tool(
                 name: "scroll",
@@ -183,24 +191,24 @@ enum ToolCatalog {
                         "element_index": elementIndex,
                         "x": number("Window-local x in points."),
                         "y": number("Window-local y in points."),
-                    ], required: ["window_id", "direction"])
+                    ], required: ["direction"])
             ),
             Tool(
                 name: "perform_action",
                 description:
-                    "Invoke a named accessibility action on an element, e.g. AXShowMenu, AXIncrement, AXDecrement, AXConfirm, AXCancel. Use when a plain click is not the right verb.",
+                    "Invoke a named accessibility action on an element: one its outline line lists in actions=[...] (e.g. AXIncrement, AXDecrement, AXCancel, or a custom name), or AXShowMenu / AXConfirm. Use when a plain click is not the right verb.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
                         "element_index": elementIndex,
                         "action": string("Accessibility action name, such as AXShowMenu."),
-                    ], required: ["window_id", "element_index", "action"])
+                    ], required: ["element_index", "action"])
             ),
             Tool(
                 name: "screenshot",
                 description:
                     "Capture a PNG of one window, even when it is covered or on another Space. Divide image pixels by scale to get window-local points.",
-                inputSchema: schema(["window_id": windowID], required: ["window_id"]),
+                inputSchema: schema(["window_id": windowID]),
                 annotations: .init(readOnlyHint: true)
             ),
             Tool(
@@ -216,12 +224,12 @@ enum ToolCatalog {
                 name: "move_to_agent_display",
                 description:
                     "Rarely needed. Moves a window onto the invisible agent display, taking it off the user's screen. Input already works in place; use this only when a custom-drawn app stops repainting while off-screen and you need fresh screenshots. Tell the user, and undo with return_window as soon as possible.",
-                inputSchema: schema(["window_id": windowID], required: ["window_id"])
+                inputSchema: schema(["window_id": windowID])
             ),
             Tool(
                 name: "return_window",
                 description: "Move a window from the agent display back to where it was before move_to_agent_display.",
-                inputSchema: schema(["window_id": windowID], required: ["window_id"])
+                inputSchema: schema(["window_id": windowID])
             ),
             Tool(
                 name: "browser_status",
@@ -309,7 +317,7 @@ enum ToolCatalog {
             ),
             Tool(
                 name: "browser_close",
-                description: "Close an agent tab.",
+                description: "Close a tab the agent opened. A claimed personal tab is released instead, and stays open.",
                 inputSchema: schema(["tab_id": tabID], required: ["tab_id"])
             ),
         ] + extraTools).map { tool in
@@ -318,6 +326,15 @@ enum ToolCatalog {
                     tool.name.hasPrefix("browser_") && !["browser_instances", "browser_status"].contains(tool.name)
                 let action = actionTools.contains(tool.name) || tool.name == "browser_command"
                 if browserScoped { props["browser_id"] = string("Instance from browser_instances.") }
+                if windowScopedTools.contains(tool.name) {
+                    props["app"] = string(
+                        "App name or bundle id, instead of window_id. Reads and screenshots use the app's main window; actions, inspect_element and scoped reads use the window of that app you observed last.")
+                }
+                if observingTools.contains(tool.name) {
+                    props["observe"] = string(
+                        "Returned after the action: tree (what changed since your last read of this window), both (tree and screenshot), screenshot, or none when chaining blind.",
+                        enumValues: ["tree", "both", "screenshot", "none"], default: "tree")
+                }
                 if tool.name == "browser_snapshot" {
                     props["full"] = boolean("Full outline; false enables session-local diffs.", default: true)
                 }
@@ -364,7 +381,7 @@ enum ToolCatalog {
                 [
                     "window_id": windowID, "element_index": elementIndex, "offset": integer("UTF-16 offset"),
                     "length": integer("Maximum UTF-16 units, up to 100000"),
-                ], required: ["window_id", "element_index"])),
+                ], required: ["element_index"])),
         Tool(
             name: "select_text",
             description:
@@ -374,7 +391,7 @@ enum ToolCatalog {
                     "window_id": windowID, "element_index": elementIndex, "text": string("Exact text"),
                     "prefix": string("Text immediately before"), "suffix": string("Text immediately after"),
                     "selection_type": string("Mode", enumValues: ["text", "cursor_before", "cursor_after"]),
-                ], required: ["window_id", "element_index", "text"])),
+                ], required: ["element_index", "text"])),
         Tool(
             name: "paste",
             description:
@@ -383,7 +400,7 @@ enum ToolCatalog {
                 [
                     "window_id": windowID, "text": string("Content"),
                     "format": string("Format", enumValues: ["text", "html", "md"]),
-                ], required: ["window_id", "text"])),
+                ], required: ["text"])),
         Tool(
             name: "browser_instances",
             description: "Discover connected browser instances/profiles and their capabilities.",
@@ -413,7 +430,7 @@ enum ToolCatalog {
                 ], required: ["operation"])),
     ]
 
-    private static let windowID = integer("Window id from list_windows or launch_app.")
+    private static let windowID = integer("Window id from list_windows or launch_app. Omit to target app instead.")
     private static let elementIndex = integer("Element [index] from get_window_state of this window.")
     private static let tabID = integer("Agent tab id from browser_open or browser_tabs.")
 

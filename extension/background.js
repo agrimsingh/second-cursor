@@ -12,7 +12,7 @@ import {
 } from "./tabs.js";
 
 import { extended, recordEvent, withDialog } from "./extended.js";
-import { closeSession } from "./tabs.js";
+import { closeSession, endTurn } from "./tabs.js";
 
 const HOST = "dev.secondcursor.host";
 const VERSION = chrome.runtime.getManifest().version;
@@ -34,6 +34,16 @@ const handlers = {
       if (key.startsWith(session_id + ":")) observations.delete(key);
     return closeSession(session_id);
   },
+  // Only for the app's local approval prompt text; tab ids never come from here to the model.
+  "tab.info": async ({ tabId }) => {
+    const tab = await chrome.tabs.get(tabId);
+    return { url: tab.url || tab.pendingUrl || "", title: tab.title || "" };
+  },
+  "session.end_turn": ({ session_id }) => {
+    for (const key of observations.keys())
+      if (key.startsWith(session_id + ":")) observations.delete(key);
+    return endTurn(session_id);
+  },
   "tabs.list": async ({ session_id }) => ({ tabs: await listTabs(session_id) }),
   "tabs.open": async ({ url, session_id }) => {
     const tab = await openTab(url, session_id);
@@ -46,10 +56,7 @@ const handlers = {
       }),
     };
   },
-  "tabs.close": async ({ tabId }) => {
-    await closeTab(tabId);
-    return {};
-  },
+  "tabs.close": ({ tabId }) => closeTab(tabId),
   "tab.navigate": async ({ tabId, url }) => ({
     tab: await navigateTab(tabId, url),
   }),
@@ -160,6 +167,7 @@ async function dispatch(activePort, { id, method, params }) {
       );
     if (
       params.tabId != null &&
+      method !== "tab.info" &&
       !(
         method === "extended" &&
         ["claim", "user_tabs", "capabilities"].includes(params.operation)

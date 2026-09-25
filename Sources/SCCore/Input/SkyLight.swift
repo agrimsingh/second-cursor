@@ -16,7 +16,6 @@ enum SkyLight {
     private typealias GetWindowOwner = @convention(c) (Int32, UInt32, UnsafeMutablePointer<Int32>) -> Int32
     private typealias GetConnectionPSN = @convention(c) (Int32, UnsafeMutableRawPointer) -> Int32
     private typealias GetProcessForPID = @convention(c) (pid_t, UnsafeMutableRawPointer) -> Int32
-    private typealias GetProcessPID = @convention(c) (UnsafeRawPointer, UnsafeMutablePointer<pid_t>) -> Int32
     private typealias AuthMessageFactory = @convention(c) (AnyClass, Selector, UnsafeMutableRawPointer, Int32, UInt32) -> Unmanaged<AnyObject>?
 
     private static let loaded = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY | RTLD_GLOBAL) != nil
@@ -36,7 +35,6 @@ enum SkyLight {
     private static let getWindowOwner = symbol("SLSGetWindowOwner", GetWindowOwner.self)
     private static let getConnectionPSN = symbol("SLSGetConnectionPSN", GetConnectionPSN.self)
     private static let getProcessForPID = symbol("GetProcessForPID", GetProcessForPID.self)
-    private static let getProcessPID = symbol("GetProcessPID", GetProcessPID.self)
     private static let objcMsgSend = symbol("objc_msgSend", AuthMessageFactory.self)
 
     /// Keyboard events need the authentication envelope for Chromium to accept them as live input.
@@ -90,42 +88,41 @@ enum SkyLight {
     private static let focusLock = NSRecursiveLock()
 
     struct FocusHandoff {
-        let previousPSN: ProcessSerialNumber
-        let previousWindow: CGWindowID?
         let targetPSN: ProcessSerialNumber
         let targetWindow: CGWindowID
     }
 
-    /// Makes `wid` key inside its app and tells the front app it lost key focus, without reordering
-    /// any window, activating the app, or following a Space (yabai's focus-without-raise recipe).
-    /// AppKit then treats the next click as a normal click instead of a window-activation click.
+    /// Posts a synthetic `focused` record for `wid` to the target process only, so AppKit treats the
+    /// next click as a normal click; no window is reordered and no Space followed. A record must never
+    /// reach the real frontmost process (it would resign active mid-typing), so this returns nil and
+    /// posts nothing when the target is front or its state is unknown. Serialized until `restore`.
     static func focusWithoutRaise(pid: pid_t, wid: CGWindowID) -> FocusHandoff? {
         focusLock.lock()
-        guard let front = frontProcess(), let target = processSerialNumber(pid: pid, wid: wid) else { focusLock.unlock(); return nil }
-        let previousWindow = processID(front).flatMap(focusedWindow(pid:))
-        guard postFocusRecord(to: front, wid: previousWindow ?? 0, focus: false) else { focusLock.unlock(); return nil }
-        guard postFocusRecord(to: target, wid: wid, focus: true) else {
-            _ = postFocusRecord(to: front, wid: previousWindow ?? 0, focus: true)
-            focusLock.unlock(); return nil
+        guard let front = frontProcess(), let target = processSerialNumber(pid: pid, wid: wid),
+              !samePSN(front, target), postFocusRecord(to: target, wid: wid, focus: true)
+        else {
+            focusLock.unlock()
+            return nil
         }
-        return FocusHandoff(previousPSN: front, previousWindow: previousWindow, targetPSN: target, targetWindow: wid)
+        return FocusHandoff(targetPSN: target, targetWindow: wid)
     }
 
-    /// Undoes `focusWithoutRaise`; otherwise the user's key window stops taking keystrokes until they click it.
+    /// Takes the synthetic focus back from the target only. Skipped when the user switched to the
+    /// target meanwhile: it is then really frontmost and must not be told it lost focus.
     static func restore(_ handoff: FocusHandoff) {
         defer { focusLock.unlock() }
+        if let front = frontProcess(), samePSN(front, handoff.targetPSN) { return }
         _ = postFocusRecord(to: handoff.targetPSN, wid: handoff.targetWindow, focus: false)
-        // Respect a human app switch that happened while the background shortcut ran.
-        let current = frontProcess() ?? handoff.previousPSN
-        let unchanged = current.highLongOfPSN == handoff.previousPSN.highLongOfPSN && current.lowLongOfPSN == handoff.previousPSN.lowLongOfPSN
-        let window = unchanged ? handoff.previousWindow : processID(current).flatMap(focusedWindow(pid:))
-        _ = postFocusRecord(to: current, wid: window ?? 0, focus: true)
     }
 
     /// True when WindowServer considers `pid` the front process.
     static func isFront(pid: pid_t, wid: CGWindowID) -> Bool {
         guard let front = frontProcess(), let target = processSerialNumber(pid: pid, wid: wid) else { return false }
-        return front.highLongOfPSN == target.highLongOfPSN && front.lowLongOfPSN == target.lowLongOfPSN
+        return samePSN(front, target)
+    }
+
+    private static func samePSN(_ a: ProcessSerialNumber, _ b: ProcessSerialNumber) -> Bool {
+        a.highLongOfPSN == b.highLongOfPSN && a.lowLongOfPSN == b.lowLongOfPSN
     }
 
     /// The window `pid` currently treats as key, per AX.
@@ -176,13 +173,6 @@ enum SkyLight {
         }
         if let getProcessForPID, getProcessForPID(pid, &psn) == 0 { return psn }
         return nil
-    }
-
-    private static func processID(_ psn: ProcessSerialNumber) -> pid_t? {
-        guard let getProcessPID else { return nil }
-        var psn = psn
-        var pid: pid_t = 0
-        return getProcessPID(&psn, &pid) == 0 && pid > 0 ? pid : nil
     }
 
     private static func focusedWindow(pid: pid_t) -> CGWindowID? {

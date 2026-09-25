@@ -31,7 +31,7 @@ def sessions_native(ctx):
         "parity.txt",
         "first repeat then second repeat 🙂\n" + "long text " * 300 + " END",
     )["id"]
-    sa = ctx.call("get_window_state", window_id=w, session_id=a)
+    sa = ctx.call("get_window_state", window_id=w, session_id=a, structured=True)
     sb = ctx.call("get_window_state", window_id=w, session_id=b)
     ctx.require(
         "first observations are independently full",

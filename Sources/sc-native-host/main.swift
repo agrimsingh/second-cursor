@@ -13,7 +13,11 @@ func log(_ message: String) {
     FileHandle.standardError.write("sc-native-host: \(message)\n".data(using: .utf8)!)
 }
 
+/// Mirrors `SCPaths`: `SC_HOME` (inherited from the browser's environment) points at a test instance.
 func socketPath() -> String {
+    if let custom = ProcessInfo.processInfo.environment["SC_HOME"], !custom.isEmpty {
+        return URL(fileURLWithPath: custom, isDirectory: true).appendingPathComponent("browser.sock").path
+    }
     let home = getpwuid(getuid()).map { String(cString: $0.pointee.pw_dir) } ?? NSHomeDirectory()
     return home + "/Library/Application Support/SecondCursor/browser.sock"
 }

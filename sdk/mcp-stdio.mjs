@@ -1,14 +1,13 @@
 #!/usr/bin/env node
-/** Stdio adapter for MCP hosts that cannot connect over HTTP. */
+/** Stdio adapter for MCP hosts that cannot connect over HTTP. The app's native
+ * `SecondCursor mcp` does the same without Node and also starts the app; prefer it. */
 import { createInterface } from "node:readline";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-const config = JSON.parse(
-  await readFile(
-    `${homedir()}/Library/Application Support/SecondCursor/config.json`,
-    "utf8",
-  ),
-);
+const home =
+  process.env.SC_HOME ||
+  `${homedir()}/Library/Application Support/SecondCursor`;
+const config = JSON.parse(await readFile(`${home}/config.json`, "utf8"));
 const input = createInterface({ input: process.stdin });
 input.on("line", async (line) => {
   let request;

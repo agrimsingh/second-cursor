@@ -1,46 +1,66 @@
-# Second Cursor 0.2 client contract
+# Second Cursor client contract
 
-The signed macOS app is the runtime. MCP HTTP (`/mcp`), JSON HTTP (`/api`), the JavaScript SDK, and the stdio adapter all reach the same tool dispatcher. No provider credentials are stored in the runtime.
+The signed macOS app is the runtime. MCP over HTTP (`/mcp`), JSON over HTTP (`/api`), the native stdio proxy (`SecondCursor mcp`), and the JavaScript SDK all reach the same tool dispatcher and the same policies. No provider credentials are stored in the runtime.
 
 ## Connections
 
-Read the localhost port and bearer token from `~/Library/Application Support/SecondCursor/config.json`. POST `/api` with `Authorization: Bearer …`, `Content-Type: application/json`, and a body such as:
+Read the localhost port and bearer token from `~/Library/Application Support/SecondCursor/config.json` (or `$SC_HOME/config.json` when `SC_HOME` is set). POST `/api` with `Authorization: Bearer …`, `Content-Type: application/json`, and a body such as:
 
 ```json
 {"tool":"session","args":{"action":"create"}}
 ```
 
-The response uses MCP's content envelope: text items contain result JSON and image items contain base64 PNG data. `isError` distinguishes refused/failed operations. `{"tool":"tools/list"}` returns the complete tool definitions. MCP clients use `/mcp` normally. For stdio-only hosts, run `node /absolute/path/second-cursor/sdk/mcp-stdio.mjs`.
+The response uses MCP's content envelope: text items contain result JSON and image items contain base64 PNG data. `isError` distinguishes refused or failed operations. `{"tool":"tools/list"}` returns the tool definitions. MCP clients use `/mcp`. Hosts that only launch commands run `~/Applications/SecondCursor.app/Contents/MacOS/SecondCursor mcp`, which proxies stdio to the running app and starts it if needed. `SecondCursor install-mcp --client cursor|claude|codex|gemini` writes that entry for you; `SecondCursor doctor` checks the setup.
 
-## Sessions, ownership, observations, and retries
+## Observations
 
-Pass `session_id` on subsequent tools. Omission uses the compatibility session `legacy`; independent hosts should create their own sessions. Native reads are permitted across sessions. Explicit-session mutations hold an idle lease; legacy actions check existing leases but do not acquire one. Native leases expire after five idle minutes (local config `claimIdleSeconds`), and in-flight actions keep their lease until they finish. A claimed browser tab can only be read or changed by its owner. `bind_target` claims/releases `window:<id>`. Closing a session cancels queued work, releases targets, closes ephemeral agent-created tabs, and releases retained/user tabs without closing them.
+`get_window_state` returns `snapshot_id` and a compact outline. The first read of a window in a session is the whole outline; later reads return only changed lines (`is_diff: true`, `diff_base`). Indexed lines show window-local frames, unusual states only (`enabled=false`, `focused=true`, `selected=true`, `expanded=true`), and `actions=[…]` only for actions beyond the obvious press/confirm/menu. Full outlines end with `focused: [i] Role "label"` and, when text is selected, `selected text: "…"`; both take part in diffs. `scope` reads one subtree at full depth. `inspect_element` recovers full values and selection ranges in UTF-16 units. `structured: true` adds the `elements` JSON array to full and scoped reads; diffs never include it. Screenshots are opt-in (`include_screenshot`).
 
-`get_window_state` returns `snapshot_id`, a compact tree, structured `elements`, and optional screenshot metadata. Text-only is now the default. Each session has its own full/diff baseline. `scope` reads a known subtree; `inspect_element` recovers full values and selection ranges. Offsets and lengths are UTF-16 code units. Unknown state is null. Diff responses omit `elements`; request `full:true` for the structured list. Compact outlines print unusual states only. Settable/editable details are queried by `inspect_element`, not by every tree walk. `browser_snapshot` also returns structured elements and an observation ID; pass `full:false` for session-local diffs.
+Every native action (`click`, `drag`, `type_text`, `set_value`, `press_key`, `scroll`, `perform_action`, `select_text`, `paste`) returns an `observation`: the diff against the session's previous read of that window, taken after the UI settles. It advances the diff baseline and becomes the window's current observation. `observe` chooses `tree` (default), `both` (adds a screenshot), `screenshot`, or `none` (no read, no settle wait; use it when chaining blind steps). A failed read after a successful action is reported as `observation_error`, not as a failure. `batch` returns one observation after its last step.
 
-Pass `observation_id` when acting on a previous native/browser observation. A superseded observation is rejected. Native pixel actions also reject a resized window. Observation IDs are references to what was returned, not a guarantee that an application cannot change afterward; observe again after actions and before branching.
+Window tools take `window_id` or `app` (name or bundle id). For reads and screenshots, `app` means that app's only window, or the main window of its frontmost process; when it can't choose, the error lists candidate window ids. Actions, `inspect_element`, and scoped reads by `app` go to the app window this session observed last, so indexes and coordinates always refer to the window you saw; they are refused if you haven't observed one or it has closed. Results carry the resolved `window_id`. Codex-style argument names are accepted: `click_count`, `mouse_button`, `key` (xdotool names such as `Return`, `Page_Up`, `KP_Enter`, `super+c`), and `pages` for scrolling.
 
-Supply an `operation_id` before submitting an action. Reuse it only for an identical request; the server returns the existing outcome instead of executing again. `operation_status` reconciles timeouts. `cancel_operation` prevents queued work and future batch steps, but cannot undo input already delivered to an app. `timeout_ms` includes queue time and is capped at 60000. A timeout is not cancellation. Terminal result payloads share a 32MB cache; an evicted payload has `result_expired:true` but its operation ID remains reserved for the retention interval, preventing accidental re-execution within that interval. Completed explicit IDs expire after one hour (local config `operationRetentionSeconds`). Retry only within this window; an expired ID is treated as a new request. Successful calls without a supplied ID do not retain history; unresolved timeouts do. Closing a session discards its history. `status.runtime` reports retained operations, result bytes and active HTTP connections.
+Pass `observation_id` when acting on a previous observation; a superseded one is rejected. Pixel actions also stop when the window changed size since it was last observed. Read `get_window_state` at the start of each turn before acting.
 
-Native batches cannot cross app processes. Browser batches cannot cross tabs; the Swift runtime is their sole executor. Both execute in order and recheck admission between steps. Configured `confirmationRequiredTools` and browser `user_tabs`, `claim`, `history`, `clipboard`, and `cdp` always show a local Allow once/Deny prompt. Batch children pass the same checks. The prompt activates the app, expires within the call deadline, closes on cancellation, and keeps the main actor responsive; the model cannot approve itself. The host remains responsible for interpreting the meaning of actions such as sending a message or purchasing an item.
+## Sessions, ownership, and retries
+
+Pass `session_id` on subsequent tools. Omitting it uses the shared compatibility session `legacy`; independent hosts should create their own. Native reads are permitted across sessions. Explicit-session actions hold an idle lease on the window; legacy actions respect existing leases but never take one. Leases expire after five idle minutes (`claimIdleSeconds`), and in-flight actions keep theirs. `bind_target` claims or releases `window:<id>`. Closing a session cancels queued work, releases targets and approvals, closes temporary agent-created tabs, and releases claimed personal tabs without closing them.
+
+Supply an `operation_id` before submitting an action and reuse it only for an identical request; the server returns the existing outcome instead of running it again. `operation_status` reconciles timeouts and `cancel_operation` stops queued work, but neither can undo input already delivered. `timeout_ms` includes approval and queue time and is capped at 60000. Completed explicit IDs are kept for one hour (`operationRetentionSeconds`); calls without an ID keep no history unless they time out. `status.runtime` reports retained operations, result bytes, and open HTTP connections.
+
+Native batches cannot cross app processes. Browser batches cannot cross tabs. Both run in order and recheck admission between steps.
+
+## Approvals
+
+The agent needs the user's approval to read or operate an app. The first window tool or `launch_app` call for an app shows a local prompt: **Allow for this session**, **Always allow** (saved to `approvedBundleIDs`), or **Deny**. Concurrent calls for the same app share one prompt. Session approvals last until the session closes; for the `legacy` session, until the turn ends or the app quits. `appApproval: "off"` in the config turns this off. Blocked apps (`blockedBundleIDs`) are never reachable.
+
+Sensitive browser operations always ask, once per call: `user_tabs`, `claim`, `history`, `clipboard`, `cdp`, and `upload` (which hands local files to a web page). A claim lasts until the tab is released, the session or turn ends, or the tab sits idle for five minutes. `confirmationRequiredTools` lists extra tools that always ask. Prompts name the app, site, and files involved, expire with the call deadline, close on cancellation, and are the one place the app takes focus. The model cannot approve itself; the extension checks the grant again on its side.
+
+`approvals` in the config decides how every prompt is answered: `prompt` (default), `deny` (refuse without UI), or `allow` (grant without UI, honored only for disposable test instances started with `SC_HOME`).
+
+Approvals limit what an agent can do through Second Cursor's tools. They are not a sandbox: an agent that can also run shell commands as you can edit the config, or start its own instance with `SC_HOME`, and that instance inherits the app's Accessibility and Screen Recording permissions. If an agent has unrestricted shell access, treat approvals as a guard against mistakes, not against a determined agent.
+
+## Turn end
+
+`POST /turn-ended` (same token and origin checks as `/api`, optional body `{"session_id": "…"}`, default `legacy`) resets that session's diff baselines so the next read is full, clears its session app approvals, and releases personal tabs it claimed. Agent-created tabs stay open and the session stays open. It returns `{ok, session_id, released_tabs, cleared_app_approvals}`. `SecondCursor --turn-ended` calls it, always exits 0, and ignores stdin, so it can run as an agent-stop hook; `scripts/cursor-hooks.json` is a Cursor sample and `install-mcp --client cursor --with-hook` merges it.
 
 ## Native editing
 
 - `select_text`: element index, exact text, optional prefix/suffix, and selection_type `text`, `cursor_before`, or `cursor_after`. Ambiguous matches fail.
-- `paste`: `text`, `html`, or `md`. Markdown inserts source text. Native paste restores the clipboard only if it still owns it, preserving a concurrent human copy.
-- `inspect_element`: `offset` and `length` recover truncated text; response includes `total_length`, `has_more`, selection and available actions.
-- `perform_action`: choose an action actually listed in the observation.
+- `paste`: `text`, `html`, or `md`. Markdown inserts source text. The clipboard is restored only if the paste still owns it, so a copy the user makes meanwhile survives.
+- `inspect_element`: `offset` and `length` recover truncated text; the response includes `total_length`, `has_more`, selection, editability, and available actions.
+- `perform_action`: choose an action listed in the observation (custom actions by the name shown).
 
 ## Extended browser interface
 
-Use `browser_instances` to discover persistent instance IDs. Agent-created tabs work without prompts; personal-tab discovery and claim require local approval. Supply `browser_id` when more than one extension profile is connected. Existing browser tools remain available. `browser_command` takes `operation`, `tab_id`, `browser_id`, session fields, and an `arguments` object for operation-specific fields. Flat arguments remain compatible. `operation:capabilities` supplies detailed argument help on demand.
+Use `browser_instances` to discover instance IDs and supply `browser_id` when more than one profile is connected. Agent-created tabs work without prompts. `browser_command` takes `operation`, `tab_id`, `browser_id`, session fields, and an `arguments` object for operation-specific fields (flat arguments still work). `operation: capabilities` returns argument help, the CDP allowlist, and which operations need approval.
 
-Locators use one or more of `selector`, `role`/`name`, `label`, `text`, `placeholder`, `test_id`; matching is exact unless `exact:false`. `nth` selects an explicit match. `frame` is a selector or an array for nested frame traversal, including debugger-attached cross-origin frame contexts. Ambiguous matches fail.
+Locators use one or more of `selector`, `role`/`name`, `label`, `text`, `placeholder`, `test_id`; matching is exact unless `exact:false`. `nth` selects an explicit match. `frame` is a selector or an array for nested frames, including cross-origin frames. Ambiguous matches fail.
 
 | Operations | Arguments / result |
 |---|---|
-| capabilities | Advertised operations and locator fields |
-| user_tabs, claim, release | Discover user tabs; explicitly claim one; release without closing |
+| capabilities | Operations, argument help, CDP allowlist, approval requirements |
+| user_tabs, claim, release | Discover personal tabs and claim one (both ask); release without closing |
 | retain | mode: ephemeral, deliverable, handoff; retained tabs survive session cleanup |
 | dom_snapshot, inspect | Structured DOM state; inspect supports offset/length and returns attributes and bounds |
 | click | locator or x/y; button, count, modifiers |
@@ -52,17 +72,17 @@ Locators use one or more of `selector`, `role`/`name`, `label`, `text`, `placeho
 | back, forward, reload | Browser navigation |
 | wait | url substring, locator/state, or event download/filechooser/navigation; bounded timeout_ms |
 | dialog | Omit accept to inspect; accept boolean and optional prompt_text to answer |
-| upload | Absolute regular-file paths; locator or an intercepted chooser |
+| upload | Absolute regular-file paths; locator or an intercepted chooser; asks first |
 | screenshot | full_page or clip; PNG plus dimensions, scale and document-coordinate origin |
 | viewport | width/height, or reset:true |
-| logs, history | Console entries; query/from/to/limit for history (Unix milliseconds) |
+| logs, history | Console entries; history asks first, with query/from/to/limit (Unix milliseconds) |
 | export | text/html/md/pdf; Google Workspace xlsx/csv/docx/pptx; youtube_transcript on watch pages |
 | assets | List observed resources; action:bundle and asset_ids return selected bodies |
-| clipboard | action read/write, text; requires the page origin to allow clipboard access |
-| cdp | Locally approved method/params; only Page.getLayoutMetrics, Page.getNavigationHistory, DOM.getDocument and Accessibility.getFullAXTree are allowed |
-| batch | Array of extended operation arguments; returns results and final DOM observation |
+| clipboard | action read/write, text; asks first; the page origin must allow clipboard access |
+| cdp | Asks first; only Page.getLayoutMetrics, Page.getNavigationHistory, DOM.getDocument and Accessibility.getFullAXTree |
+| batch | Array of extended operation arguments; returns results and a final DOM observation |
 
-A dialog-triggering action returns the observed dialog instead of waiting for the click to complete. File choosers are intercepted, allowing explicit assignment without moving the system cursor. Google Workspace exports need a signed-in document and can return a download in progress; YouTube transcripts require available captions. These service-specific paths depend on the service and are not covered by the local fixture suite.
+A dialog-triggering action returns the observed dialog instead of waiting for the click to complete. File choosers are intercepted, so files can be assigned without moving the system cursor. Google Workspace exports need a signed-in document; YouTube transcripts need captions. These service-specific paths are not covered by the local fixture suites.
 
 ## JavaScript SDK
 
@@ -70,18 +90,29 @@ A dialog-triggering action returns the observed dialog instead of waiting for th
 import { SecondCursor } from './sdk/index.mjs';
 const sc = await SecondCursor.local();
 try {
-  const { browsers } = await sc.state();
-  const tab = await sc.browser(browsers[0].id).open('https://example.com');
-  const state = await tab.domSnapshot();
-  // Choose locators from observed UI, then act and observe again.
-  await tab.markDeliverable();
+  const notes = await sc.app('TextEdit');
+  const area = notes.observation.elements.find((e) => e.role === 'AXTextArea').index;
+  await notes.selectText(area, 'draft', { selection_type: 'cursor_after' });
+  const { observation } = await notes.typeText(' (reviewed)');
+  console.log(observation.tree);
 } finally { await sc.close(); }
 ```
 
-App and Tab handles persist in the caller's JavaScript environment. `app()` refuses an ambiguous multi-window selection. Opening/binding a target includes an initial observation. `call()` exposes every tool for capabilities not covered by convenience methods. Errors carry `operationId`. Use `transport:'mcp'` to exercise the MCP endpoint instead of JSON HTTP. `sdk/agent.mjs` supplies an optional model-independent loop; its adapter owns provider-specific tool/image encoding and its approval hook belongs to the host.
+`SecondCursor.local()` reads the config (respecting `SC_HOME`) and creates a session. `App` and `Tab` handles keep the latest observation; actions adopt the observation they return, and `observe()` requests structured elements. `app()` refuses an ambiguous multi-window selection. `call()` exposes every tool. Errors carry `operationId`. `transport: 'mcp'` exercises `/mcp` instead of `/api`. `sdk/agent.mjs` is an optional model-independent loop; its adapter owns provider-specific encoding and its approval hook belongs to the host. For multi-step flows with branching, a short Node script using the SDK is often better than many separate tool calls; see `.cursor/skills/second-cursor/SKILL.md`.
 
 ## Validation
 
-`docs/parity-acceptance.md` records failure cases written before implementation. Run `scripts/build_and_run.sh --verify`, `python3 e2e/start-browser.py`, `python3 e2e/parity.py`, `python3 e2e/run.py`, then `node sdk/smoke.mjs`. Review regressions: `python3 e2e/review.py --short-retention` (temporarily changes local lease/retention settings and restores them), plus `node sdk/stdio-smoke.mjs`. Browser startup prints its isolated PID/profile for cleanup. Do not run pause scenarios concurrently with another suite. Reports, transcripts, screenshots, PDF/HTML/text exports and selected asset bodies are stored under `e2e/artifacts/`.
+Every suite runs against a disposable test instance: the harness starts the installed bundle with its own `SC_HOME`, port, token, and config (`approvals: "allow"`, `appApproval: "off"`), and never reads or writes your config or restarts your app. Pass `--installed` to target your own instance instead, `SC_E2E_APP=<bundle>` to test another build, `--browser` to force the isolated headless browser, and `--approvals` for the interactive prompt scenarios (they show real dialogs and never click them).
 
-Review approval scenarios are excluded by default. Add `--approvals` only for a deliberate interactive test; ordinary parity/review runs do not produce approval dialogs.
+```sh
+python3 e2e/run.py        # core regressions
+python3 e2e/policy.py     # approvals (deny mode, no UI), turn end, action log
+python3 e2e/parity.py     # sessions, editing, browser
+python3 e2e/review.py     # observation size, leases, bookkeeping (add --short-retention for expiry)
+python3 e2e/instance.py   # test-instance isolation
+python3 e2e/setup.py      # stdio proxy, doctor, turn end, install-mcp
+python3 e2e/focus.py      # focus safety; puts a probe window in front and takes focus while it runs
+python3 e2e/agent_smoke.py --run   # a real Cursor agent drives the tools (costs model usage)
+```
+
+Failure cases written before implementation are in `docs/parity-acceptance.md` and `docs/review-acceptance.md`. Reports, transcripts, screenshots, and exported files are written to `e2e/artifacts/<run-id>/`.

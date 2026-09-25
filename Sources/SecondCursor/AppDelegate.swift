@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let agentCursor = AgentCursorOverlay()
     private let agentDisplay = AgentDisplay()
     private let browserBridge = BrowserBridge()
+    private let onboarding = OnboardingPanel()
     private var server: SecondCursorServer?
     private var menu: StatusMenu?
     private var signalSources: [DispatchSourceSignal] = []
@@ -18,7 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installSignalHandlers()
-        Permissions.requestMissing()
+        onboarding.listenForRequests()
+        // A test instance (SC_HOME) must never put UI in front of the user unless asked to.
+        if CommandLine.arguments.contains("--show-onboarding") || (SCPaths.customHome == nil && OnboardingPanel.needed) {
+            onboarding.show()
+        }
         desktop.cursor = agentCursor
 
         let config: SCConfig
@@ -72,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func makeMenu(config: SCConfig?) -> StatusMenu {
         let agentDisplay = self.agentDisplay
         let menu = StatusMenu(config: config, actions: .init(
+            showOnboarding: { [weak self] in self?.onboarding.show() },
             tearDownAgentDisplay: { Task { await agentDisplay.teardown() } },
             quit: { NSApp.terminate(nil) }
         ))

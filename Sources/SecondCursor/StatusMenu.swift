@@ -11,6 +11,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     struct Actions {
+        var showOnboarding: () -> Void
         var tearDownAgentDisplay: () -> Void
         var quit: () -> Void
     }
@@ -101,13 +102,11 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     @objc private func grantAccessibility() {
-        Permissions.requestMissing()
-        Permissions.openSettings(accessibility: true)
+        actions.showOnboarding()
     }
 
     @objc private func grantScreenRecording() {
-        Permissions.requestMissing()
-        Permissions.openSettings(accessibility: false)
+        actions.showOnboarding()
     }
 
     @objc private func togglePause() {
@@ -121,14 +120,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     @objc private func copyCursorConfig() {
         guard let config else { return }
-        let entry: [String: Any] = [
-            "mcpServers": [
-                "second-cursor": [
-                    "url": "http://\(SecondCursorServer.host):\(config.port)\(SecondCursorServer.path)",
-                    "headers": ["Authorization": "Bearer \(config.token)"],
-                ],
-            ],
-        ]
+        let entry = ["mcpServers": [InstallMCP.serverName: InstallMCP.cursorEntry(config)]]
         guard let data = try? JSONSerialization.data(
             withJSONObject: entry, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else { return }
         NSPasteboard.general.clearContents()

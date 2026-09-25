@@ -38,6 +38,10 @@ public protocol DesktopControlling: AnyObject, Sendable {
     func listApps(includeNotRunning: Bool) async -> [AppInfo]
     /// `appQuery` matches app name or bundle id (case-insensitive substring); nil lists all.
     func listWindows(appQuery: String?) async -> [WindowInfo]
+    /// The window an app name refers to. `query` matches like `listWindows`, narrowed to exact name or
+    /// bundle id matches when there are any. Throws, listing the candidates, when no single window
+    /// stands out as the app's main window.
+    func appWindow(_ query: String) async throws -> UInt32
     /// Launches (or reuses) an app without activating it. Returns once it is running.
     /// `newInstance` starts a separate process so the agent never shares a window with the user.
     func launchApp(_ query: String, urls: [URL], newInstance: Bool) async throws -> AppInfo

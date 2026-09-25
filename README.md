@@ -2,6 +2,8 @@
 
 Let an AI agent use any app on your Mac while you keep working. Second Cursor clicks, types, and reads apps in the background: your cursor never moves, your focus never changes, and you are never dragged to another Space. It runs as a small menu bar app and exposes an MCP server over HTTP, so Cursor or any other MCP client can drive it.
 
+There is one deliberate exception: local approval prompts. When an agent first touches an app you have not approved, or asks for a sensitive browser operation (your own tabs, history, clipboard, uploads), Second Cursor brings up a dialog so that you, not the model, decide. That dialog takes focus on purpose.
+
 Version 0.2 also provides explicit client sessions, structured observations, full-text inspection, native text selection and rich paste, DOM browser actions, multi-profile browser connections, and a dependency-free JavaScript SDK. See [the client contract](docs/api.md) and [the E2E acceptance cases](docs/parity-acceptance.md).
 
 ## How it works
@@ -37,12 +39,28 @@ This creates a local self-signed code-signing identity (so macOS permission gran
 
 Then:
 
-1. Grant **Accessibility** and **Screen & System Audio Recording** to Second Cursor in System Settings > Privacy & Security, and relaunch it.
+1. Grant **Accessibility** and **Screen & System Audio Recording**. When either is missing, a small setup panel opens next to System Settings. **Open System Settings** jumps to the right pane. Drag the app icon from the panel into the list, or switch Second Cursor on if it is already listed. The panel ticks each permission off as it turns on and closes when both are granted. For Screen Recording, choose **Quit & Reopen** if System Settings asks. The menu bar's **Grant … permission** items reopen the panel, and so does `SecondCursor --show-onboarding`.
 2. For browser control, open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select `~/Library/Application Support/SecondCursor/extension`.
+3. Check the setup with `SecondCursor doctor`. It reports whether the app is reachable, its version, both permissions, pause state, the extension connection, and the config path. It exits non-zero when something needs your action. Add `--json` for machine output.
+
+`SecondCursor` in these commands is the app's binary, `~/Applications/SecondCursor.app/Contents/MacOS/SecondCursor`. `SecondCursor --help` lists every command.
 
 ## Connect a client
 
-The menu bar item has **Copy Cursor MCP config**. It produces an entry like this for `~/.cursor/mcp.json`:
+One command writes the entry for a client:
+
+```bash
+SecondCursor install-mcp --client cursor    # ~/.cursor/mcp.json (HTTP URL + token)
+SecondCursor install-mcp --client claude    # ~/.claude.json (Claude Code)
+SecondCursor install-mcp --client codex     # ~/.codex/config.toml, [mcp_servers.second_cursor]
+SecondCursor install-mcp --client gemini    # ~/.gemini/settings.json
+```
+
+It only adds or replaces the `second-cursor` entry and leaves everything else in the file alone. Before it writes, it copies the original to `<file>.bak`, and it creates the file if it is missing. It prints what changed. `--dry-run` shows the entry it would write (token redacted) and which existing entries it would keep, without writing anything. Nothing is installed until you run one of these commands.
+
+Claude Code, Codex and Gemini CLI launch a command rather than connecting over HTTP, so their entry runs `SecondCursor mcp`. That is a stdio MCP server built into the app binary. It forwards each request to the running app and starts the app if it isn't running. `node sdk/mcp-stdio.mjs` does the same for hosts where only Node is available. Any other stdio host can use `SecondCursor mcp` directly.
+
+For Cursor, the menu bar item's **Copy Cursor MCP config** produces the same entry that `install-mcp --client cursor` writes:
 
 ```json
 {
@@ -55,9 +73,17 @@ The menu bar item has **Copy Cursor MCP config**. It produces an entry like this
 }
 ```
 
-Stdio-only MCP hosts can run `node /absolute/path/second-cursor/sdk/mcp-stdio.mjs`. Custom hosts can use POST `/api` or `sdk/index.mjs`; all interfaces share the same dispatcher and policies.
+Custom hosts can use POST `/api` or `sdk/index.mjs`; all interfaces share the same dispatcher and policies.
 
 The port and token live in `~/Library/Application Support/SecondCursor/config.json`. The server only listens on localhost and rejects requests without the token or with a non-local origin.
+
+### Cursor turn-end hook
+
+At the end of each agent turn, `SecondCursor --turn-ended` tells the app the turn is over. The next observation is then a full read, and approvals and claimed browser tabs held for that turn are released. `--session <id>` targets an explicit session; the default is the shared `legacy` session that MCP clients use. The command ignores its stdin and always exits 0, so a hook can never fail loudly. `install-mcp --client cursor --with-hook` adds a `stop` hook to `~/.cursor/hooks.json`, keeping your other hooks and writing a `.bak` first. `scripts/cursor-hooks.json` is the same hook as a sample to merge by hand.
+
+### Agent skill
+
+`.cursor/skills/second-cursor/SKILL.md` tells an agent when to use Second Cursor and how to work with it. It covers the observe-then-act loop, and writing a short Node script with `sdk/index.mjs` instead of dozens of tool calls when a flow branches. It also sets the safety rules: ask before sending, deleting or purchasing, and never read password managers. Copy it into another project's `.cursor/skills/`, or into your personal skills, to use it outside this repo.
 
 ## Tools
 
@@ -74,6 +100,8 @@ The port and token live in `~/Library/Application Support/SecondCursor/config.js
 
 ## Safety
 
+- **App approval:** the first time an agent reads or operates an app, you choose Allow for this session, Always allow, or Deny. Your own tabs, browsing history, clipboard, raw DevTools, and file uploads always ask. See [the client contract](docs/api.md#approvals).
+- **Not a sandbox:** approvals limit what an agent can do through Second Cursor's tools. An agent that can also run shell commands as you could edit the config or start its own instance, so treat approvals as a guard against mistakes, not against a determined agent.
 - **Pause:** the menu bar item pauses the agent; every tool except `status` is refused until you resume. `SecondCursor --pause` / `--resume` do the same from a shell.
 - **Blocked apps:** `blockedBundleIDs` in `config.json` (password managers, Keychain Access, System Settings by default) can never be launched or touched.
 - **Action log:** every state-changing call is appended to `~/Library/Logs/SecondCursor/actions.jsonl` before it runs.
@@ -82,13 +110,21 @@ The port and token live in `~/Library/Application Support/SecondCursor/config.js
 
 ## Testing
 
-Testing is end to end only. With the app installed and running:
+Testing is end to end only. Every suite runs against a disposable test instance, not against your running app. The harness starts a fresh copy of the installed bundle with its own `SC_HOME` folder, port, token and config, and stops it afterwards. Your app, config, logs and pause flag are never read, written or restarted. Test instances never show approval dialogs or the setup panel.
 
 ```bash
 python3 e2e/run.py            # or name scenarios: python3 e2e/run.py textedit_background calculator
+python3 e2e/parity.py         # sessions, editing, browser
+python3 e2e/review.py         # review regressions (--short-retention for lease/retention expiry)
+python3 e2e/setup.py          # mcp stdio proxy, doctor, --turn-ended, install-mcp, onboarding gating
+python3 e2e/policy.py         # approvals in deny mode (no UI), turn end, action log
+python3 e2e/instance.py       # test-instance isolation
+python3 e2e/focus.py          # focus safety; puts a probe window in front and takes focus while it runs
 ```
 
-Run `python3 e2e/parity.py` for the new session/editing/browser scenarios and `node sdk/smoke.mjs` for both SDK transports. `python3 e2e/start-browser.py` starts an isolated extension-enabled Chrome for Testing profile and prints its PID for cleanup. Do not run suites containing pause scenarios concurrently.
+`SC_E2E_APP=build/SecondCursor.app` tests another bundle, and `--installed` targets your running app instead (opt-in). `python3 e2e/setup.py` runs `install-mcp` against a temporary `HOME` and checks that your real client configs are unchanged.
+
+`python3 e2e/agent_smoke.py --run` checks that a real model can use the tools. It has the Cursor Agent CLI compute 7 × 6 in Calculator and append the result to a TextEdit window, through a project-level MCP config that points at a test instance, then verifies the result independently. It spends model usage, so without `--run` it only prints what it would do.
 
 The suite talks to the app over MCP like a real client and, around every scenario, independently checks that your cursor, frontmost app, and active Space did not change. Each run writes a report, screenshots, and a full call transcript to `e2e/artifacts/<run-id>/`. Scenarios that depend on your environment (an Electron app open, a window on another Space, the Chrome extension loaded) are skipped with a reason when unavailable.
 
@@ -113,9 +149,8 @@ The suite talks to the app over MCP like a real client and, around every scenari
 - Custom-drawn apps (Ableton, games) may stop repainting while on a Space you are not viewing, so their screenshots go stale; input still lands and the accessibility tree stays live.
 - A window on another Space that neither its app nor any accessibility client has exposed yet cannot be reached until the app is touched once.
 - Chrome shows its "started debugging this browser" bar while the extension is attached to an agent tab.
+- A pixel click or drag into a background window of the app you are currently using can bring that window forward, because the app is already active. Element-index actions don't have this problem.
 
 ## Credits
 
 The background input recipes (SkyLight event posting, focus without raise) build on [cua-driver](https://github.com/trycua/cua) (MIT, see `LICENSES/cua-driver-MIT.txt`) and ideas from [yabai](https://github.com/koekeishiya/yabai).
-
-Review corrections: native leases expire after five idle minutes; completed explicit retry IDs expire after one hour. Browser personal-tab discovery/claim, history, clipboard, and allowlisted raw CDP require a local approval within the call deadline. See [the API contract](docs/api.md) and [review acceptance cases](docs/review-acceptance.md).

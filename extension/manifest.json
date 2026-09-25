@@ -6,6 +6,7 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6hSSs97ye4+HwOQp1h6UxNwyuRbWEciBOFu86ejujB3gfvTkwEGxhE/WvqtC4OztlvJDrsoUNN34NGlx9ZYcIIUyjypzrGlIdUUHvSGCRqPbHncLRGXJ8m+S/a3ezIUsQpw5ILw4bseGs/QmW4fYce2tVqWroUk6efZFtx645jNbAS4/lQZOX5z4sHMSFmIIdy7fdQjAU9bLPNw4oK8TDANQDxNzAmKrWv6f5Ja1oJFlpFRBgmbwprssLaNql3NbNwvii/Kq1beAMtYr0Ha4qX6RWDJTCS925Yi4w/9sw9L24OgFd5SlSj4LHxPSArBAGJRcPnBvQ+pe5eXferfxeQIDAQAB",
   "minimum_chrome_version": "116",
   "permissions": [
+    "alarms",
     "debugger",
     "tabs",
     "tabGroups",

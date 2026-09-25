@@ -10,18 +10,22 @@ SCENARIOS.clear()
 
 @scenario
 def compact_observations(ctx):
+    import re
+
     w = ctx.launch_scratch_textedit("compact.txt", "initial")["id"]
-    full = ctx.call("get_window_state", window_id=w, full=True)
+    full = ctx.call("get_window_state", window_id=w, full=True, structured=True)
     i = element_index(full["tree"], "AXTextArea")
     ctx.require("full read has structured elements", bool(full["elements"]))
+    obvious = {"AXPress", "AXConfirm", "AXShowMenu", "AXScrollToVisible", "AXShowDefaultUI", "AXShowAlternateUI", "AXRaise"}
+    listed = {a.strip() for group in re.findall(r"actions=\[([^\]]*)\]", full["tree"]) for a in group.split(",")}
     ctx.require(
         "outline omits common annotations",
         "enabled=true" not in full["tree"]
         and "editable=false" not in full["tree"]
-        and "actions=[" not in full["tree"],
+        and not listed & obvious,
+        sorted(listed & obvious),
     )
-    ctx.call("set_value", window_id=w, element_index=i, value="changed")
-    diff = ctx.call("get_window_state", window_id=w)
+    diff = ctx.call("set_value", window_id=w, element_index=i, value="changed")["observation"]
     ctx.require(
         "diff omits full element list", diff["is_diff"] and "elements" not in diff
     )
@@ -137,9 +141,9 @@ def private_browser_access(ctx):
             timeout_ms=150,
         )
     except ToolError as e:
-        ctx.require("batch cannot bypass approval", "approval" in str(e).lower())
+        ctx.require("batch cannot carry a sensitive step", "call history on its own" in str(e), str(e))
     else:
-        ctx.require("batch cannot bypass approval", False)
+        ctx.require("batch cannot carry a sensitive step", False)
     try:
         ctx.call("browser_snapshot", session_id=sid, browser_id=bid, tab_id=tid)
     except ToolError:
@@ -380,46 +384,8 @@ def approval_lifecycle(ctx):
 
 
 if __name__ == "__main__":
-    config = Path.home() / "Library/Application Support/SecondCursor/config.json"
-    original = None
-
-    def restart():
-        subprocess.run(["pkill", "-x", "SecondCursor"], check=False)
-        for _ in range(100):
-            if subprocess.run(
-                ["pgrep", "-x", "SecondCursor"], stdout=subprocess.DEVNULL
-            ).returncode:
-                break
-            time.sleep(0.1)
-        else:
-            raise RuntimeError("Installed app did not stop gracefully")
-        for attempt in range(3):
-            launched = subprocess.run(
-                ["open", "-n", str(Path.home() / "Applications/SecondCursor.app")],
-                capture_output=True,
-                text=True,
-            )
-            if launched.returncode == 0:
-                break
-            time.sleep(0.5)
-        else:
-            raise RuntimeError(
-                "LaunchServices could not restart the app: " + launched.stderr
-            )
-        time.sleep(2)
-
-    try:
-        if "--short-retention" in sys.argv:
-            original = config.read_bytes()
-            data = json.loads(original)
-            data.update(claimIdleSeconds=2, operationRetentionSeconds=3)
-            config.write_text(json.dumps(data))
-            restart()
-        run = Run()
-        run.run([x for x in sys.argv[1:] if not x.startswith("--")])
-        failed = any(r["status"] == "FAIL" for r in run.results)
-    finally:
-        if original is not None:
-            config.write_bytes(original)
-            restart()
-    sys.exit(1 if failed else 0)
+    # Short retention lives only in the disposable test instance's config.
+    short = "--short-retention" in sys.argv
+    run = Run(config_overrides={"claimIdleSeconds": 2, "operationRetentionSeconds": 3} if short else None)
+    run.run(sys.argv[1:])
+    sys.exit(1 if any(r["status"] == "FAIL" for r in run.results) else 0)

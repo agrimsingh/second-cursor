@@ -10,6 +10,7 @@ let package = Package(
         .executable(name: "sc-dev", targets: ["sc-dev"]),
         .executable(name: "sc-display-dev", targets: ["sc-display-dev"]),
         .executable(name: "sc-browser-dev", targets: ["sc-browser-dev"]),
+        .executable(name: "sc-focus-probe", targets: ["sc-focus-probe"]),
     ],
     dependencies: [
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", exact: "0.12.1"),
@@ -44,6 +45,7 @@ let package = Package(
         .executableTarget(name: "sc-dev", dependencies: ["SCShared", "SCCore"]),
         .executableTarget(name: "sc-display-dev", dependencies: ["SCShared", "SCDisplay"]),
         .executableTarget(name: "sc-browser-dev", dependencies: ["SCShared", "SCBrowser"]),
+        .executableTarget(name: "sc-focus-probe"),
     ],
     swiftLanguageModes: [.v5]
 )
