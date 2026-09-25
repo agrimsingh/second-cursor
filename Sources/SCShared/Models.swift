@@ -86,13 +86,18 @@ public struct SnapshotOptions: Sendable, Equatable {
     public var includeScreenshot: Bool
     public var includeMenuBar: Bool
     public var maxElements: Int
-    public var maxDepth: Int
+    /// `false` returns a diff against the window's previous full snapshot when one exists.
+    public var full: Bool
+    /// When set, returns only the subtree rooted at this element index, at full depth.
+    public var scope: Int?
 
-    public init(includeScreenshot: Bool = true, includeMenuBar: Bool = false, maxElements: Int = 400, maxDepth: Int = 40) {
+    public init(includeScreenshot: Bool = true, includeMenuBar: Bool = false, maxElements: Int = 400,
+                full: Bool = true, scope: Int? = nil) {
         self.includeScreenshot = includeScreenshot
         self.includeMenuBar = includeMenuBar
         self.maxElements = maxElements
-        self.maxDepth = maxDepth
+        self.full = full
+        self.scope = scope
     }
 }
 
@@ -105,14 +110,22 @@ public struct WindowSnapshot: Sendable, Equatable {
     public var tree: String
     public var elementCount: Int
     public var truncated: Bool
+    /// True when `tree` is a diff; `diffBase` is the snapshot id it was computed against.
+    public var isDiff: Bool
+    public var diffBase: String?
+    public var scope: Int?
     public var screenshot: Screenshot?
 
-    public init(window: WindowInfo, snapshotID: String, tree: String, elementCount: Int, truncated: Bool, screenshot: Screenshot?) {
+    public init(window: WindowInfo, snapshotID: String, tree: String, elementCount: Int, truncated: Bool,
+                isDiff: Bool = false, diffBase: String? = nil, scope: Int? = nil, screenshot: Screenshot? = nil) {
         self.window = window
         self.snapshotID = snapshotID
         self.tree = tree
         self.elementCount = elementCount
         self.truncated = truncated
+        self.isDiff = isDiff
+        self.diffBase = diffBase
+        self.scope = scope
         self.screenshot = screenshot
     }
 }
@@ -163,6 +176,14 @@ public enum BatchAction: Sendable, Equatable {
     case drag(from: Point, to: Point)
     case performAction(elementIndex: Int, action: String)
     case wait(milliseconds: Int)
+
+    /// Whether the step addresses window pixels, which go stale when the layout changes.
+    public var usesPixels: Bool {
+        switch self {
+        case .click(.point, _, _), .scroll(.point?, _, _), .drag: return true
+        default: return false
+        }
+    }
 }
 
 /// `tool` is the step's tool name as the client wrote it; used for results and the action log.

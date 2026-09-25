@@ -8,6 +8,7 @@ import SCShared
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let desktop = Desktop()
+    private let agentCursor = AgentCursorOverlay()
     private let agentDisplay = AgentDisplay()
     private let browserBridge = BrowserBridge()
     private var server: SecondCursorServer?
@@ -18,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         installSignalHandlers()
         Permissions.requestMissing()
+        desktop.cursor = agentCursor
 
         let config: SCConfig
         do {

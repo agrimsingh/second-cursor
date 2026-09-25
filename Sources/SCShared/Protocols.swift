@@ -57,11 +57,25 @@ public protocol DesktopControlling: AnyObject, Sendable {
     func screenshot(windowID: UInt32) async throws -> Screenshot
     /// Runs `steps` strictly in order as one uninterrupted block on the batch window's app queue.
     /// `admit` runs before each step (pause/blocked gates, action log) and throws to refuse it.
-    /// After a failure the remaining steps are skipped unless `stopOnError` is false.
-    func runBatch(windowID: UInt32, steps: [BatchStep], stopOnError: Bool,
+    /// After a failure the remaining steps are skipped unless `stopOnError` is false. With
+    /// `stopOnLayoutChange`, a pixel step whose window changed size since it was last observed stops the batch.
+    func runBatch(windowID: UInt32, steps: [BatchStep], stopOnError: Bool, stopOnLayoutChange: Bool,
                   admit: @escaping @Sendable (BatchStep) throws -> Void) async throws -> [BatchStepResult]
     /// Returns once the window's accessibility tree has stopped changing (~300 ms), or after ~3 s.
     func settle(windowID: UInt32) async
+}
+
+/// What the visible agent cursor should show. Points are global screen points, top-left origin.
+public enum AgentCursorEvent: Sendable, Equatable {
+    case click(at: Point, count: Int)
+    case drag(from: Point, to: Point)
+    case scroll(at: Point)
+}
+
+/// Draws the agent's own on-screen cursor (never the user's). `present` returns once the cursor
+/// has arrived at the target, so the action it announces happens where the user sees it.
+public protocol AgentCursorPresenting: AnyObject, Sendable {
+    func present(_ event: AgentCursorEvent)
 }
 
 /// The agent-owned virtual display. Windows hosted there are on an always-active Space

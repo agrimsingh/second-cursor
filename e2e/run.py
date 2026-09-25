@@ -207,7 +207,8 @@ class Context:
         return self.wait_for_window("TextEdit", pid=pid, title=filename)
 
     def tree(self, window_id, **opts):
-        return self.call("get_window_state", window_id=window_id, **opts)["tree"]
+        """Always the full tree: scenarios parse indexes from it. Diffs are exercised by tree_diffs."""
+        return self.call("get_window_state", window_id=window_id, full=True, **opts)["tree"]
 
 
 def element_index(tree, role, label=None):
@@ -388,7 +389,9 @@ def step(tool, **args):
 
 
 def value_of(tree, role="AXTextArea"):
-    match = re.search(rf'\] {role} "[^"]*" value="((?:[^"\\]|\\.)*)"', tree)
+    """Reads a full tree or a diff; a diff's '-' lines are state that no longer exists."""
+    current = "\n".join(line for line in tree.splitlines() if not line.startswith("-"))
+    match = re.search(rf'\] {role} "[^"]*" value="((?:[^"\\]|\\.)*)"', current)
     return json.loads(f'"{match.group(1)}"') if match else None
 
 
@@ -468,6 +471,135 @@ def batch_order_and_errors(ctx):
 
     result = ctx.call("batch", window_id=wid, observe="none", steps=[step("wait", ms=10)])
     ctx.check('observe="none" returns no observation', result.get("observation") is None, result)
+
+
+def png_pixels(data):
+    """Minimal PNG decoder (8-bit RGB/RGBA, non-interlaced), enough to inspect screenshots without PIL."""
+    import struct, zlib
+    pos, idat = 8, b""
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        kind, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, height, _, color_type = struct.unpack(">IIBB", body[:10])
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + length
+    bpp = 4 if color_type == 6 else 3
+    raw, stride, rows, prev, i = zlib.decompress(idat), width * bpp, [], bytearray(width * bpp), 0
+    for _ in range(height):
+        kind, line = raw[i], bytearray(raw[i + 1:i + 1 + stride])
+        i += 1 + stride
+        for x in range(stride):
+            a = line[x - bpp] if x >= bpp else 0
+            b, c = prev[x], (prev[x - bpp] if x >= bpp else 0)
+            if kind == 1: line[x] = (line[x] + a) & 255
+            elif kind == 2: line[x] = (line[x] + b) & 255
+            elif kind == 3: line[x] = (line[x] + (a + b) // 2) & 255
+            elif kind == 4:
+                p = a + b - c
+                line[x] = (line[x] + (a if abs(p - a) <= abs(p - b) and abs(p - a) <= abs(p - c) else b if abs(p - b) <= abs(p - c) else c)) & 255
+        rows.append(bytes(line))
+        prev = line
+    return [(row[x * bpp], row[x * bpp + 1], row[x * bpp + 2]) for row in rows for x in range(width)]
+
+
+def accent_pixels(pixels):
+    return sum(1 for r, g, b in pixels if r > 200 and 40 < g < 130 and b < 70)
+
+
+@scenario
+def agent_cursor_visible(ctx):
+    window = ctx.launch_scratch_textedit("cursor.txt", "line one\nline two")
+    if not window["is_on_screen"]:
+        raise Skip("scratch window opened on a Space the user is not viewing; the agent cursor only shows on the current Space")
+    wid = window["id"]
+    _, frame = text_area(ctx, wid)
+    local = (frame[0] + 3, frame[1] + 6)
+    ctx.call("click", window_id=wid, x=local[0], y=local[1])
+
+    screen_x, screen_y = window["frame"]["x"] + local[0], window["frame"]["y"] + local[1]
+    region = ctx.run.dir / "screenshots" / f"{ctx.name}-around-click.png"
+    subprocess.run(["screencapture", "-x", "-R", f"{int(screen_x) - 10},{int(screen_y) - 10},48,48", str(region)], check=True)
+    ctx.screenshots.append(region.relative_to(ctx.run.dir).as_posix())
+    ctx.check("the agent's orange arrow is drawn on screen at the click point", accent_pixels(png_pixels(region.read_bytes())) >= 20)
+
+    shot = ctx.mcp.call("screenshot", window_id=wid)[1][0]
+    ctx.check("the agent's own window screenshot does not include its arrow",
+              accent_pixels(png_pixels(base64.b64decode(shot["data"]))) < 5)
+    ctx.call("type_text", window_id=wid, text="Z")
+    ctx.check("the click still landed", value_of(ctx.tree(wid, include_screenshot=False)) == "Zline one\nline two")
+
+
+@scenario
+def tree_diffs(ctx):
+    window = ctx.launch_scratch_textedit("diff.txt", "alpha")
+    wid = window["id"]
+    full = ctx.call("get_window_state", window_id=wid, include_screenshot=False, full=True)
+    ctx.check("first full snapshot is not a diff", not full.get("is_diff"), full.get("is_diff"))
+    area = element_index(full["tree"], "AXTextArea")
+    ctx.require("text area is indexed in the full tree", area is not None, full["tree"][:300])
+    base_id = full["snapshot_id"]
+    full_len = len(full["tree"])
+
+    ctx.call("set_value", window_id=wid, element_index=area, value="alpha beta gamma")
+    diff = ctx.call("get_window_state", window_id=wid, include_screenshot=False)
+    ctx.check("second snapshot defaults to a diff", diff.get("is_diff"), diff)
+    ctx.check("diff names the snapshot it is based on", diff.get("diff_base") == base_id, diff.get("diff_base"))
+    ctx.check("diff shows the changed value as an added line", re.search(r'^\+.*value="alpha beta gamma"', diff["tree"], re.M), diff["tree"][:400])
+    ctx.check("diff is much smaller than the full tree", len(diff["tree"]) < full_len, (len(diff["tree"]), full_len))
+
+    # Stable indexes: the index from the first full snapshot still addresses the same element.
+    reused = ctx.call("set_value", window_id=wid, element_index=area, value="stable")
+    ctx.check("element index stayed stable across snapshots", reused.get("ok"), reused)
+    ctx.check("acting on it changed the value", value_of(ctx.tree(wid, include_screenshot=False)) == "stable")
+
+    nochange = ctx.call("get_window_state", window_id=wid, include_screenshot=False)
+    ctx.check("a snapshot with no UI change reports no changes", "no changes" in nochange["tree"].lower(), nochange["tree"][:200])
+
+    again_full = ctx.call("get_window_state", window_id=wid, include_screenshot=False, full=True)
+    ctx.check("full=true returns the whole tree again", not again_full.get("is_diff") and "AXTextArea" in again_full["tree"])
+
+
+@scenario
+def scope_reads(ctx):
+    window = ctx.launch_scratch_textedit("scope.txt", "scoped")
+    wid = window["id"]
+    full = ctx.call("get_window_state", window_id=wid, include_screenshot=False, full=True)
+    ctx.check("full tree includes the window control buttons", full["tree"].count("AXButton") >= 2, full["tree"][:300])
+    area = element_index(full["tree"], "AXTextArea")
+    ctx.require("text area is indexed", area is not None, full["tree"][:300])
+
+    scoped = ctx.call("get_window_state", window_id=wid, include_screenshot=False, scope=area)
+    ctx.check("scoped read is rooted at the requested element", "AXTextArea" in scoped["tree"], scoped["tree"][:300])
+    ctx.check("scoped read excludes elements outside the subtree", "AXButton" not in scoped["tree"], scoped["tree"][:300])
+    ctx.check("scoped read is not a diff", not scoped.get("is_diff"), scoped)
+    ctx.check("the scoped element index still acts", ctx.call("set_value", window_id=wid, element_index=area, value="ok").get("ok"))
+
+
+@scenario
+def batch_layout_guard(ctx):
+    calc = ctx.call("launch_app", app="Calculator", new_instance=True)
+    ctx.kill_on_exit(calc["app"]["pid"])
+    window = ctx.wait_for_window("Calculator", pid=calc["app"]["pid"])
+    wid = window["id"]
+    start_w = window["frame"]["width"]
+
+    # cmd+2 switches Calculator to Scientific, which resizes the window; the following pixel click
+    # would land on stale coordinates, so the guard should stop the batch before it runs.
+    result = ctx.call("batch", window_id=wid, stop_on_layout_change=True, steps=[
+        step("press_key", keys="cmd+2"),
+        step("wait", ms=400),
+        step("click", x=40, y=40),
+    ])
+    tools = [(s["tool"], s["ok"], s.get("skipped"), s.get("error")) for s in result["steps"]]
+    ctx.check("the mode switch ran", result["steps"][0]["ok"], tools)
+    ctx.check("the pixel click after the resize was stopped", not result["steps"][2]["ok"], tools)
+    ctx.check("it was stopped for a layout change, not attempted", "layout" in (result["steps"][2].get("error") or "").lower(), tools)
+    changed = ctx.call("list_windows", app="Calculator")["windows"]
+    now = next((w for w in changed if w["id"] == wid), None) or changed[0]
+    ctx.check("the window really did resize", now["frame"]["width"] != start_w, (start_w, now["frame"]["width"]))
+    ctx.call("batch", window_id=now["id"], steps=[step("press_key", keys="cmd+1")], observe="none")
 
 
 @scenario

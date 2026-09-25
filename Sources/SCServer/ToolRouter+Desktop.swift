@@ -32,19 +32,12 @@ extension ToolRouter {
         case "get_window_state":
             let options = SnapshotOptions(
                 includeScreenshot: try args.bool("include_screenshot", default: true),
-                includeMenuBar: try args.bool("include_menu_bar", default: false)
+                includeMenuBar: try args.bool("include_menu_bar", default: false),
+                full: try args.bool("full", default: false),
+                scope: try args.optionalInt("scope")
             )
             let snapshot = try await desktop.windowState(windowID: try args.windowID(), options: options)
-            return ToolOutput(
-                json: [
-                    "window": Shape.window(snapshot.window, agentBounds: await agentBounds()),
-                    "snapshot_id": snapshot.snapshotID,
-                    "element_count": snapshot.elementCount,
-                    "truncated": snapshot.truncated,
-                    "tree": snapshot.tree,
-                ],
-                images: snapshot.screenshot.map { [$0] } ?? []
-            )
+            return ToolOutput(json: await snapshotJSON(snapshot), images: snapshot.screenshot.map { [$0] } ?? [])
 
         case "click":
             guard let target = try args.clickTarget() else { throw SCError.invalidArgument("Pass element_index, or both x and y") }
@@ -123,6 +116,20 @@ extension ToolRouter {
         ToolOutput(json: Shape.action(result))
     }
 
+    private func snapshotJSON(_ snapshot: WindowSnapshot) async -> [String: Any] {
+        var json: [String: Any] = [
+            "window": Shape.window(snapshot.window, agentBounds: await agentBounds()),
+            "snapshot_id": snapshot.snapshotID,
+            "element_count": snapshot.elementCount,
+            "truncated": snapshot.truncated,
+            "is_diff": snapshot.isDiff,
+            "tree": snapshot.tree,
+        ]
+        if let base = snapshot.diffBase { json["diff_base"] = base }
+        if let scope = snapshot.scope { json["scope"] = scope }
+        return json
+    }
+
     private static let batchTools: Set<String> = ["click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "wait"]
 
     private func runBatch(_ args: Arguments) async throws -> ToolOutput {
@@ -137,8 +144,10 @@ extension ToolRouter {
         }
 
         // Each step passes the same gates as a standalone call and gets its own log line, refusals included.
+        let full = try args.bool("full", default: false)
         let results = try await desktop.runBatch(
-            windowID: windowID, steps: steps, stopOnError: try args.bool("stop_on_error", default: true)
+            windowID: windowID, steps: steps, stopOnError: try args.bool("stop_on_error", default: true),
+            stopOnLayoutChange: try args.bool("stop_on_layout_change", default: true)
         ) { [appGuard, log] step in
             do {
                 if PauseState.isPaused { throw SCError.paused }
@@ -171,14 +180,8 @@ extension ToolRouter {
             switch observe {
             case "tree", "both":
                 let snapshot = try await desktop.windowState(
-                    windowID: windowID, options: SnapshotOptions(includeScreenshot: observe == "both"))
-                json["observation"] = [
-                    "window": Shape.window(snapshot.window, agentBounds: await agentBounds()),
-                    "snapshot_id": snapshot.snapshotID,
-                    "element_count": snapshot.elementCount,
-                    "truncated": snapshot.truncated,
-                    "tree": snapshot.tree,
-                ]
+                    windowID: windowID, options: SnapshotOptions(includeScreenshot: observe == "both", full: full))
+                json["observation"] = await snapshotJSON(snapshot)
                 images = snapshot.screenshot.map { [$0] } ?? []
             case "screenshot":
                 await desktop.settle(windowID: windowID)

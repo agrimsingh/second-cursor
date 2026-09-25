@@ -46,17 +46,19 @@ enum ToolCatalog {
         ),
         Tool(
             name: "get_window_state",
-            description: "Read a window: an indented accessibility outline where actionable elements carry [index] markers and frames, plus a screenshot. Call before acting and after any action that changes the UI; indexes are only valid for the latest snapshot of that window.",
+            description: "Read a window: an indented accessibility outline where actionable elements carry [index] markers and window-local frames, plus a screenshot. The first read of a window returns the whole outline; later reads return only what changed since the previous read (is_diff=true): lines starting with + are new or changed, lines starting with - are gone, and \"(no changes)\" means the UI is the same. An element keeps its index across reads as long as it keeps its place in the UI, so indexes from earlier reads stay usable. Pass full=true to get the whole outline again, and scope=<index> to read everything inside one element at full depth when the outline is truncated or a region needs detail.",
             inputSchema: schema([
                 "window_id": windowID,
                 "include_screenshot": boolean("Attach a PNG screenshot of the window.", default: true),
                 "include_menu_bar": boolean("Include the app's menu bar in the outline.", default: false),
+                "full": boolean("Return the whole outline instead of a diff from the previous read.", default: false),
+                "scope": integer("Return only the subtree under this element index, at full depth. Not a diff."),
             ], required: ["window_id"]),
             annotations: .init(readOnlyHint: true)
         ),
         Tool(
             name: "batch",
-            description: "Run several actions on one window in a single call, strictly in order, then return one observation after the UI settles. Batch predictable sequences where you already know every step: pressing a known series of buttons, filling known fields, typing followed by a shortcut, keyboard navigation. Do not batch past a step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet): end the batch there and look at the observation, or call get_window_state. Element indexes come from the latest get_window_state and are not refreshed between steps. Each step's result reports ok, route, and error; by default the batch stops at the first failure.",
+            description: "Run several actions on one window in a single call, strictly in order, then return one observation after the UI settles. Batch predictable sequences where you already know every step: pressing a known series of buttons, filling known fields, typing followed by a shortcut, keyboard navigation. Do not batch past a step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet): end the batch there and look at the observation, or call get_window_state. Element indexes come from get_window_state and are not refreshed between steps. Pixel steps (x/y clicks, drags, scrolls at a point) stop the batch if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the batch stops at the first failure. The observation is a diff like get_window_state unless full=true.",
             inputSchema: schema([
                 "window_id": windowID,
                 "steps": .object([
@@ -75,6 +77,8 @@ enum ToolCatalog {
                 ]),
                 "observe": string("What to return after the last step.", enumValues: ["tree", "screenshot", "both", "none"], default: "tree"),
                 "stop_on_error": boolean("Skip the remaining steps after the first failure.", default: true),
+                "stop_on_layout_change": boolean("Stop before a pixel step when the window's size changed since it was last observed.", default: true),
+                "full": boolean("Return the whole outline in the observation instead of a diff.", default: false),
             ], required: ["window_id", "steps"])
         ),
         Tool(
@@ -253,7 +257,7 @@ enum ToolCatalog {
     ]
 
     private static let windowID = integer("Window id from list_windows or launch_app.")
-    private static let elementIndex = integer("Element [index] from the latest get_window_state of this window.")
+    private static let elementIndex = integer("Element [index] from get_window_state of this window.")
     private static let tabID = integer("Agent tab id from browser_open or browser_tabs.")
 
     private static func schema(_ properties: [String: Value], required: [String] = []) -> Value {

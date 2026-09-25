@@ -4,10 +4,16 @@ import Foundation
 import SCShared
 
 public final class Desktop: DesktopControlling, @unchecked Sendable {
-    private struct Snapshot {
-        let id: String
+    /// What the agent last saw of one window. Only touched on that window's app queue.
+    private final class WindowTree {
         let pid: pid_t
-        let elements: [SnapshotElement]
+        let table = IndexTable()
+        var snapshotID: String?
+        /// The last full rendering; the next diff is computed against it.
+        var lines: [String]?
+        var elements: [Int: SnapshotElement] = [:]
+
+        init(pid: pid_t) { self.pid = pid }
     }
 
     /// AX and input calls block on the target app, so each app gets its own serial queue: actions on
@@ -17,10 +23,21 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     private var queues: [pid_t: DispatchQueue] = [:]
     private let listQueue = DispatchQueue(label: "dev.secondcursor.desktop.list")
     private let resolver = WindowResolver()
-    private var snapshots: [CGWindowID: Snapshot] = [:]
+    private var trees: [CGWindowID: WindowTree] = [:]
+    /// Window size when the agent last observed it; pixel coordinates it sends are relative to that layout.
+    private var observedSizes: [CGWindowID: CGSize] = [:]
     private var lastAction: [CGWindowID: Date] = [:]
 
+    /// Draws the agent's visible cursor. Set once by the app at launch; command-line tools leave it nil.
+    public var cursor: AgentCursorPresenting?
+
     public init() {}
+
+    /// Only for windows on the user's current Space: an arrow aimed at a window they cannot see would mislead.
+    private func showCursor(_ record: CGWindowRecord, _ event: AgentCursorEvent) {
+        guard record.isOnScreen, let cursor else { return }
+        cursor.present(event)
+    }
 
     private func queue(for pid: pid_t) -> DispatchQueue {
         lock.lock()
@@ -42,16 +59,39 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         return try await run(on: queue(for: record.pid), work)
     }
 
-    private func storeSnapshot(_ snapshot: Snapshot?, for wid: CGWindowID) {
+    /// A window id can be reused by a different process, so a tree for another pid starts over.
+    private func tree(for wid: CGWindowID, pid: pid_t) -> WindowTree {
         lock.lock()
-        snapshots[wid] = snapshot
+        defer { lock.unlock() }
+        if let tree = trees[wid], tree.pid == pid { return tree }
+        let tree = WindowTree(pid: pid)
+        trees[wid] = tree
+        return tree
+    }
+
+    private func storedTree(for wid: CGWindowID) -> WindowTree? {
+        lock.lock()
+        defer { lock.unlock() }
+        return trees[wid]
+    }
+
+    private func forget(_ wid: CGWindowID) {
+        lock.lock()
+        trees[wid] = nil
+        observedSizes[wid] = nil
         lock.unlock()
     }
 
-    private func storedSnapshot(for wid: CGWindowID) -> Snapshot? {
+    private func noteObserved(_ wid: CGWindowID, size: CGSize) {
+        lock.lock()
+        observedSizes[wid] = size
+        lock.unlock()
+    }
+
+    private func observedSize(_ wid: CGWindowID) -> CGSize? {
         lock.lock()
         defer { lock.unlock() }
-        return snapshots[wid]
+        return observedSizes[wid]
     }
 
     public func permissionStatus() -> PermissionStatus {
@@ -103,14 +143,29 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         return try await act(windowID) { try self.performKey(windowID, chord: chord) }
     }
 
-    public func runBatch(windowID: UInt32, steps: [BatchStep], stopOnError: Bool,
+    public func runBatch(windowID: UInt32, steps: [BatchStep], stopOnError: Bool, stopOnLayoutChange: Bool,
                          admit: @escaping @Sendable (BatchStep) throws -> Void) async throws -> [BatchStepResult] {
         try await run(windowID: windowID) {
+            // Pixel steps were planned against the layout the agent last saw, or failing that, the layout at batch start.
+            var expected: [CGWindowID: CGSize] = [:]
+            for wid in Set(steps.map(\.windowID)) {
+                expected[wid] = self.observedSize(wid) ?? WindowList.record(wid)?.bounds.size
+            }
             var results: [BatchStepResult] = []
             var halted = false
             for step in steps {
                 if halted {
                     results.append(BatchStepResult(tool: step.tool, ok: false, skipped: true, error: "skipped: an earlier step failed"))
+                    continue
+                }
+                if stopOnLayoutChange, step.action.usesPixels, let before = expected[step.windowID],
+                   let now = WindowList.record(step.windowID)?.bounds.size,
+                   abs(now.width - before.width) > 1 || abs(now.height - before.height) > 1 {
+                    results.append(BatchStepResult(tool: step.tool, ok: false, error:
+                        "Stopped before this step: the window layout changed (\(Int(before.width))x\(Int(before.height)) → "
+                        + "\(Int(now.width))x\(Int(now.height))) since it was last observed, so its pixel coordinates may be stale. "
+                        + "Observe again, or pass stop_on_layout_change=false."))
+                    halted = true
                     continue
                 }
                 do {
@@ -173,6 +228,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 throw SCError.invalidArgument("Point (\(point.x), \(point.y)) is outside window \(wid) (\(Int(record.bounds.width))x\(Int(record.bounds.height)))")
             }
         }
+        showCursor(record, .drag(from: Point(x: record.bounds.minX + from.x, y: record.bounds.minY + from.y),
+                                 to: Point(x: record.bounds.minX + to.x, y: record.bounds.minY + to.y)))
         Pointer.drag(pid: record.pid, wid: record.id,
                      from: Self.location(record, local: CGPoint(x: from.x, y: from.y)),
                      to: Self.location(record, local: CGPoint(x: to.x, y: to.y)), flags: flags)
@@ -246,10 +303,20 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     private func settleNow(_ wid: CGWindowID, quiet: TimeInterval = 0.3, cap: TimeInterval = 3) -> Bool {
         guard let record = WindowList.record(wid), let window = try? resolver.resolve(pid: record.pid, wid: wid) else { return false }
         func fingerprint() -> Int {
-            let frame = window.frame ?? record.bounds
-            var builder = TreeBuilder(origin: frame.origin, maxElements: 400, maxDepth: 40)
-            builder.build(window: window, title: "", size: frame.size, menuBar: nil)
-            return builder.text.hashValue
+            var builder = TreeBuilder(maxNodes: 600, maxDepth: 40)
+            builder.build(window: window, menuBar: nil)
+            var hasher = Hasher()
+            for node in builder.nodes {
+                hasher.combine(node.key)
+                hasher.combine(node.value)
+                if let frame = node.frame {
+                    hasher.combine(frame.minX)
+                    hasher.combine(frame.minY)
+                    hasher.combine(frame.width)
+                    hasher.combine(frame.height)
+                }
+            }
+            return hasher.finalize()
         }
         let deadline = Date().addingTimeInterval(cap)
         var last = fingerprint()
@@ -292,7 +359,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     }
 
     public func screenshot(windowID: UInt32) async throws -> Screenshot {
-        guard WindowList.record(windowID) != nil else { throw SCError.windowNotFound(windowID) }
+        guard let record = WindowList.record(windowID) else { throw SCError.windowNotFound(windowID) }
+        noteObserved(windowID, size: record.bounds.size)
         return try await Capture.window(windowID)
     }
 
@@ -300,7 +368,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     private func record(_ wid: CGWindowID) throws -> CGWindowRecord {
         guard let record = WindowList.record(wid) else {
-            storeSnapshot(nil, for: wid)
+            forget(wid)
             throw SCError.windowNotFound(wid)
         }
         return record
@@ -350,23 +418,48 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let record = try record(wid)
         let window = try resolver.resolve(pid: record.pid, wid: wid)
         let frame = window.frame ?? record.bounds
-        let title = window.string(kAXTitleAttribute) ?? record.title
-        var builder = TreeBuilder(origin: frame.origin, maxElements: options.maxElements, maxDepth: options.maxDepth)
-        let menuBar = options.includeMenuBar ? AXUIElementCreateApplication(record.pid).element(kAXMenuBarAttribute) : nil
-        builder.build(window: window, title: title, size: frame.size, menuBar: menuBar)
+        let tree = tree(for: wid, pid: record.pid)
         let id = String(UUID().uuidString.prefix(8)).lowercased()
-        storeSnapshot(Snapshot(id: id, pid: record.pid, elements: builder.elements), for: wid)
+        noteObserved(wid, size: record.bounds.size)
+
+        if let scope = options.scope {
+            guard tree.snapshotID != nil else { throw SCError.staleSnapshot(wid) }
+            guard let root = tree.elements[scope] else { throw SCError.elementNotFound(scope) }
+            guard root.element.isAlive else {
+                throw SCError.actionFailed("Element \(scope) no longer exists; call get_window_state again")
+            }
+            var builder = TreeBuilder()
+            builder.build(subtreeOf: root.element, key: root.key, inWebArea: root.inWebArea)
+            let out = TreeRenderer.scoped(scope: scope, windowOrigin: frame.origin, nodes: builder.nodes,
+                                          table: tree.table, maxElements: max(options.maxElements, 2000))
+            tree.elements.merge(out.elements) { _, scoped in scoped }
+            return WindowSnapshot(window: windowInfo(record, window: window), snapshotID: id, tree: out.text,
+                                  elementCount: out.indexedCount, truncated: out.truncated || builder.truncated, scope: scope)
+        }
+
+        var builder = TreeBuilder()
+        let menuBar = options.includeMenuBar ? AXUIElementCreateApplication(record.pid).element(kAXMenuBarAttribute) : nil
+        builder.build(window: window, menuBar: menuBar)
+        let title = window.string(kAXTitleAttribute) ?? record.title
+        let out = TreeRenderer.full(title: title, size: frame.size, windowOrigin: frame.origin, nodes: builder.nodes,
+                                    table: tree.table, maxElements: options.maxElements)
+        tree.table.retain(keys: Set(builder.nodes.map(\.key)))
+        let base = tree.snapshotID
+        let diff = options.full ? nil : tree.lines.flatMap { TreeRenderer.diff(previous: $0, current: out.lines) }
+        tree.snapshotID = id
+        tree.lines = out.lines
+        tree.elements = out.elements
         return WindowSnapshot(
-            window: windowInfo(record, window: window), snapshotID: id, tree: builder.text,
-            elementCount: builder.elements.count, truncated: builder.truncated, screenshot: nil
+            window: windowInfo(record, window: window), snapshotID: id, tree: diff ?? out.text,
+            elementCount: out.indexedCount, truncated: out.truncated || builder.truncated,
+            isDiff: diff != nil, diffBase: diff != nil ? base : nil
         )
     }
 
     private func element(_ wid: CGWindowID, _ index: Int) throws -> (CGWindowRecord, SnapshotElement) {
         let record = try record(wid)
-        guard let snapshot = storedSnapshot(for: wid), snapshot.pid == record.pid else { throw SCError.staleSnapshot(wid) }
-        guard snapshot.elements.indices.contains(index) else { throw SCError.elementNotFound(index) }
-        let element = snapshot.elements[index]
+        guard let tree = storedTree(for: wid), tree.pid == record.pid, tree.snapshotID != nil else { throw SCError.staleSnapshot(wid) }
+        guard let element = tree.elements[index] else { throw SCError.elementNotFound(index) }
         guard element.element.isAlive else {
             throw SCError.actionFailed("Element \(index) no longer exists; call get_window_state again")
         }
@@ -385,6 +478,9 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             let action = button == .left ? kAXPressAction : button == .right ? kAXShowMenuAction : nil
             // Modifier clicks (shift-extend, cmd-toggle) have no accessibility equivalent, so they go through the pointer.
             if flags.isEmpty, let action, element.element.actions.contains(action) {
+                if let frame = element.element.frame {
+                    showCursor(record, .click(at: Point(x: frame.midX, y: frame.midY), count: button == .left ? count : 1))
+                }
                 for _ in 0..<(button == .left ? count : 1) {
                     let error = element.element.perform(action)
                     guard error == .success || error == .cannotComplete else {
@@ -410,6 +506,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         guard local.x >= 0, local.y >= 0, local.x < record.bounds.width, local.y < record.bounds.height else {
             throw SCError.invalidArgument("Point (\(local.x), \(local.y)) is outside window \(record.id) (\(Int(record.bounds.width))x\(Int(record.bounds.height)))")
         }
+        showCursor(record, .click(at: Point(x: record.bounds.minX + local.x, y: record.bounds.minY + local.y), count: count))
         Pointer.click(pid: record.pid, wid: record.id, at: Self.location(record, local: local), button: button, count: count, flags: flags)
         return ActionResult(route: "skylight_pointer")
     }
@@ -468,6 +565,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         case .left: (3, 0)
         case .right: (-3, 0)
         }
+        showCursor(record, .scroll(at: Point(x: record.bounds.minX + local.x, y: record.bounds.minY + local.y)))
         Pointer.scroll(pid: record.pid, wid: record.id, at: Self.location(record, local: local), dx: dx, dy: dy, ticks: amount)
         return ActionResult(route: "skylight_wheel")
     }
