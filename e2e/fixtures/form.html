@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Second Cursor fixture — form</title></head>
+<body>
+  <h1 id="greeting">Hello, stranger</h1>
+  <form id="f">
+    <label>Name <input id="name" name="name" type="text"></label>
+    <button type="submit">Submit</button>
+  </form>
+  <p><a href="next.html">Next page</a></p>
+  <script>
+    document.getElementById("f").addEventListener("submit", (e) => {
+      e.preventDefault();
+      document.getElementById("greeting").textContent = "Hello, " + document.getElementById("name").value;
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+---
+description: Testing policy for second-cursor
+alwaysApply: true
+---
+
+# Testing
+
+- Never write unit tests after writing code.
+- End-to-end tests are the testing mechanism. They live in `e2e/`, drive the installed app through its MCP HTTP endpoint like a real client, and every run writes a verifiable, repeatable artifact to `e2e/artifacts/<run-id>/` (report, screenshots, call transcript).
+- If a component truly must be tested in isolation, first write down every way it could fail, then write the code.
+- During development, verify behavior by running the real thing (`sc-dev`, `sc-display-dev`, the app) against scratch windows, not with mocks.
