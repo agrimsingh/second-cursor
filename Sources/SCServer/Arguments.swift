@@ -39,6 +39,7 @@ struct Arguments {
 
     func optionalString(_ key: String) throws -> String? {
         guard let value = present(key) else { return nil }
+        if case .data = value { return value.description }
         guard let string = String(value, strict: false) else { throw SCError.invalidArgument("\(key) must be a string") }
         return string
     }

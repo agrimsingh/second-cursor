@@ -87,6 +87,8 @@ enum SkyLight {
 
     // MARK: Focus without raise
 
+    private static let focusLock = NSRecursiveLock()
+
     struct FocusHandoff {
         let previousPSN: ProcessSerialNumber
         let previousWindow: CGWindowID?
@@ -98,18 +100,26 @@ enum SkyLight {
     /// any window, activating the app, or following a Space (yabai's focus-without-raise recipe).
     /// AppKit then treats the next click as a normal click instead of a window-activation click.
     static func focusWithoutRaise(pid: pid_t, wid: CGWindowID) -> FocusHandoff? {
-        guard let front = frontProcess(), let target = processSerialNumber(pid: pid, wid: wid) else { return nil }
+        focusLock.lock()
+        guard let front = frontProcess(), let target = processSerialNumber(pid: pid, wid: wid) else { focusLock.unlock(); return nil }
         let previousWindow = processID(front).flatMap(focusedWindow(pid:))
-        guard postFocusRecord(to: front, wid: previousWindow ?? 0, focus: false),
-              postFocusRecord(to: target, wid: wid, focus: true)
-        else { return nil }
+        guard postFocusRecord(to: front, wid: previousWindow ?? 0, focus: false) else { focusLock.unlock(); return nil }
+        guard postFocusRecord(to: target, wid: wid, focus: true) else {
+            _ = postFocusRecord(to: front, wid: previousWindow ?? 0, focus: true)
+            focusLock.unlock(); return nil
+        }
         return FocusHandoff(previousPSN: front, previousWindow: previousWindow, targetPSN: target, targetWindow: wid)
     }
 
     /// Undoes `focusWithoutRaise`; otherwise the user's key window stops taking keystrokes until they click it.
     static func restore(_ handoff: FocusHandoff) {
+        defer { focusLock.unlock() }
         _ = postFocusRecord(to: handoff.targetPSN, wid: handoff.targetWindow, focus: false)
-        _ = postFocusRecord(to: handoff.previousPSN, wid: handoff.previousWindow ?? 0, focus: true)
+        // Respect a human app switch that happened while the background shortcut ran.
+        let current = frontProcess() ?? handoff.previousPSN
+        let unchanged = current.highLongOfPSN == handoff.previousPSN.highLongOfPSN && current.lowLongOfPSN == handoff.previousPSN.lowLongOfPSN
+        let window = unchanged ? handoff.previousWindow : processID(current).flatMap(focusedWindow(pid:))
+        _ = postFocusRecord(to: current, wid: window ?? 0, focus: true)
     }
 
     /// True when WindowServer considers `pid` the front process.

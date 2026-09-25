@@ -22,6 +22,9 @@ struct AppGuard {
 
     func checkWindow(_ windowID: UInt32) throws -> (pid: Int32, bundleID: String?) {
         guard let owner = Self.owner(of: windowID) else { throw SCError.windowNotFound(windowID) }
+        if owner.pid == ProcessInfo.processInfo.processIdentifier {
+            throw SCError.notAllowed("The agent cannot control Second Cursor or its local approval windows")
+        }
         if config.isBlocked(bundleID: owner.bundleID) {
             throw SCError.notAllowed("Window \(windowID) belongs to \(owner.bundleID ?? "a blocked app"), which is blocked for the agent")
         }

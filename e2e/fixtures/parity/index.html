@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>Second Cursor parity fixture</title>
+<style>body{font:18px system-ui;padding:30px}input,textarea,button,select{font:inherit;margin:8px}#scroll{height:100px;overflow:auto;border:1px solid}#drag{background:coral;width:100px;height:70px}iframe{width:600px;height:220px}</style>
+<h1>Parity fixture</h1><label>Name <input id="name" placeholder="Your name"></label>
+<label>Enabled <input id="enabled" type="checkbox"></label>
+<label>Choice <select id="choice"><option value="a">Alpha</option><option value="b">Beta</option></select></label>
+<button disabled>Unavailable</button><button onclick="document.querySelector('#out').textContent='Saved '+document.querySelector('#name').value">Save</button>
+<button onclick="document.querySelector('#out').textContent=confirm('Continue?')?'accepted':'dismissed'">Confirm</button>
+<button onclick="document.querySelector('#out').textContent=prompt('Name?','initial')">Prompt</button>
+<button onclick="alert('Notice')">Alert</button><input type="file" id="upload" multiple onchange="document.querySelector('#out').textContent=[...this.files].map(x=>x.name).join(',')">
+<a href="download.txt" download="parity-download.txt">Download fixture</a><a href="next.html">Next page</a>
+<textarea aria-label="Long text" id="long"></textarea><div contenteditable="true" aria-label="Rich editor" role="textbox" id="rich">first repeat then second repeat 🙂</div>
+<div id="scroll"><div style="height:900px">Scrollable region</div></div><div draggable="true" id="drag">Drag me</div><div id="drop" style="height:80px;background:#ddd" ondragover="event.preventDefault()" ondrop="event.preventDefault();this.textContent='Dropped'">Drop here</div>
+<iframe title="Nested form" src="frame.html"></iframe><p id="out" role="status">Ready</p><div style="height:1100px">Tall page</div>
+<script>long.value='start '+('long text '.repeat(300))+' END';console.log('parity fixture loaded');document.querySelector('#name').addEventListener('contextmenu',e=>{e.preventDefault();out.textContent='right clicked'});</script>
+
+<label>Quantity <input type="number" value="2" min="0" max="10"></label>
+<script>
+const cross=document.createElement('iframe');cross.title='Cross-origin form';cross.src=location.origin.replace('127.0.0.1','localhost')+'/frame.html';document.body.append(cross);
+</script>

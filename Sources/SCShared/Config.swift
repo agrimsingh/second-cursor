@@ -26,6 +26,11 @@ public struct SCConfig: Codable, Sendable {
     /// Tool names that require user confirmation before running (send, delete, purchase, etc.).
     public var confirmationRequiredTools: [String]
 
+    /// Native ownership expires after this many idle seconds. Nil uses five minutes.
+    public var claimIdleSeconds: Double?
+    /// Completed explicit retry IDs expire after this many seconds. Nil uses one hour.
+    public var operationRetentionSeconds: Double?
+
     public init(port: Int, token: String, blockedBundleIDs: [String], confirmationRequiredTools: [String]) {
         self.port = port
         self.token = token

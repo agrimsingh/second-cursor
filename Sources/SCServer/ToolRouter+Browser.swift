@@ -4,6 +4,29 @@ import SCShared
 extension ToolRouter {
     func runBrowser(_ name: String, _ args: Arguments) async throws -> ToolOutput {
         switch name {
+        case "browser_instances":
+            return ToolOutput(json: (try? JSONSerialization.jsonObject(with: await browser.instances())) as? [String:Any] ?? [:])
+        case "browser_command":
+            var params = args.raw.mapValues { value -> Any in
+                // Use MCP's Codable representation to preserve nested structured arguments.
+                (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(value), options:.fragmentsAllowed)) ?? NSNull()
+            }
+            if let tid = try args.optionalInt("tab_id") { params["tabId"] = tid }
+            if try args.optionalString("operation") == "upload" {
+                for path in try args.strings("files") {
+                    var directory: ObjCBool = false
+                    guard path.hasPrefix("/"), FileManager.default.fileExists(atPath:path,isDirectory:&directory), !directory.boolValue else {
+                        throw SCError.invalidArgument("Upload file does not exist or is not a regular file: \(path)")
+                    }
+                }
+            }
+            let data = try await browser.command("extended",params: JSONSerialization.data(withJSONObject:params))
+            var json = try JSONSerialization.jsonObject(with:data) as? [String:Any] ?? [:]
+            var images: [Screenshot] = []
+            if let encoded = json.removeValue(forKey:"data") as? String, let png = Data(base64Encoded:encoded) {
+                images = [Screenshot(pngData:png,width:json["width"] as? Int ?? 0,height:json["height"] as? Int ?? 0,scale:json["scale"] as? Double ?? 1)]
+            }
+            return ToolOutput(json:json,images:images)
         case "browser_status":
             return ToolOutput(json: Shape.browser(await browser.status()))
 
@@ -11,19 +34,21 @@ extension ToolRouter {
             return ToolOutput(json: ["tabs": try await browser.listTabs().map(Shape.tab)])
 
         case "browser_open":
-            return ToolOutput(json: ["tab": Shape.tab(try await browser.openTab(url: try args.string("url")))])
+            let data=try await browser.command("tabs.open",params:JSONSerialization.data(withJSONObject:["url":args.string("url")]))
+            return ToolOutput(json:try JSONSerialization.jsonObject(with:data) as? [String:Any] ?? [:])
 
         case "browser_navigate":
             let tab = try await browser.navigate(tabID: try args.int("tab_id"), url: try args.string("url"))
             return ToolOutput(json: ["tab": Shape.tab(tab)])
 
         case "browser_snapshot":
-            let snapshot = try await browser.snapshot(
-                tabID: try args.int("tab_id"), includeScreenshot: try args.bool("include_screenshot", default: false))
-            return ToolOutput(
-                json: ["tab": Shape.tab(snapshot.tab), "outline": snapshot.outline],
-                images: snapshot.screenshot.map { [$0] } ?? []
-            )
+            let params = try JSONSerialization.data(withJSONObject:["tabId":args.int("tab_id"),"full":args.bool("full",default:true)])
+            var json = try JSONSerialization.jsonObject(with: await browser.command("tab.snapshot",params:params)) as? [String:Any] ?? [:]
+            var images: [Screenshot] = []
+            if try args.bool("include_screenshot",default:false) {
+                let shot = try await browser.screenshot(tabID:args.int("tab_id")); images=[shot]; json["screenshot"]=Shape.screenshot(shot)
+            }
+            return ToolOutput(json:json,images:images)
 
         case "browser_click":
             let target: BrowserTarget

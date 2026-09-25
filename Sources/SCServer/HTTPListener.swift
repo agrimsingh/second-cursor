@@ -10,6 +10,34 @@ final class HTTPListener: @unchecked Sendable {
 
     private let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
     private var channel: Channel?
+    private let childrenLock = NSLock()
+    private var children: [ObjectIdentifier: Channel] = [:]
+    var activeConnectionCount: Int {
+        childrenLock.lock()
+        defer { childrenLock.unlock() }
+        return children.count
+    }
+
+    private func remember(_ channel: Channel) {
+        let id = ObjectIdentifier(channel)
+        childrenLock.lock()
+        children[id] = channel
+        childrenLock.unlock()
+        channel.closeFuture.whenComplete { [weak self] _ in
+            guard let self else { return }
+            self.childrenLock.lock()
+            self.children[id] = nil
+            self.childrenLock.unlock()
+        }
+    }
+
+    private func drain() -> [Channel] {
+        childrenLock.lock()
+        defer { childrenLock.unlock() }
+        let all = Array(children.values)
+        children.removeAll()
+        return all
+    }
 
     func start(host: String, port: Int, path: String, route: @escaping Route) async throws {
         let bootstrap = ServerBootstrap(group: group)
@@ -18,7 +46,8 @@ final class HTTPListener: @unchecked Sendable {
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.socketOption(.tcp_nodelay), value: 1)
             .childChannelInitializer { channel in
-                channel.pipeline.configureHTTPServerPipeline().flatMap {
+                self.remember(channel)
+                return channel.pipeline.configureHTTPServerPipeline().flatMap {
                     channel.pipeline.addHandler(MCPHTTPHandler(path: path, route: route))
                 }
             }
@@ -28,6 +57,7 @@ final class HTTPListener: @unchecked Sendable {
     func stop() async {
         try? await channel?.close()
         channel = nil
+        for child in drain() { try? await child.close() }
         try? await group.shutdownGracefully()
     }
 }
@@ -77,7 +107,7 @@ private final class MCPHTTPHandler: ChannelInboundHandler {
         let loop = context.eventLoop
         let boundContext = NIOLoopBound(context, eventLoop: loop)
 
-        guard requestPath == path else {
+        guard requestPath == path || requestPath == "/api" else {
             Self.write(.error(statusCode: 404, .invalidRequest("Not Found")), for: head, to: context)
             return
         }

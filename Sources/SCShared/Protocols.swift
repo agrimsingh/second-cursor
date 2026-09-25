@@ -33,6 +33,7 @@ public enum SCError: Error, LocalizedError, Equatable {
 /// Desktop app control. Implementations must never move the user's cursor, change the
 /// frontmost app, or switch Spaces unless a method says otherwise.
 public protocol DesktopControlling: AnyObject, Sendable {
+    func closeSession(_ sessionID: String)
     func permissionStatus() -> PermissionStatus
     func listApps(includeNotRunning: Bool) async -> [AppInfo]
     /// `appQuery` matches app name or bundle id (case-insensitive substring); nil lists all.
@@ -54,6 +55,9 @@ public protocol DesktopControlling: AnyObject, Sendable {
     func scroll(windowID: UInt32, target: ClickTarget?, direction: ScrollDirection, amount: Int) async throws -> ActionResult
     /// Invokes a named accessibility action (e.g. "AXShowMenu", "AXIncrement") exposed by the element.
     func performAction(windowID: UInt32, elementIndex: Int, action: String) async throws -> ActionResult
+    func inspectElement(windowID: UInt32, index: Int, offset: Int, length: Int) async throws -> Data
+    func selectText(windowID: UInt32, index: Int, text: String, prefix: String?, suffix: String?, mode: String) async throws -> ActionResult
+    func paste(windowID: UInt32, text: String, format: String) async throws -> ActionResult
     func screenshot(windowID: UInt32) async throws -> Screenshot
     /// Runs `steps` strictly in order as one uninterrupted block on the batch window's app queue.
     /// `admit` runs before each step (pause/blocked gates, action log) and throws to refuse it.
@@ -93,6 +97,8 @@ public protocol AgentDisplayControlling: AnyObject, Sendable {
 /// Chrome control through the Second Cursor extension. Agent tabs are tabs the extension
 /// opened itself; implementations must not act on the user's own tabs.
 public protocol BrowserControlling: AnyObject, Sendable {
+    func instances() async -> Data
+    func command(_ method: String, params: Data) async throws -> Data
     func status() async -> BrowserStatus
     func listTabs() async throws -> [BrowserTab]
     func openTab(url: String) async throws -> BrowserTab

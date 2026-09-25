@@ -1,6 +1,7 @@
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import SCShared
 
 struct SnapshotElement {
     let element: AXUIElement
@@ -21,6 +22,8 @@ struct TreeNode {
     let inWebArea: Bool
     /// Path of role/label/ordinal from the window root; stable while the UI keeps its structure.
     let key: String
+    let actions: [String]
+    let states: [String: Bool?]
 }
 
 /// Walks an AX subtree once and records every shown element. Rendering limits (max elements,
@@ -45,6 +48,7 @@ struct TreeBuilder {
     private static let attributeNames = [
         kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, "AXLabel", kAXPlaceholderValueAttribute,
         kAXValueAttribute, kAXPositionAttribute, kAXSizeAttribute, kAXChildrenAttribute,
+        kAXEnabledAttribute, kAXFocusedAttribute, kAXSelectedAttribute, "AXExpanded",
     ]
 
     let maxNodes: Int
@@ -94,6 +98,9 @@ struct TreeBuilder {
         let indexed = Self.actionableRoles.contains(role) || meaningful || (Self.rowRoles.contains(role) && !actions.isEmpty)
         let shown = indexed || !label.isEmpty || !(value ?? "").isEmpty || !Self.containerRoles.contains(role)
 
+        let states: [String: Bool?] = ["enabled": (values[9] as? NSNumber)?.boolValue,
+            "focused": (values[10] as? NSNumber)?.boolValue, "selected": (values[11] as? NSNumber)?.boolValue,
+            "expanded": (values[12] as? NSNumber)?.boolValue]
         let key: String
         if let knownKey {
             key = knownKey
@@ -111,7 +118,7 @@ struct TreeBuilder {
                 frame = CGRect(origin: position, size: size)
             }
             nodes.append(TreeNode(indent: indent, role: role, label: label, value: value, frame: frame,
-                                  indexed: indexed, element: element, inWebArea: inWebArea, key: key))
+                                  indexed: indexed, element: element, inWebArea: inWebArea, key: key, actions: actions, states: states))
             childIndent += 1
         }
 
@@ -181,6 +188,7 @@ enum TreeRenderer {
         var elements: [Int: SnapshotElement]
         var indexedCount: Int
         var truncated: Bool
+        var structured: [ElementInfo]
     }
 
     /// Renders the window header plus every node, numbering indexed elements from `table`.
@@ -199,6 +207,7 @@ enum TreeRenderer {
                                table: IndexTable, maxElements: Int) -> Output {
         var lines = [header]
         var elements: [Int: SnapshotElement] = [:]
+        var structured: [ElementInfo] = []
         var indexed = 0
         var truncated = false
         for node in nodes {
@@ -210,6 +219,8 @@ enum TreeRenderer {
             if node.indexed {
                 let index = table.index(forKey: node.key)
                 elements[index] = SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key)
+                let bounds = node.frame.map { Rect(x: $0.minX-windowOrigin.x, y: $0.minY-windowOrigin.y, width: $0.width, height: $0.height) }
+                structured.append(ElementInfo(index: index, role: node.role, name: node.label, value: node.value.map { String($0.prefix(300)) }, bounds: bounds, actions: node.actions, states: node.states, valueLength: node.value?.utf16.count))
                 indexed += 1
                 line += "[\(index)] \(node.role) \"\(TreeBuilder.escape(node.label, limit: 120))\""
             } else {
@@ -223,9 +234,16 @@ enum TreeRenderer {
                 line += " (\(Int((frame.minX - windowOrigin.x).rounded())),\(Int((frame.minY - windowOrigin.y).rounded()))"
                     + " \(Int(frame.width.rounded()))x\(Int(frame.height.rounded())))"
             }
+            if node.indexed {
+                for name in node.states.keys.sorted() {
+                    if let value = node.states[name] ?? nil, value == (name != "enabled") {
+                        line += " \(name)=\(value)"
+                    }
+                }
+            }
             lines.append(line)
         }
-        return Output(text: lines.joined(separator: "\n"), lines: lines, elements: elements, indexedCount: indexed, truncated: truncated)
+        return Output(text: lines.joined(separator: "\n"), lines: lines, elements: elements, indexedCount: indexed, truncated: truncated, structured: structured)
     }
 
     /// A compact line diff of `current` against `previous`. Because indexes are stable, unchanged

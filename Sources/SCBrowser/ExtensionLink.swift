@@ -53,8 +53,10 @@ final class ExtensionLink: @unchecked Sendable {
 
     let socketURL: URL
     private let lock = NSLock()
+    private let scheduler = BrowserScheduler()
     private var listenFD: Int32 = -1
-    private var active: Connection?
+    private var active: [String: Connection] = [:]
+    private var metadata: [String: [String: Any]] = [:]
     private var extensionVersion: String?
     private var nextConnectionID = 1
     private var nextCallID = 1
@@ -67,7 +69,7 @@ final class ExtensionLink: @unchecked Sendable {
     var status: BrowserStatus {
         lock.lock()
         defer { lock.unlock() }
-        return BrowserStatus(connected: active != nil, extensionVersion: active == nil ? nil : extensionVersion)
+        return BrowserStatus(connected: !active.isEmpty, extensionVersion: active.isEmpty ? nil : extensionVersion)
     }
 
     func start() throws {
@@ -109,8 +111,39 @@ final class ExtensionLink: @unchecked Sendable {
         thread.start()
     }
 
-    func call(_ method: String, _ params: [String: Any], timeout: TimeInterval = 30) async throws -> [String: Any] {
+    func call(_ method: String, _ params: [String: Any], timeout: TimeInterval = 60) async throws -> [String: Any] {
+        let key = (Execution.context.browserID ?? "default") + ":" + String(describing: params["tabId"] ?? "browser")
+        return try await scheduler.run(key: key) {
+            if method == "extended", params["operation"] as? String == "batch" {
+                guard let steps = params["steps"] as? [[String: Any]], steps.count <= 50 else {
+                    throw SCError.invalidArgument("Batch requires at most 50 steps")
+                }
+                var results: [[String: Any]] = []
+                for var step in steps {
+                    guard step["operation"] as? String != "batch" else {
+                        throw SCError.invalidArgument("Nested batch not allowed")
+                    }
+                    step["tabId"] = params["tabId"]
+                    results.append(try await self.callNow("extended", step, timeout: timeout))
+                }
+                let observation = try await self.callNow(
+                    "extended", ["tabId": params["tabId"] as Any, "operation": "dom_snapshot"], timeout: timeout)
+                return ["results": results, "observation": observation]
+            }
+            return try await self.callNow(method, params, timeout: timeout)
+        }
+    }
+
+    private func callNow(_ method: String, _ params: [String: Any], timeout: TimeInterval) async throws -> [String: Any]
+    {
+        try Execution.context.beforeDispatch()
         let (connection, id) = try reserveCall()
+        var params = params
+        // Override untrusted arguments; only the local approval flow can populate this grant.
+        params["local_approvals"] = Array(Execution.context.browserApprovals)
+        params["session_id"] = Execution.context.sessionID
+        params["deadline"] = Execution.context.deadline.map { $0.timeIntervalSince1970 * 1000 }
+        params["observation_id"] = Execution.context.observationID
         let reply = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Reply, Error>) in
             lock.lock()
             pending[id] = Pending(connectionID: connection.id, continuation: continuation)
@@ -121,7 +154,8 @@ final class ExtensionLink: @unchecked Sendable {
                 return
             }
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
-                self?.finish(id, .failure(SCError.actionFailed("Browser call \(method) timed out after \(Int(timeout))s")))
+                self?.finish(
+                    id, .failure(SCError.actionFailed("Browser call \(method) timed out after \(Int(timeout))s")))
             }
         }
         return reply.value
@@ -130,7 +164,17 @@ final class ExtensionLink: @unchecked Sendable {
     private func reserveCall() throws -> (Connection, Int) {
         lock.lock()
         defer { lock.unlock() }
-        guard let connection = active else {
+        let connection: Connection?
+        if let id = Execution.context.browserID {
+            connection = active[id]
+        } else if active.count == 1 {
+            connection = active.values.first
+        } else if active.count > 1 {
+            throw SCError.invalidArgument("Multiple browsers connected; provide browser_id from browser_instances")
+        } else {
+            connection = nil
+        }
+        guard let connection else {
             throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected")
         }
         let id = nextCallID
@@ -189,7 +233,7 @@ final class ExtensionLink: @unchecked Sendable {
 
     private func handle(_ message: [String: Any], from connection: Connection) {
         if message["type"] as? String == "hello" {
-            promote(connection, version: message["version"] as? String)
+            promote(connection, message: message)
             return
         }
         guard let id = (message["id"] as? NSNumber)?.intValue else { return }
@@ -205,24 +249,55 @@ final class ExtensionLink: @unchecked Sendable {
         }
     }
 
-    private func promote(_ connection: Connection, version: String?) {
+    func instances() -> Data {
         lock.lock()
-        let previous = active
-        active = connection
-        extensionVersion = version
-        lock.unlock()
+        defer { lock.unlock() }
+        let browsers = active.keys.sorted().map { id -> [String: Any] in
+            var info = metadata[id] ?? [:]
+            info["id"] = id
+            return info
+        }
+        return (try? JSONSerialization.data(withJSONObject: ["browsers": browsers])) ?? Data()
+    }
 
+    private func instanceIDs() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Array(active.keys)
+    }
+
+    func closeSession(_ params: [String: Any]) async {
+        let ids = instanceIDs()
+        for id in ids {
+            var context = Execution.context
+            context.browserID = id
+            context.sessionID = params["session_id"] as? String ?? context.sessionID
+            _ = try? await Execution.$context.withValue(context) { try await call("session.close", params) }
+        }
+    }
+
+    private func promote(_ connection: Connection, message: [String: Any]) {
+        let id = message["instance_id"] as? String ?? "legacy"
+        lock.lock()
+        let previous = active[id]
+        active[id] = connection
+        metadata[id] = [
+            "name": message["name"] ?? "Chromium", "profile_name": message["profile_name"] ?? "",
+            "extension_version": message["version"] ?? "", "capabilities": message["capabilities"] ?? [],
+        ]
+        extensionVersion = message["version"] as? String
+        lock.unlock()
         guard let previous, previous !== connection else { return }
-        failPending(on: previous.id, reason: "a newer browser connection replaced this one")
+        failPending(on: previous.id, reason: "browser instance reconnected")
         _ = previous.send(["type": "superseded"])
         previous.hangUp()
     }
 
     private func drop(_ connection: Connection, reason: String) {
         lock.lock()
-        if active === connection {
-            active = nil
-            extensionVersion = nil
+        for id in active.keys.filter({ active[$0] === connection }) {
+            active[id] = nil
+            metadata[id] = nil
         }
         lock.unlock()
         failPending(on: connection.id, reason: reason)
@@ -275,5 +350,27 @@ final class ExtensionLink: @unchecked Sendable {
 
     private static func posixError(_ what: String) -> SCError {
         SCError.actionFailed("\(what) failed: \(String(cString: strerror(errno)))")
+    }
+}
+
+private actor BrowserScheduler {
+    private var tails: [String: Task<Void, Never>] = [:]
+    private var generations: [String: UUID] = [:]
+    func run(key: String, work: @escaping () async throws -> [String: Any]) async throws -> [String: Any] {
+        let previous = tails[key]
+        let generation = UUID()
+        let task = Task {
+            await previous?.value
+            return try await work()
+        }
+        tails[key] = Task { _ = try? await task.value }
+        generations[key] = generation
+        defer {
+            if generations[key] == generation {
+                tails[key] = nil
+                generations[key] = nil
+            }
+        }
+        return try await task.value
     }
 }

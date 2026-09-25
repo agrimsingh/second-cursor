@@ -115,3 +115,14 @@ export async function snapshot(tabId) {
   const { nodes } = await cdp(tabId, "Accessibility.getFullAXTree", {});
   return renderOutline(nodes ?? []);
 }
+
+export async function structuredSnapshot(tabId) {
+  const {nodes=[]}=await cdp(tabId,"Accessibility.getFullAXTree",{});
+  const elements=nodes.filter(n=>!n.ignored&&n.backendDOMNodeId).map(n=>({
+    ref:`e${n.backendDOMNodeId}`,role:n.role?.value??"",name:n.name?.value??"",value:String(n.value?.value??"").slice(0,300),
+    value_length:String(n.value?.value??"").length,
+    states:Object.fromEntries(["disabled","focused","selected","expanded","checked","editable"].map(k=>[k,property(n,k)??null])),
+    actions:isInteractive(n,n.role?.value)?["click",...(property(n,"editable")?["fill","type","select_text"]:[])]:[]
+  }));
+  return {outline:renderOutline(nodes),elements};
+}

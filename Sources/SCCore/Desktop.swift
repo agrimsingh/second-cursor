@@ -9,6 +9,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let pid: pid_t
         let table = IndexTable()
         var snapshotID: String?
+        var observationID: String?
         /// The last full rendering; the next diff is computed against it.
         var lines: [String]?
         var elements: [Int: SnapshotElement] = [:]
@@ -23,15 +24,22 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     private var queues: [pid_t: DispatchQueue] = [:]
     private let listQueue = DispatchQueue(label: "dev.secondcursor.desktop.list")
     private let resolver = WindowResolver()
-    private var trees: [CGWindowID: WindowTree] = [:]
+    private var trees: [String: WindowTree] = [:]
     /// Window size when the agent last observed it; pixel coordinates it sends are relative to that layout.
-    private var observedSizes: [CGWindowID: CGSize] = [:]
+    private var observedSizes: [String: CGSize] = [:]
     private var lastAction: [CGWindowID: Date] = [:]
 
     /// Draws the agent's visible cursor. Set once by the app at launch; command-line tools leave it nil.
     public var cursor: AgentCursorPresenting?
 
     public init() {}
+
+    public func closeSession(_ sessionID: String) {
+        lock.lock(); defer { lock.unlock() }
+        let prefix=sessionID+":"
+        trees=trees.filter { !$0.key.hasPrefix(prefix) }
+        observedSizes=observedSizes.filter { !$0.key.hasPrefix(prefix) }
+    }
 
     /// Only for windows on the user's current Space: an arrow aimed at a window they cannot see would mislead.
     private func showCursor(_ record: CGWindowRecord, _ event: AgentCursorEvent) {
@@ -49,8 +57,11 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     }
 
     private func run<T>(on queue: DispatchQueue, _ work: @escaping () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
-            queue.async { continuation.resume(with: Result { try work() }) }
+        let context = Execution.context
+        return try await withCheckedThrowingContinuation { continuation in
+            queue.async { continuation.resume(with: Result {
+                try Execution.$context.withValue(context) { try context.beforeDispatch(); return try work() }
+            }) }
         }
     }
 
@@ -63,35 +74,35 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     private func tree(for wid: CGWindowID, pid: pid_t) -> WindowTree {
         lock.lock()
         defer { lock.unlock() }
-        if let tree = trees[wid], tree.pid == pid { return tree }
+        if let tree = trees["\(Execution.context.sessionID):\(wid)"], tree.pid == pid { return tree }
         let tree = WindowTree(pid: pid)
-        trees[wid] = tree
+        trees["\(Execution.context.sessionID):\(wid)"] = tree
         return tree
     }
 
     private func storedTree(for wid: CGWindowID) -> WindowTree? {
         lock.lock()
         defer { lock.unlock() }
-        return trees[wid]
+        return trees["\(Execution.context.sessionID):\(wid)"]
     }
 
     private func forget(_ wid: CGWindowID) {
         lock.lock()
-        trees[wid] = nil
-        observedSizes[wid] = nil
+        trees["\(Execution.context.sessionID):\(wid)"] = nil
+        observedSizes["\(Execution.context.sessionID):\(wid)"] = nil
         lock.unlock()
     }
 
     private func noteObserved(_ wid: CGWindowID, size: CGSize) {
         lock.lock()
-        observedSizes[wid] = size
+        observedSizes["\(Execution.context.sessionID):\(wid)"] = size
         lock.unlock()
     }
 
     private func observedSize(_ wid: CGWindowID) -> CGSize? {
         lock.lock()
         defer { lock.unlock() }
-        return observedSizes[wid]
+        return observedSizes["\(Execution.context.sessionID):\(wid)"]
     }
 
     public func permissionStatus() -> PermissionStatus {
@@ -107,6 +118,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     }
 
     public func launchApp(_ query: String, urls: [URL], newInstance: Bool) async throws -> AppInfo {
+        try Execution.context.beforeDispatch()
         guard let app = Apps.resolve(query) else { throw SCError.appNotFound(query) }
         return try await Apps.launch(app, urls: urls, newInstance: newInstance)
     }
@@ -146,6 +158,11 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     public func runBatch(windowID: UInt32, steps: [BatchStep], stopOnError: Bool, stopOnLayoutChange: Bool,
                          admit: @escaping @Sendable (BatchStep) throws -> Void) async throws -> [BatchStepResult] {
         try await run(windowID: windowID) {
+            let initial = try self.record(windowID)
+            guard steps.allSatisfy({ WindowList.record($0.windowID)?.pid == initial.pid }) else {
+                throw SCError.invalidArgument("A batch cannot cross app processes; submit a separate batch for each app")
+            }
+            try self.validateObservation(windowID)
             // Pixel steps were planned against the layout the agent last saw, or failing that, the layout at batch start.
             var expected: [CGWindowID: CGSize] = [:]
             for wid in Set(steps.map(\.windowID)) {
@@ -169,6 +186,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                     continue
                 }
                 do {
+                    try Execution.context.beforeDispatch()
                     try admit(step)
                     let result = try self.perform(step)
                     self.markAction(on: step.windowID)
@@ -191,6 +209,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     private func act(_ windowID: CGWindowID, _ work: @escaping () throws -> ActionResult) async throws -> ActionResult {
         try await run(windowID: windowID) {
+            try self.validateObservation(windowID)
             let result = try work()
             self.markAction(on: windowID)
             return result
@@ -421,6 +440,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let tree = tree(for: wid, pid: record.pid)
         let id = String(UUID().uuidString.prefix(8)).lowercased()
         noteObserved(wid, size: record.bounds.size)
+        tree.observationID = id
 
         if let scope = options.scope {
             guard tree.snapshotID != nil else { throw SCError.staleSnapshot(wid) }
@@ -433,8 +453,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             let out = TreeRenderer.scoped(scope: scope, windowOrigin: frame.origin, nodes: builder.nodes,
                                           table: tree.table, maxElements: max(options.maxElements, 2000))
             tree.elements.merge(out.elements) { _, scoped in scoped }
-            return WindowSnapshot(window: windowInfo(record, window: window), snapshotID: id, tree: out.text,
+            var result = WindowSnapshot(window: windowInfo(record, window: window), snapshotID: id, tree: out.text,
                                   elementCount: out.indexedCount, truncated: out.truncated || builder.truncated, scope: scope)
+            result.elements = out.structured
+            return result
         }
 
         var builder = TreeBuilder()
@@ -449,11 +471,13 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         tree.snapshotID = id
         tree.lines = out.lines
         tree.elements = out.elements
-        return WindowSnapshot(
+        var result = WindowSnapshot(
             window: windowInfo(record, window: window), snapshotID: id, tree: diff ?? out.text,
             elementCount: out.indexedCount, truncated: out.truncated || builder.truncated,
             isDiff: diff != nil, diffBase: diff != nil ? base : nil
         )
+        result.elements = out.structured
+        return result
     }
 
     private func element(_ wid: CGWindowID, _ index: Int) throws -> (CGWindowRecord, SnapshotElement) {
@@ -464,6 +488,88 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             throw SCError.actionFailed("Element \(index) no longer exists; call get_window_state again")
         }
         return (record, element)
+    }
+
+    private func validateObservation(_ wid: CGWindowID) throws {
+        if let expected = Execution.context.observationID,
+           storedTree(for: wid)?.observationID != expected {
+            throw SCError.actionFailed("Stale observation; read get_window_state again before acting")
+        }
+    }
+
+    public func inspectElement(windowID: UInt32, index: Int, offset: Int, length: Int) async throws -> Data {
+        try await run(windowID: windowID) {
+            let (_, item) = try self.element(windowID, index)
+            let text = AX.text(item.element.attribute(kAXValueAttribute)) ?? item.element.string(kAXTitleAttribute) ?? ""
+            let ns = text as NSString
+            guard offset >= 0, offset <= ns.length, length >= 0, length <= 100_000 else {
+                throw SCError.invalidArgument("offset/length must be in range; length is limited to 100000 UTF-16 units")
+            }
+            let count = min(length, ns.length-offset)
+            let selection = AX.range(item.element.attribute(kAXSelectedTextRangeAttribute))
+            return try JSONSerialization.data(withJSONObject: [
+                "text": ns.substring(with: NSRange(location: offset, length: count)), "offset": offset,
+                "length": count, "total_length": ns.length, "has_more": offset+count < ns.length,
+                "actions": item.element.actions,
+                "editable": item.element.isSettable(kAXValueAttribute),
+                "selection": selection.map { ["offset": $0.location, "length": $0.length] } as Any? ?? NSNull()
+            ])
+        }
+    }
+
+    public func selectText(windowID: UInt32, index: Int, text: String, prefix: String?, suffix: String?, mode: String) async throws -> ActionResult {
+        try await act(windowID) {
+            guard !text.isEmpty, ["text", "cursor_before", "cursor_after"].contains(mode) else { throw SCError.invalidArgument("Nonempty text and valid selection mode required") }
+            let (_, item) = try self.element(windowID, index)
+            let value = (AX.text(item.element.attribute(kAXValueAttribute)) ?? "") as NSString
+            var matches: [NSRange] = [], start = 0
+            while start < value.length {
+                let range = value.range(of: text, range: NSRange(location: start, length: value.length-start))
+                if range.location == NSNotFound { break }
+                let before = value.substring(to: range.location), after = value.substring(from: NSMaxRange(range))
+                if prefix.map({ before.hasSuffix($0) }) ?? true, suffix.map({ after.hasPrefix($0) }) ?? true { matches.append(range) }
+                start = NSMaxRange(range)
+            }
+            guard matches.count == 1 else { throw SCError.invalidArgument("Text matched \(matches.count) times; supply prefix/suffix to select exactly one occurrence") }
+            let found = matches[0]
+            let range = CFRange(location: mode == "cursor_after" ? NSMaxRange(found) : found.location, length: mode == "text" ? found.length : 0)
+            guard item.element.set(kAXSelectedTextRangeAttribute, AX.rangeValue(range)) == .success else { throw SCError.actionFailed("This element does not support text selection") }
+            let actual = AX.range(item.element.attribute(kAXSelectedTextRangeAttribute))
+            return ActionResult(route: "ax_selection", verified: actual?.location == range.location && actual?.length == range.length)
+        }
+    }
+
+    private static let clipboardLock = NSLock()
+    public func paste(windowID: UInt32, text: String, format: String) async throws -> ActionResult {
+        guard ["text", "html", "md"].contains(format) else { throw SCError.invalidArgument("format must be text, html or md") }
+        // AppKit HTML import must run on the main thread, before taking the app queue or clipboard lock.
+        let plain = format == "html" ? await MainActor.run {
+            (try? NSAttributedString(data: Data(text.utf8),
+                options: [.documentType: NSAttributedString.DocumentType.html],
+                documentAttributes: nil))?.string ?? text
+        } : text
+        return try await act(windowID) {
+            Self.clipboardLock.lock(); defer { Self.clipboardLock.unlock() }
+            let pb = NSPasteboard.general
+            let saved = (pb.pasteboardItems ?? []).map { item in item.types.compactMap { type in item.data(forType: type).map { (type, $0) } } }
+            pb.clearContents()
+            let item = NSPasteboardItem()
+            if format == "html" {
+                item.setString(text, forType: .html)
+                item.setString(plain, forType: .string)
+            } else { item.setString(text, forType: .string) }
+            pb.writeObjects([item]); let owned = pb.changeCount
+            defer {
+                if pb.changeCount == owned {
+                    pb.clearContents()
+                    let items = saved.map { entries -> NSPasteboardItem in let item = NSPasteboardItem(); for (type, data) in entries { item.setData(data, forType: type) }; return item }
+                    if !items.isEmpty { pb.writeObjects(items) }
+                }
+            }
+            let result = try self.performKey(windowID, chord: Keyboard.parse("cmd+v"))
+            self.settleNow(windowID)
+            return ActionResult(route: "clipboard_paste", note: "format=\(format); Markdown is pasted as source. " + (result.note ?? ""))
+        }
     }
 
     // MARK: Pointer
@@ -518,6 +624,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// Pointer events are addressed to the window, so they land in place on any Space. A minimized
     /// window has no on-screen frame to hit-test against.
     private func requirePointerTarget(_ record: CGWindowRecord) throws {
+        if Execution.context.observationID != nil, let before=observedSize(record.id),
+           abs(before.width-record.bounds.width)>1 || abs(before.height-record.bounds.height)>1 {
+            throw SCError.actionFailed("Window resized since observation; observe again before using coordinates")
+        }
         guard !record.isOnScreen else { return }
         let window = try resolver.resolve(pid: record.pid, wid: record.id)
         if window.bool(kAXMinimizedAttribute) == true {

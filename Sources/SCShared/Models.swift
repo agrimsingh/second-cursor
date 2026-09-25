@@ -115,6 +115,7 @@ public struct WindowSnapshot: Sendable, Equatable {
     public var diffBase: String?
     public var scope: Int?
     public var screenshot: Screenshot?
+    public var elements: [ElementInfo] = []
 
     public init(window: WindowInfo, snapshotID: String, tree: String, elementCount: Int, truncated: Bool,
                 isDiff: Bool = false, diffBase: String? = nil, scope: Int? = nil, screenshot: Screenshot? = nil) {

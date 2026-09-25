@@ -50,11 +50,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shuttingDown = true
         let server = self.server
         let agentDisplay = self.agentDisplay
-        Task {
+        Task.detached {
             await server?.stop()
             // Hosted windows must go back to the user's screen, but a stuck teardown must not block quitting.
             await runWithDeadline(seconds: 10) { await agentDisplay.teardown() }
-            NSApp.reply(toApplicationShouldTerminate: true)
+            RunLoop.main.perform(inModes: [.common]) { NSApp.reply(toApplicationShouldTerminate: true) }
         }
         return .terminateLater
     }
@@ -84,7 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler {
-                MainActor.assumeIsolated { NSApp.terminate(nil) }
+                RunLoop.main.perform(inModes: [.common]) { NSApp.terminate(nil) }
             }
             source.resume()
             signalSources.append(source)

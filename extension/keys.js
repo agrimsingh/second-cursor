@@ -58,6 +58,7 @@ const MAC_COMMANDS = {
 
 function mainKey(token, modifiers) {
   const lower = token.toLowerCase();
+  if(/^kp_[0-9]$/.test(lower)){const digit=lower.at(-1);return {key:digit,code:`Numpad${digit}`,keyCode:96+Number(digit),text:digit};}
   const named = NAMED[NAMED_ALIASES[lower] ?? lower];
   if (named) {
     const [key, code, keyCode, text] = named;

@@ -48,6 +48,7 @@ public actor AgentDisplay: AgentDisplayControlling {
     }
 
     public func ensureDisplay() throws -> AgentDisplayStatus {
+        try Execution.context.beforeDispatch()
         if liveDisplayID() == nil {
             try createDisplay()
         }
@@ -55,6 +56,7 @@ public actor AgentDisplay: AgentDisplayControlling {
     }
 
     public func moveToAgentDisplay(windowID: UInt32, pid: Int32) throws -> WindowPlacement {
+        try Execution.context.beforeDispatch()
         guard AXIsProcessTrusted() else { throw SCError.permissionDenied("Accessibility") }
         if liveDisplayID() == nil {
             try createDisplay()
@@ -117,6 +119,7 @@ public actor AgentDisplay: AgentDisplayControlling {
     }
 
     public func returnWindow(windowID: UInt32) throws {
+        try Execution.context.beforeDispatch()
         guard let entry = hosted[windowID] else {
             throw SCError.invalidArgument("Window \(windowID) is not on the agent display")
         }

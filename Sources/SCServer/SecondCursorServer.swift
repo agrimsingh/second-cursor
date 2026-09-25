@@ -18,7 +18,7 @@ public final class SecondCursorServer: @unchecked Sendable {
 
     public static let host = "127.0.0.1"
     public static let path = "/mcp"
-    static let version = "0.1.0"
+    static let version = "0.2.0"
 
     static let instructions = """
         Second Cursor operates macOS apps in the background without moving the user's cursor, \
@@ -29,7 +29,8 @@ public final class SecondCursorServer: @unchecked Sendable {
         - Everything works in place: windows stay where they are, on any Space, behind any app. Never move the user's windows.
         - Keyboard shortcuts (press_key) are often the fastest, most reliable way to drive pro apps.
         - Custom-drawn apps may stop repainting while on a Space the user is not viewing; trust the accessibility tree over a stale screenshot.
-        - Browser tools act only on tabs the agent opened with browser_open.
+        - Browser tools act on agent-created tabs. Personal tab discovery/claim, history, clipboard and raw CDP require local user approval.
+        - Browser operation argument help is available through browser_command(operation=capabilities).
         - Calls may run concurrently; send order-dependent actions (typing, key sequences, button presses) one at a time.
         """
 
@@ -46,7 +47,8 @@ public final class SecondCursorServer: @unchecked Sendable {
 
     /// Binds 127.0.0.1:`config.port` and returns once the server is listening.
     public func start(config: SCConfig) async throws {
-        let router = ToolRouter(desktop: desktop, agentDisplay: agentDisplay, browser: browser, config: config)
+        let router = ToolRouter(desktop: desktop, agentDisplay: agentDisplay, browser: browser, config: config,
+                                connectionCount: { [listener] in listener.activeConnectionCount })
         let pipeline = StandardValidationPipeline(validators: [
             OriginValidator.localhost(),
             StaticBearerTokenValidator(token: config.token),
@@ -56,7 +58,20 @@ public final class SecondCursorServer: @unchecked Sendable {
         ])
         do {
             try await listener.start(host: Self.host, port: config.port, path: Self.path) { request in
-                await Self.handle(request, pipeline: pipeline, router: router)
+                if request.path == "/api" {
+                    let context = HTTPValidationContext(httpMethod:request.method)
+                    for validator: any HTTPRequestValidator in [OriginValidator.localhost(), StaticBearerTokenValidator(token:config.token), ContentTypeValidator()] {
+                        if let refusal = validator.validate(request,context:context) { return refusal }
+                    }
+                    guard request.method == "POST", let body = request.body else { return .error(statusCode:400,.invalidRequest("POST JSON required")) }
+                    do {
+                        let payload = try JSONDecoder().decode(APIRequest.self,from:body)
+                        if payload.tool == "tools/list" { return .data(try JSONEncoder().encode(ToolCatalog.tools),headers:["Content-Type":"application/json"]) }
+                        let result = await router.call(name:payload.tool,arguments:payload.args ?? [:])
+                        return .data(try JSONEncoder().encode(result),headers:["Content-Type":"application/json"])
+                    } catch { return .error(statusCode:400,.invalidRequest("Malformed request: \(error.localizedDescription)")) }
+                }
+                return await Self.handle(request, pipeline: pipeline, router: router)
             }
         } catch let error as IOError where error.errnoCode == EADDRINUSE {
             throw StartError.portInUse(config.port)
@@ -96,3 +111,5 @@ public final class SecondCursorServer: @unchecked Sendable {
         return response
     }
 }
+
+private struct APIRequest: Decodable { let tool: String; let args: [String: Value]? }

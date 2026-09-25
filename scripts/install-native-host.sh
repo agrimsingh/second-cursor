@@ -34,7 +34,7 @@ cp -R "$REPO/extension" "$EXTENSION_DEST"
 echo "Extension copied to $EXTENSION_DEST (load this folder via chrome://extensions > Load unpacked)"
 
 DIRS=()
-for browser in "Google/Chrome" "Google/Chrome for Testing" "Chromium" "BraveSoftware/Brave-Browser"; do
+for browser in "Google/Chrome" "Google/Chrome for Testing" "Chromium" "BraveSoftware/Brave-Browser" "Microsoft Edge" "Microsoft Edge Beta"; do
     if [ -d "$SUPPORT/$browser" ]; then
         DIRS+=("$SUPPORT/$browser")
     fi

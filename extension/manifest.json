@@ -1,11 +1,21 @@
 {
   "manifest_version": 3,
   "name": "Second Cursor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lets the Second Cursor app drive its own background tabs without touching yours.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6hSSs97ye4+HwOQp1h6UxNwyuRbWEciBOFu86ejujB3gfvTkwEGxhE/WvqtC4OztlvJDrsoUNN34NGlx9ZYcIIUyjypzrGlIdUUHvSGCRqPbHncLRGXJ8m+S/a3ezIUsQpw5ILw4bseGs/QmW4fYce2tVqWroUk6efZFtx645jNbAS4/lQZOX5z4sHMSFmIIdy7fdQjAU9bLPNw4oK8TDANQDxNzAmKrWv6f5Ja1oJFlpFRBgmbwprssLaNql3NbNwvii/Kq1beAMtYr0Ha4qX6RWDJTCS925Yi4w/9sw9L24OgFd5SlSj4LHxPSArBAGJRcPnBvQ+pe5eXferfxeQIDAQAB",
   "minimum_chrome_version": "116",
-  "permissions": ["debugger", "tabs", "tabGroups", "nativeMessaging", "storage"],
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "nativeMessaging",
+    "storage",
+    "downloads",
+    "history",
+    "clipboardRead",
+    "clipboardWrite"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"

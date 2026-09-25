@@ -1,6 +1,14 @@
 import { BridgeError } from "./errors.js";
 
 const attached = new Set();
+const frameSessions = new Map();
+chrome.debugger.onEvent.addListener((source,method,p)=>{
+  if(method === "Target.attachedToTarget") {
+    frameSessions.set(`${source.tabId}:${p.targetInfo.targetId}`,p.sessionId);
+    chrome.debugger.sendCommand({tabId:source.tabId,sessionId:p.sessionId},"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
+  }
+  if(method === "Target.detachedFromTarget")for(const [k,v] of frameSessions)if(v===p.sessionId)frameSessions.delete(k);
+});
 
 chrome.debugger.onDetach.addListener(({ tabId }) => attached.delete(tabId));
 
@@ -15,7 +23,10 @@ async function attach(tabId) {
     }
   }
   attached.add(tabId);
+  for (const domain of ["Page", "Runtime", "DOM", "Network"]) await chrome.debugger.sendCommand({tabId}, domain+".enable", {}).catch(()=>{});
   const target = { tabId };
+  await chrome.debugger.sendCommand(target,"Page.setInterceptFileChooserDialog",{enabled:true}).catch(()=>{});
+  await chrome.debugger.sendCommand(target,"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
   // Background tabs report blur and may be frozen; make them behave like the focused tab.
   await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
   await chrome.debugger.sendCommand(target, "Page.setWebLifecycleState", { state: "active" }).catch(() => {});
@@ -42,4 +53,11 @@ export function protocolMessage(error) {
   } catch {
     return error.message;
   }
+}
+
+export async function frameCDP(tabId,frameId,method,params={}) {
+  await attach(tabId);
+  const sessionId=frameSessions.get(`${tabId}:${frameId}`);
+  try{return await chrome.debugger.sendCommand({tabId,...(sessionId?{sessionId}:{})},method,params);}
+  catch(e){throw new BridgeError("failed",`${method}: ${protocolMessage(e)}`);}
 }

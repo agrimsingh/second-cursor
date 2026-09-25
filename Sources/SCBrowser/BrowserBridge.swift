@@ -14,6 +14,14 @@ public final class BrowserBridge: BrowserControlling, @unchecked Sendable {
         try link.start()
     }
 
+    public func instances() async -> Data { link.instances() }
+
+    public func command(_ method: String, params: Data) async throws -> Data {
+        let object = try JSONSerialization.jsonObject(with:params) as? [String:Any] ?? [:]
+        if method == "session.close" { await link.closeSession(object); return Data("{}".utf8) }
+        return try JSONSerialization.data(withJSONObject: await link.call(method,object))
+    }
+
     public func status() async -> BrowserStatus {
         link.status
     }

@@ -16,7 +16,17 @@ let displays: [[String: Any]] = ids.prefix(Int(count)).map { id in
 }
 
 // Synthetic per-process events never reach the HID system state, so these only move for real user input.
+let approvalWindows = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? [])
+    .filter { ($0[kCGWindowOwnerName as String] as? String) == "Second Cursor" || ($0[kCGWindowOwnerName as String] as? String) == "SecondCursor" }
+    .compactMap { info -> [String: Any]? in
+        guard let id = info[kCGWindowNumber as String] as? NSNumber,
+              let bounds = info[kCGWindowBounds as String] as? [String: Any],
+              (bounds["Height"] as? Double ?? 0) > 100,
+              (bounds["Width"] as? Double ?? 0) < 1000 else { return nil }
+        return ["id": id, "title": info[kCGWindowName as String] ?? "", "bounds": bounds]
+    }
 let state: [String: Any] = [
+    "second_cursor_windows": approvalWindows,
     "cursor": ["x": cursor.x, "y": cursor.y],
     "frontmost": ["name": front?.localizedName ?? "", "bundle_id": front?.bundleIdentifier ?? "", "pid": front?.processIdentifier ?? 0],
     "active_space": CGSGetActiveSpace(CGSMainConnectionID()),
