@@ -10,9 +10,22 @@ chrome.debugger.onEvent.addListener((source,method,p)=>{
   if(method === "Target.detachedFromTarget")for(const [k,v] of frameSessions)if(v===p.sessionId)frameSessions.delete(k);
 });
 
-chrome.debugger.onDetach.addListener(({ tabId }) => attached.delete(tabId));
+chrome.debugger.onDetach.addListener(({ tabId }) => {
+  attached.delete(tabId);
+  for (const key of enabled) if (key.startsWith(`${tabId}:`)) enabled.delete(key);
+});
 
-async function attach(tabId) {
+// Runtime.enable is the best-known sign of an automated page to bot checks, and Network.enable reports every
+// request; like Codex, they are switched on only for the operations that read their events.
+const enabled = new Set();
+export async function ensureDomain(tabId, domain) {
+  const key = `${tabId}:${domain}`;
+  if (enabled.has(key)) return;
+  await cdp(tabId, `${domain}.enable`, {});
+  enabled.add(key);
+}
+
+export async function attach(tabId) {
   if (attached.has(tabId)) return;
   try {
     await chrome.debugger.attach({ tabId }, "1.3");
@@ -23,7 +36,7 @@ async function attach(tabId) {
     }
   }
   attached.add(tabId);
-  for (const domain of ["Page", "Runtime", "DOM", "Network"]) await chrome.debugger.sendCommand({tabId}, domain+".enable", {}).catch(()=>{});
+  await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
   const target = { tabId };
   await chrome.debugger.sendCommand(target,"Page.setInterceptFileChooserDialog",{enabled:true}).catch(()=>{});
   await chrome.debugger.sendCommand(target,"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});

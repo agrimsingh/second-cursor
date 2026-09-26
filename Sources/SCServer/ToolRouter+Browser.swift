@@ -46,7 +46,10 @@ extension ToolRouter {
             return ToolOutput(json: ["tab": Shape.tab(tab)])
 
         case "browser_snapshot":
-            let params = try JSONSerialization.data(withJSONObject:["tabId":args.int("tab_id"),"full":args.bool("full",default:true)])
+            let params = try JSONSerialization.data(withJSONObject: [
+                "tabId": args.int("tab_id"), "full": args.bool("full", default: true),
+                "structured": args.bool("structured", default: false),
+            ])
             var json = try JSONSerialization.jsonObject(with: await browser.command("tab.snapshot",params:params)) as? [String:Any] ?? [:]
             var images: [Screenshot] = []
             if try args.bool("include_screenshot",default:false) {

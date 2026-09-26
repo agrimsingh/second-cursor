@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Late results</title>
+</head>
+<body>
+  <h1>Search results</h1>
+  <p id="status">Loading results</p>
+  <ul id="list"></ul>
+  <button id="more" type="button">Load more</button>
+  <p id="probe">automation: not detected</p>
+  <script>
+    const list = document.getElementById("list");
+    const add = (name) => list.append(Object.assign(document.createElement("li"), { textContent: name }));
+    // Like a search page that renders its results from a request made after load.
+    setTimeout(() => {
+      document.getElementById("status").textContent = "First batch ready";
+      ["Sheba pouch", "Whiskas tin", "Fancy Feast can"].forEach(add);
+    }, 1200);
+    document.getElementById("more").addEventListener("click", () => setTimeout(() => add("Second batch ready"), 800));
+    // The best-known bot check for a DevTools protocol client: with Runtime enabled, the client reads console
+    // arguments, which runs this getter.
+    setInterval(() => {
+      const error = new Error();
+      Object.defineProperty(error, "stack", {
+        get() {
+          document.getElementById("probe").textContent = "automation: detected";
+          return "";
+        },
+      });
+      console.debug(error);
+    }, 200);
+  </script>
+</body>
+</html>

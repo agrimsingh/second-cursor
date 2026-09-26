@@ -1491,6 +1491,105 @@ def browser(ctx):
         ctx.check("background tab screenshot returned an image", shot.get("width", 0) > 0, shot)
 
 
+@scenario
+def browser_settled_reads(ctx):
+    """Browser reads a model can act on at once, taken without giving the page a reason to suspect automation.
+
+    Ways this can fail, each checked against e2e/fixtures/late.html:
+    - browser_open returns before the page renders what it fetches after load, so the model reads only the page's
+      frame and must read again (the results appear 1.2 s after load).
+    - A read right after a click that makes the page fetch and render ("Load more", a filter) returns the old page.
+    - Reads carry the per-element JSON list without structured=true, multiplying the payload about tenfold.
+    - The cursor stays off the tab until the first action; Codex shows it as soon as the agent works in a tab.
+    - Ordinary work switches on the DevTools Runtime domain, which the page can detect through its console. Only
+      reading console logs may switch it on. The fixture's probe must then detect it; if it cannot, the check is
+      inconclusive rather than passed, since a probe that never fires proves nothing.
+    """
+    if not ctx.call("browser_status").get("connected"):
+        raise Skip("Chrome extension not connected")
+    with FixtureServer() as base:
+        started = time.time()
+        opened = ctx.call("browser_open", url=f"{base}/late.html")
+        took = time.time() - started
+        tid = opened["tab"]["id"]
+        ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
+        outline = opened["observation"]["outline"]
+        ctx.check("browser_open waited for the results the page renders after load", "Fancy Feast can" in outline,
+                  outline[:400])
+        ctx.check("and not much longer than the page needed (< 5 s)", took < 5, f"{took:.1f}s")
+        ctx.check("its observation has no per-element list", "elements" not in opened["observation"],
+                  list(opened["observation"]))
+
+        def command(operation, **args):
+            return ctx.call("browser_command", tab_id=tid, operation=operation, **args)
+
+        viewport = command("cdp", method="Page.getLayoutMetrics")["result"]["cssLayoutViewport"]
+        expected = (viewport["clientWidth"] * 0.58, viewport["clientHeight"] * 0.55)
+        state = poll(lambda: overlay_in(command("cdp", method="DOM.getDocument",
+                                                params={"depth": -1, "pierce": True})["result"]["root"]),
+                     lambda s: bool(s and s["point"]))
+        ctx.check("the cursor is on the tab as soon as it opened, at 58% x 55% of the viewport, before any action",
+                  bool(state and state["point"]) and abs(state["point"][0] - expected[0]) < 2
+                  and abs(state["point"][1] - expected[1]) < 2, (state, expected))
+
+        more = re.search(r'\[(\w+)\] button "Load more"', outline)
+        ctx.require("the Load more button has a ref", more, outline[:400])
+        ctx.call("browser_click", tab_id=tid, ref=more.group(1))
+        read = ctx.call("browser_snapshot", tab_id=tid)
+        ctx.check("a read right after the click waits for what the click made the page fetch",
+                  "Second batch ready" in read["outline"], read["outline"][-300:])
+        ctx.check("a plain read has no per-element list", "elements" not in read, list(read))
+        rich = ctx.call("browser_snapshot", tab_id=tid, full=True, structured=True)
+        ctx.check("structured=true adds it", bool(rich.get("elements")), list(rich))
+        ctx.check("the page saw no DevTools Runtime client while the agent opened, read and clicked",
+                  "automation: not detected" in rich["outline"], re.findall(r"automation: \w+( \w+)?", rich["outline"]))
+
+        command("logs")
+        time.sleep(0.6)
+        after = ctx.call("browser_snapshot", tab_id=tid)["outline"]
+        label = "the probe works: reading console logs switches Runtime on, and the page notices"
+        if "automation: detected" in after:
+            ctx.check(label, True)
+        else:
+            ctx.checks.append({"label": label, "ok": True, "inconclusive": True,
+                               "detail": "this Chrome does not expose Runtime.enable to the page's console; the "
+                                         "not-detected check above proves nothing here"})
+
+
+@scenario
+def browser_compact_outline(ctx):
+    """The outline a model reads for a page: every control and visible text, in as few tokens as possible.
+
+    Ways this can fail, each checked against e2e/fixtures/cards.html:
+    - A link made of several texts (a listing card: title, price, rating, delivery) is spread over one line per
+      text and icon, or loses a text; its line must hold all of them, and a price's "$" stays on its number.
+    - Icon alt text ("star-icon") or unnamed images take lines; empty placeholder list items take lines.
+    - A link whose visible text is split into pieces ("[", "1", "]") reads as a list instead of "[1]".
+    - An icon-only button loses its label.
+    """
+    if not ctx.call("browser_status").get("connected"):
+        raise Skip("Chrome extension not connected")
+    with FixtureServer() as base:
+        opened = ctx.call("browser_open", url=f"{base}/cards.html")
+        tid = opened["tab"]["id"]
+        ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
+        outline = opened["observation"]["outline"]
+        for card in ("Blue kettle 1.7L · $24.90 · 4.8 · Arrives tomorrow",
+                     "Two-slot toaster · €31.00 · 4.5 · Arrives in 3 days",
+                     "Burr coffee grinder · $89.00 · 4.9 · Arrives in 2 days"):
+            ctx.check(f"one line holds the whole card: {card}",
+                      re.search(r'^\s*\[e\d+\] link "' + re.escape(card) + '"$', outline, re.M), outline)
+        ctx.check("icon alt text takes no line or space", "star-icon" not in outline and "photo" not in outline, outline)
+        ctx.check("unnamed images take no lines", not re.search(r"^\s*image$", outline, re.M), outline)
+        ctx.check("empty placeholder list items take no lines",
+                  len(re.findall(r"^\s*listitem$", outline, re.M)) == 3, outline)
+        ctx.check('a citation built from "[", "1" and "]" reads "[1]"',
+                  re.search(r'^\s*\[e\d+\] link "\[1\]"$', outline, re.M), outline)
+        ctx.check("an icon-only button keeps its label",
+                  re.search(r'^\s*\[e\d+\] button "Close dialog"$', outline, re.M), outline)
+        ctx.check("the whole page fits in a few lines", len(outline.splitlines()) <= 14, outline)
+
+
 OVERLAY_ID = "second-cursor-overlay"
 
 
@@ -1644,8 +1743,9 @@ def browser_cursor(ctx):
       error), or the caption command is refused. Covered: host and caption read back with DOM.getDocument(pierce),
       and a capture over the page's own DevTools socket must show the orange glow and the dark caption pill.
     - It shows in the wrong place: tip offset from the hotspot, wrong point for a ref click, a typed-into field, a
-      scroll, a locator click, or a fill; or the first click makes it appear at 58% x 55% and fly over instead of
-      appearing at the target. Covered: the tip's translate is compared with each action's point.
+      scroll, a locator click, or a fill. Covered: the tip's translate is compared with each action's point. (It is
+      on the tab from browser_open, at 58% x 55%, so the first click travels from there; browser_settled_reads
+      checks that.)
     - A keyboard action in a fresh tab shows nothing, or not at 58% x 55% of the viewport. Covered.
     - The caption is missing, not fully typed out, not replaced by the next caption, or survives a caption-less
       action. Covered.

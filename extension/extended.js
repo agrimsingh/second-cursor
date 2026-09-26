@@ -1,4 +1,4 @@
-import { cdp, frameCDP } from "./cdp.js";
+import { cdp, ensureDomain, frameCDP } from "./cdp.js";
 import { concealDuring, dragTo, pointTo, setCaption, show } from "./cursor.js";
 import { exportContent } from "./exports.js";
 import { BridgeError, sleep } from "./errors.js";
@@ -871,8 +871,11 @@ export async function extended(p) {
     throw new BridgeError("failed", "Wait deadline expired");
   }
   if (op === "downloads") return { downloads: state(tabId).downloads };
-  if (op === "logs")
+  if (op === "logs") {
+    // Runtime.enable replays the messages the page logged before it, as events that precede its reply.
+    await ensureDomain(tabId, "Runtime");
     return { logs: state(tabId).logs.slice(-(p.limit ?? 100)) };
+  }
   if (op === "viewport") {
     const s = state(tabId);
     const size = async () =>
@@ -972,6 +975,8 @@ export async function extended(p) {
   }
   if (op === "export") return exportContent(tabId, p);
   if (op === "assets") {
+    // Responses before this call are found through the page below; later ones are also recorded with their bodies.
+    await ensureDomain(tabId, "Network");
     const { result } = await cdp(tabId, "Runtime.evaluate", {
       expression:
         '[location.href,...performance.getEntriesByType("resource").map(x=>x.name),...[...document.querySelectorAll("img[src],video[src],audio[src],source[src],link[href]")].map(x=>x.src||x.href)]',

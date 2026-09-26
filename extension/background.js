@@ -1,3 +1,4 @@
+import { attach } from "./cdp.js";
 import { hideSession, setCaption, show } from "./cursor.js";
 import { BridgeError } from "./errors.js";
 import { click, pressKey, screenshot, scroll, type } from "./input.js";
@@ -8,8 +9,10 @@ import {
   listTabs,
   navigateTab,
   openTab,
+  noteAction,
   requireAgentTab,
   settleAround,
+  settled,
 } from "./tabs.js";
 
 import { extended, recordEvent, withDialog } from "./extended.js";
@@ -65,13 +68,18 @@ const handlers = {
     };
   },
   "tabs.close": ({ tabId }) => closeTab(tabId),
-  "tab.navigate": async ({ tabId, url }) => {
+  "tab.navigate": async ({ tabId, url, session_id }) => {
+    await attach(tabId);
+    show(tabId, session_id);
     const tab = await navigateTab(tabId, url);
-    show(tabId);
     return { tab };
   },
-  "tab.snapshot": async ({ tabId, session_id, full }) => {
+  "tab.snapshot": async ({ tabId, session_id, full, structured }) => {
     await requireAgentTab(tabId);
+    // Like Codex, the cursor is on the tab from the moment the agent works in it, not only once it acts.
+    await attach(tabId);
+    show(tabId, session_id);
+    await settled(tabId);
     const key = `${session_id}:${tabId}`;
     const previous = observations.get(key);
     const snapshot = await structuredSnapshot(tabId);
@@ -115,7 +123,7 @@ const handlers = {
     return {
       tab: describe(await chrome.tabs.get(tabId)),
       outline,
-      ...(is_diff ? {} : { elements: snapshot.elements }),
+      ...(structured && !is_diff ? { elements: snapshot.elements } : {}),
       snapshot_id: id,
       is_diff,
       diff_base: is_diff ? previous.id : null,
@@ -148,6 +156,9 @@ const handlers = {
     return await screenshot(tabId);
   },
 };
+
+const ACTIONS = new Set(["tab.click", "tab.type", "tab.pressKey", "tab.scroll"]);
+const EXTENDED_ACTIONS = new Set(["click", "drag", "paste", "press_key", "scroll", "type", "upload"]);
 
 let port = null;
 let retryTimer = null;
@@ -190,6 +201,11 @@ async function dispatch(activePort, { id, method, params }) {
         ? withDialog(params.tabId, () => handler(params))
         : handler(params)),
     };
+    if (
+      params.tabId != null &&
+      (ACTIONS.has(method) || (method === "extended" && EXTENDED_ACTIONS.has(params.operation)))
+    )
+      noteAction(params.tabId);
   } catch (error) {
     reply = {
       id,

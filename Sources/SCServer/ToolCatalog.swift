@@ -299,7 +299,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_open",
                 description:
-                    "Open a URL in a new background Chrome tab owned by the agent. Use the returned tab id with the other browser tools.",
+                    "Open a URL in a new background Chrome tab owned by the agent, wait for the page to finish rendering, and return its outline (as browser_snapshot does). Use the returned tab id with the other browser tools.",
                 inputSchema: schema(["url": string("URL to open.")], required: ["url"])
             ),
             Tool(
@@ -310,11 +310,13 @@ enum ToolCatalog {
             Tool(
                 name: "browser_snapshot",
                 description:
-                    "Read an agent tab as a compact accessibility outline; interactive nodes carry [ref] markers for browser_click and browser_type. Call again after the page changes.",
+                    "Read an agent tab as a compact accessibility outline; interactive nodes carry [ref] markers for browser_click and browser_type. Waits briefly for content the page is still rendering. Call again after the page changes.",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
                         "include_screenshot": boolean("Attach a PNG of the viewport.", default: false),
+                        "structured": boolean(
+                            "Also return an elements JSON array on full reads, for code consumers.", default: false),
                     ], required: ["tab_id"]),
                 annotations: .init(readOnlyHint: true)
             ),

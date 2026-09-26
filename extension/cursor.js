@@ -205,8 +205,9 @@ export function dragTo(tabId, from, to) {
   return sync(tabId, from, { then: to }, true);
 }
 
-/** An action without a target: the cursor shows where it rests, or appears at 58% x 55% of the viewport. */
-export function show(tabId) {
+/** Work without a target: the cursor shows where it rests, or appears at 58% x 55% of the viewport. */
+export function show(tabId, session) {
+  if (session) state(tabId).session = session;
   sync(tabId, null);
 }
 

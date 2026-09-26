@@ -520,7 +520,7 @@ def browser_extended(ctx):
         ),
     )
     snapshot = ctx.call(
-        "browser_snapshot", session_id=sid, browser_id=bid, tab_id=tid, full=True
+        "browser_snapshot", session_id=sid, browser_id=bid, tab_id=tid, full=True, structured=True
     )
     ctx.require("browser structured state present", bool(snapshot["elements"]))
     diff = ctx.call(

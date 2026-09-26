@@ -1,4 +1,5 @@
-import { removeCursor } from "./cursor.js";
+import { attach, cdp } from "./cdp.js";
+import { removeCursor, show } from "./cursor.js";
 import { BridgeError, sleep } from "./errors.js";
 
 const GROUP_TITLE = "Second Cursor";
@@ -193,6 +194,81 @@ export async function settleAround(
   }
 }
 
+// Evaluated in its own isolated world, so the page never sees the observer.
+const SETTLE_WORLD = "SecondCursorSettle";
+const settleContexts = new Map();
+const SETTLE_PROBE = `(() => {
+  let s = globalThis.__secondCursorSettle;
+  if (!s || s.doc !== document) {
+    s = { doc: document, last: performance.now(), mutated: false };
+    // Attribute changes are left out: animations and timers change them without the content changing. So is the
+    // agent's own cursor (cursor.js), which is added when the agent starts work on the page.
+    const cursorOnly = (r) => r.addedNodes.length + r.removedNodes.length > 0
+      && [...r.addedNodes, ...r.removedNodes].every((n) => n.id === "second-cursor-overlay");
+    new MutationObserver((records) => {
+      if (records.every(cursorOnly)) return;
+      s.last = performance.now();
+      s.mutated = true;
+    }).observe(document, { subtree: true, childList: true, characterData: true });
+    globalThis.__secondCursorSettle = s;
+  }
+  return { quiet: performance.now() - s.last, mutated: s.mutated, ready: document.readyState };
+})()`;
+
+async function settleProbe(tabId) {
+  for (let retry = 0; retry < 2; retry++) {
+    try {
+      let contextId = settleContexts.get(tabId);
+      if (contextId == null) {
+        const { frameTree } = await cdp(tabId, "Page.getFrameTree");
+        ({ executionContextId: contextId } = await cdp(tabId, "Page.createIsolatedWorld", {
+          frameId: frameTree.frame.id,
+          worldName: SETTLE_WORLD,
+        }));
+        settleContexts.set(tabId, contextId);
+      }
+      const { result, exceptionDetails } = await cdp(tabId, "Runtime.evaluate", {
+        expression: SETTLE_PROBE,
+        contextId,
+        returnByValue: true,
+      });
+      if (!exceptionDetails) return result.value;
+    } catch {
+      // A navigation replaced the document and its world; make a new one.
+    }
+    settleContexts.delete(tabId);
+  }
+  return null;
+}
+chrome.tabs.onRemoved.addListener((tabId) => settleContexts.delete(tabId));
+
+const lastAction = new Map();
+chrome.tabs.onRemoved.addListener((tabId) => lastAction.delete(tabId));
+
+/** Input that may make the page fetch and render something (a filter, a search, "load more"). */
+export function noteAction(tabId) {
+  lastAction.set(tabId, Date.now());
+}
+
+/**
+ * Waits until the page's content has not changed for `quietMs`, at most `timeoutMs`. Within `reactMs` of an action
+ * (or of the load, which counts as one), a page that has not changed since is usually still waiting for a request
+ * (search results, a filter, "load more"), so the read waits for the change to start first. The first probe of a
+ * document starts its clock, so an idle page costs `quietMs` once, and nothing on later reads.
+ */
+export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200 } = {}) {
+  const began = Date.now();
+  const actedAt = lastAction.get(tabId) ?? 0;
+  while (Date.now() - began < timeoutMs) {
+    const state = await settleProbe(tabId);
+    if (!state) return;
+    const sinceAction = Date.now() - actedAt;
+    const awaitingReaction = sinceAction < reactMs && (!state.mutated || state.quiet >= sinceAction);
+    if (state.ready === "complete" && state.quiet >= quietMs && !awaitingReaction) return;
+    await sleep(awaitingReaction ? 50 : Math.min(100, Math.max(20, quietMs - state.quiet)));
+  }
+}
+
 export async function listTabs(session = null) {
   const tabs = [];
   for (const id of [...(await agentTabSet())]) {
@@ -217,6 +293,10 @@ export async function openTab(rawUrl, session = "legacy") {
   await chrome.tabs.update(tab.id, { autoDiscardable: false }).catch(() => {});
   await addToGroup(tab);
   await settleAround(tab.id, async () => {}, { quietMs: 0, timeoutMs: 20000 });
+  await attach(tab.id);
+  show(tab.id, session);
+  noteAction(tab.id);
+  await settled(tab.id, { quietMs: 500, timeoutMs: 6000, reactMs: 1500 });
   return describe(await chrome.tabs.get(tab.id));
 }
 
@@ -227,6 +307,8 @@ export async function navigateTab(tabId, rawUrl) {
     quietMs: 1000,
     timeoutMs: 20000,
   });
+  noteAction(tabId);
+  await settled(tabId, { quietMs: 500, timeoutMs: 6000, reactMs: 1500 });
   return describe(await chrome.tabs.get(tabId));
 }
 

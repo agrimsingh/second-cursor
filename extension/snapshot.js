@@ -1,6 +1,8 @@
 import { cdp } from "./cdp.js";
 
 const MAX_LINES = 2000;
+// Lines vary in length (a control's line holds all its text), so a long page is also cut by size.
+const MAX_CHARS = 80000;
 const MAX_TEXT = 150;
 
 const INTERACTIVE = new Set([
@@ -30,10 +32,17 @@ const ROLE_NAMES = {
   Iframe: "iframe",
 };
 
-function clean(text) {
+// A control's own line carries its visible text (a product card: title, price, rating, delivery), so it may run longer.
+const MAX_CONTROL_TEXT = 260;
+
+function clean(text, max = MAX_TEXT) {
   if (text == null) return "";
   const flat = String(text).replace(/\s+/g, " ").trim();
-  return flat.length > MAX_TEXT ? `${flat.slice(0, MAX_TEXT)}…` : flat;
+  // A URL inside other text (an image's src in an alt, a tracking link) costs many tokens and tells nothing; a
+  // text that is only a URL is what the page shows, so it stays.
+  const words = flat.replace(/\S*https?:\/\/\S*/g, "").replace(/\s+/g, " ").trim();
+  const kept = words || flat;
+  return kept.length > max ? `${kept.slice(0, max)}…` : kept;
 }
 
 const quote = (text) => text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -62,53 +71,121 @@ function isInteractive(node, role) {
   return INTERACTIVE.has(role) || property(node, "focusable") === true;
 }
 
+// Containers whose line a repeated name may drop; landmarks, lists, tables and headings always keep theirs.
+const WRAPPERS = new Set(["group", "generic", "region", "article", "listitem", "figure", "section"]);
+
+const children = (node, byId) => (node.childIds ?? []).map((id) => byId.get(id)).filter(Boolean);
+
+function hasControlInside(node, byId) {
+  return children(node, byId).some(
+    (c) => (!c.ignored && isInteractive(c, c.role?.value ?? "")) || hasControlInside(c, byId),
+  );
+}
+
+function visibleText(node, byId, out = []) {
+  for (const child of children(node, byId)) {
+    const role = child.role?.value ?? "";
+    if (SKIPPED.has(role)) continue;
+    if (role === "StaticText") {
+      const text = child.ignored ? "" : clean(child.name?.value, Infinity);
+      if (text && out.at(-1) !== text) out.push(text);
+    } else visibleText(child, byId, out);
+  }
+  return out;
+}
+
+// A lone currency sign or opening mark ("$", "S$", "€", "[") belongs to the text after it, and a closing mark
+// ("]", ")", ",", "%") to the text before it, not in a list of their own.
+const OPENS = /^(?:\p{L}{0,3}\p{Sc}|\p{Ps}|\p{Pi}|[#@~+±-])$/u;
+const CLOSES = /^(?:\p{Pe}|\p{Pf}|[.,;:!?%'"]){1,2}$/u;
+const joinTexts = (texts) =>
+  texts.reduce((line, text, i) => {
+    if (i === 0) return text;
+    return OPENS.test(texts[i - 1]) || CLOSES.test(text) ? line + text : `${line} · ${text}`;
+  }, "");
+
+/** A control with no controls inside is one line: its visible text, or its name when it shows none. */
+function controlLabel(node, byId) {
+  const texts = visibleText(node, byId);
+  const name = clean(node.name?.value, Infinity);
+  if (!texts.length) return clean(name, MAX_CONTROL_TEXT);
+  // The name is the visible text as the page phrases it ("[19]", "v2.1 Latest"): keep it.
+  if (name.replace(/\s/g, "") === texts.join("").replace(/\s/g, "")) return clean(name, MAX_CONTROL_TEXT);
+  const shown = joinTexts(texts);
+  // A name built from the control's content (plus image alt text) says nothing the texts do not.
+  const covered = texts.filter((t) => name.includes(t)).length >= Math.ceil(texts.length / 2);
+  const label = !name || covered || shown.includes(name) ? shown : `${name} · ${shown}`;
+  return clean(label, MAX_CONTROL_TEXT);
+}
+
 /**
  * Renders the accessibility tree as an indented outline. Interactive nodes carry `[e<backendDOMNodeId>]`
- * refs, which stay valid for as long as the DOM node exists.
+ * refs, which stay valid for as long as the DOM node exists. A control with no controls inside (a card link, a
+ * labelled button) is a single line with its visible text; unnamed images and empty containers are left out, and
+ * a wrapper whose whole name is already printed inside it gives up its own line.
  */
 export function renderOutline(nodes) {
   const byId = new Map(nodes.map((n) => [n.nodeId, n]));
   const root = nodes.find((n) => !n.parentId) ?? nodes[0];
-  const lines = [];
-  let omitted = 0;
 
-  // `context` is the name and value of the nearest printed ancestor; text repeating it is dropped.
-  const visit = (node, depth, context) => {
-    const role = node.role?.value ?? "";
-    if (SKIPPED.has(role)) return;
-    const name = clean(node.name?.value);
-    let childDepth = depth;
-    let childContext = context;
-
-    if (!node.ignored) {
-      const interactive = isInteractive(node, role);
-      const print = role === "StaticText"
-        ? name && !context.includes(name)
-        : interactive || name || STRUCTURAL.has(role);
-      if (print) {
-        const value = clean(node.value?.value);
-        if (lines.length >= MAX_LINES) {
-          omitted++;
-        } else {
-          const ref = interactive ? `[e${node.backendDOMNodeId}] ` : "";
-          let line = `${"  ".repeat(depth)}${ref}${ROLE_NAMES[role] ?? role}`;
-          if (name) line += ` "${quote(name)}"`;
-          if (value && value !== name) line += ` value="${quote(value)}"`;
-          lines.push(line + (node === root ? "" : states(node)));
-        }
-        childDepth = depth + 1;
-        childContext = `${name}\n${value}`;
-      }
-    }
-    for (const id of node.childIds ?? []) {
-      const child = byId.get(id);
-      if (child) visit(child, childDepth, childContext);
-    }
+  const line = (node, role, depth, name, interactive) => {
+    const value = clean(node.value?.value);
+    const ref = interactive ? `[e${node.backendDOMNodeId}] ` : "";
+    let text = `${ref}${ROLE_NAMES[role] ?? role}`;
+    if (name) text += ` "${quote(name)}"`;
+    if (value && value !== name) text += ` value="${quote(value)}"`;
+    return { depth, text: text + (node === root ? "" : states(node)), plain: role === "StaticText", name };
   };
 
-  if (root) visit(root, 0, "");
-  if (omitted) lines.push(`… ${omitted} more nodes omitted`);
-  return lines.join("\n");
+  // Lines are { depth, text }; `context` is the name and value of the nearest printed ancestor, whose text is
+  // not repeated below it.
+  const visit = (node, depth, context) => {
+    const role = node.role?.value ?? "";
+    if (SKIPPED.has(role)) return [];
+    const inside = (d, c) => mergeText(children(node, byId).flatMap((child) => visit(child, d, c)));
+    if (node.ignored) return inside(depth, context);
+
+    const interactive = isInteractive(node, role);
+    if (interactive && !hasControlInside(node, byId)) {
+      return [line(node, role, depth, controlLabel(node, byId), true)];
+    }
+    const name = clean(node.name?.value);
+    if (role === "StaticText") return name && !context.includes(name) ? [line(node, role, depth, name, false)] : [];
+    if ((role === "image" || role === "img") && !name) return [];
+    if (!interactive && !name && !STRUCTURAL.has(role)) return inside(depth, context);
+
+    const below = inside(depth + 1, `${name}\n${clean(node.value?.value)}`);
+    if (!interactive && !below.length && (!name || role === "listitem" || role === "list")) return [];
+    if (!interactive && WRAPPERS.has(role) && name.length >= 12 && below.some((l) => l.text.includes(quote(name)))) {
+      return below.map((l) => ({ ...l, depth: l.depth - 1 }));
+    }
+    return [line(node, role, depth, name, interactive), ...below];
+  };
+
+  const lines = root ? visit(root, 0, "") : [];
+  const text = [];
+  let size = 0;
+  for (const l of lines) {
+    const printed = `${"  ".repeat(l.depth)}${l.text}`;
+    if (text.length >= MAX_LINES || size + printed.length > MAX_CHARS) break;
+    text.push(printed);
+    size += printed.length + 1;
+  }
+  if (text.length < lines.length) text.push(`… ${lines.length - text.length} more lines omitted`);
+  return text.join("\n");
+}
+
+/** Adjacent text lines at one depth ("1", "/", "14") read as one ("1 / 14"). */
+function mergeText(lines) {
+  const out = [];
+  for (const l of lines) {
+    const last = out.at(-1);
+    if (last?.plain && l.plain && last.depth === l.depth) {
+      const name = `${last.name} ${l.name}`;
+      out[out.length - 1] = { ...last, name, text: `text "${quote(name)}"` };
+    } else out.push(l);
+  }
+  return out;
 }
 
 export async function snapshot(tabId) {
