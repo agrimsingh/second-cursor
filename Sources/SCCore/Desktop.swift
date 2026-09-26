@@ -33,11 +33,21 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// The latest action on each window, and what has happened since: reads settle once and captures wait for a
     /// repaint once per action.
     private struct Activity {
+        let started: Date
         let at: Date
+        /// An accessibility call returns once the app has handled it, so notifications during it are its answer.
+        /// Input sent as events is handled after it returns, so only later notifications count.
+        let synchronous: Bool
         var settled = false
         var painted = false
     }
     private var activity: [CGWindowID: Activity] = [:]
+    private static let synchronousRoutes: Set<String> = [
+        "ax_press", "ax_value", "ax_selected_text", "ax_selection", "ax_action", "ax_scroll_page", "ax_scrollbar",
+    ]
+    private let changes = ChangeObserver()
+    /// Condition waits block here between checks, never on an app's queue.
+    private let waits = DispatchQueue(label: "dev.secondcursor.desktop.waits", attributes: .concurrent)
 
     /// Draws the agent's visible cursor. Set once by the app at launch; command-line tools leave it nil.
     public var cursor: AgentCursorPresenting?
@@ -114,6 +124,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         defer { lock.unlock() }
         return observedSizes["\(Execution.context.sessionID):\(wid)"]
     }
+
+    public func observedApps() -> Int { changes.count }
 
     public func permissionStatus() -> PermissionStatus {
         PermissionStatus(accessibility: AXIsProcessTrusted(), screenRecording: CGPreflightScreenCaptureAccess())
@@ -221,8 +233,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                         self.cursor?.present(
                             .activity(session: Execution.context.sessionID, app: nil, near: nil, caption: caption))
                     }
+                    self.watchChanges(step.windowID)
+                    let started = Date()
                     let result = try self.perform(step)
-                    self.markAction(on: step.windowID)
+                    self.markAction(on: step.windowID, started: started, route: result.route)
                     results.append(BatchStepResult(tool: step.tool, ok: true, result: result))
                 } catch {
                     let message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
@@ -238,13 +252,87 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         _ = try? await run(windowID: windowID) { self.settleNow(windowID) }
     }
 
+    public func checkCondition(windowID: UInt32, condition: WaitCondition) async throws -> ConditionResult {
+        try await run(windowID: windowID) { try self.evaluate(windowID, condition) }
+    }
+
+    public func waitFor(windowID: UInt32, condition: WaitCondition, timeout: TimeInterval) async throws -> ConditionResult {
+        guard let record = WindowList.record(windowID) else { throw SCError.windowNotFound(windowID) }
+        let queue = queue(for: record.pid)
+        let started = Date()
+        var deadline = started.addingTimeInterval(max(timeout, 0))
+        // Leave the call time to return what it saw rather than run into its own deadline.
+        if let callDeadline = Execution.context.deadline { deadline = min(deadline, callDeadline.addingTimeInterval(-1)) }
+        var first = true
+        while true {
+            let seen = changes.state(record.pid)?.count ?? 0
+            let checked = Date()
+            var result = try await run(on: queue) { [first] in
+                if first { self.watchChanges(windowID) }
+                return try self.evaluate(windowID, condition)
+            }
+            let now = Date()
+            if result.met || now >= deadline {
+                result.waited = result.met && first ? 0 : now.timeIntervalSince(started)
+                return result
+            }
+            first = false
+            // Apps that post nothing are re-checked on a timer; apps that never stop posting at most 25 times a second,
+            // since each check walks the window on the app's queue.
+            let wake = min(deadline, now.addingTimeInterval(0.25))
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                waits.async { [changes] in
+                    changes.wait(record.pid, after: seen, until: wake)
+                    let pause = min(wake, checked.addingTimeInterval(0.04)).timeIntervalSinceNow
+                    if pause > 0 { usleep(UInt32(pause * 1_000_000)) }
+                    done.resume()
+                }
+            }
+        }
+    }
+
+    /// Runs on the window's app queue. An element that has gone does not fail the check: it no longer has the value.
+    private func evaluate(_ wid: CGWindowID, _ condition: WaitCondition) throws -> ConditionResult {
+        var holds = true
+        var seen: [String] = []
+        if let text = condition.text {
+            let record = try record(wid)
+            let window = try resolver.resolve(pid: record.pid, wid: wid)
+            let quoted = "\"\(TreeBuilder.escape(text, limit: 80))\""
+            if let found = TreeBuilder.firstContaining(text, in: window, maxNodes: 5000) {
+                seen.append("\(quoted) is in the \(found.attribute) of an \(found.role)")
+            } else {
+                holds = false
+                seen.append("no title, value or description in the window contains \(quoted)")
+            }
+        }
+        if let index = condition.elementIndex, let expected = condition.value {
+            let record = try record(wid)
+            guard let tree = storedTree(for: wid), tree.pid == record.pid, tree.snapshotID != nil else {
+                throw SCError.staleSnapshot(wid)
+            }
+            guard let element = tree.elements[index] else { throw SCError.elementNotFound(index) }
+            if element.element.isAlive {
+                let value = AX.text(element.element.attribute(kAXValueAttribute))
+                holds = holds && value == expected
+                seen.append("[\(index)] value is " + (value.map { "\"\(TreeBuilder.escape($0, limit: 200))\"" } ?? "empty"))
+            } else {
+                holds = false
+                seen.append("[\(index)] no longer exists")
+            }
+        }
+        return ConditionResult(met: holds != condition.gone, detail: seen.joined(separator: "; "))
+    }
+
     // MARK: Actions (run on the target app's queue)
 
     private func act(_ windowID: CGWindowID, _ work: @escaping () throws -> ActionResult) async throws -> ActionResult {
         try await run(windowID: windowID) {
             try self.validateObservation(windowID)
+            self.watchChanges(windowID)
+            let started = Date()
             let result = try work()
-            self.markAction(on: windowID)
+            self.markAction(on: windowID, started: started, route: result.route)
             return result
         }
     }
@@ -348,10 +436,17 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     // MARK: Settling
 
-    private func markAction(on wid: CGWindowID) {
+    private func markAction(on wid: CGWindowID, started: Date, route: String) {
         lock.lock()
-        activity[wid] = Activity(at: Date())
+        activity[wid] = Activity(started: started, at: Date(), synchronous: Self.synchronousRoutes.contains(route))
         lock.unlock()
+    }
+
+    /// Registers for the window's notifications before acting, so the app's answer to the action is not missed.
+    private func watchChanges(_ wid: CGWindowID) {
+        guard let record = WindowList.record(wid), !changes.isWatching(pid: record.pid, windowID: wid),
+              let window = try? resolver.resolve(pid: record.pid, wid: wid) else { return }
+        changes.watch(pid: record.pid, windowID: wid, window: window)
     }
 
     /// Acted on in the last 2 s and not yet seen to settle since.
@@ -372,18 +467,49 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         return true
     }
 
-    /// Polls a fingerprint of the accessibility tree until it holds still for `quiet`, so an
-    /// observation reflects the UI after the app has finished reacting, not mid-update. A window that
-    /// never holds still (meters, playback) counts as settled after `cap`, so the next read does not wait again.
+    /// Waits until the app has finished reacting to `action` (default: the window's latest action), so an observation
+    /// reflects the UI after the change, not mid-update. A window that never holds still (meters, playback) counts as
+    /// settled after `cap`, so the next read does not wait again.
     @discardableResult
-    private func settleNow(_ wid: CGWindowID, quiet: TimeInterval = 0.2, cap: TimeInterval = 3) -> Bool {
+    private func settleNow(_ wid: CGWindowID, after action: Activity? = nil, cap: TimeInterval = 3) -> Bool {
         guard let record = WindowList.record(wid), let window = try? resolver.resolve(pid: record.pid, wid: wid) else { return false }
-        func fingerprint() -> Int { TreeBuilder.fingerprint(window: window, maxNodes: 1000) }
         defer {
             lock.lock()
             activity[wid]?.settled = true
             lock.unlock()
         }
+        lock.lock()
+        let action = action ?? activity[wid]
+        lock.unlock()
+        // An app that has never posted a notification may not post them at all.
+        if let action, changes.watch(pid: record.pid, windowID: wid, window: window),
+           let state = changes.state(record.pid), state.count > 0 {
+            return settle(record.pid, after: action, cap: cap)
+        }
+        return pollSettle(window, cap: cap)
+    }
+
+    /// Waits for the app's first notification after the action (input events and menus are handled a little later,
+    /// so up to 250 ms), then until it has posted nothing for 60 ms, and never less than 30 ms after the action.
+    private func settle(_ pid: pid_t, after action: Activity, cap: TimeInterval) -> Bool {
+        let answers = action.synchronous ? action.started : action.at
+        let deadline = action.at.addingTimeInterval(cap)
+        while let state = changes.state(pid) {
+            let until = if let last = state.last, last > answers {
+                max(action.at.addingTimeInterval(0.03), last.addingTimeInterval(0.06))
+            } else {
+                action.at.addingTimeInterval(0.25)
+            }
+            if Date() >= until { return true }
+            if Date() >= deadline { return false }
+            changes.wait(pid, after: state.count, until: min(until, deadline))
+        }
+        return false
+    }
+
+    /// Polls a fingerprint of the accessibility tree until it holds still for `quiet`.
+    private func pollSettle(_ window: AXUIElement, quiet: TimeInterval = 0.2, cap: TimeInterval) -> Bool {
+        func fingerprint() -> Int { TreeBuilder.fingerprint(window: window, maxNodes: 1000) }
         let deadline = Date().addingTimeInterval(cap)
         var last = fingerprint()
         var lastChange = Date()
@@ -514,6 +640,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     private func snapshot(_ wid: CGWindowID, options: SnapshotOptions) throws -> WindowSnapshot {
         let record = try record(wid)
         let window = try resolver.resolve(pid: record.pid, wid: wid)
+        changes.watch(pid: record.pid, windowID: wid, window: window)
         let frame = window.frame ?? record.bounds
         let tree = tree(for: wid, pid: record.pid)
         let id = String(UUID().uuidString.prefix(8)).lowercased()
@@ -695,6 +822,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 if !items.isEmpty { pb.writeObjects(items) }
             }
             let result: ActionResult
+            let started = Date()
             do {
                 result = try self.performKey(windowID, chord: Keyboard.parse("cmd+v"))
             } catch {
@@ -705,7 +833,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             // An unconfirmed press or queued keystrokes may read the clipboard later; restoring now could paste
             // the user's own clipboard into the app instead.
             if result.verified == true {
-                self.settleNow(windowID)
+                self.settleNow(windowID, after: Activity(started: started, at: Date(), synchronous: false))
                 restore()
             } else {
                 note += (note.hasSuffix(" ") ? "" : "; ")

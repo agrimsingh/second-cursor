@@ -128,6 +128,26 @@ struct TreeBuilder {
         return hasher.finalize()
     }
 
+    /// The role and attribute of the first element, in walk order from the window itself, whose title, value or
+    /// description contains `text` (case-sensitive), looking at up to `maxNodes` elements.
+    static func firstContaining(_ text: String, in window: AXUIElement, maxNodes: Int) -> (role: String, attribute: String)? {
+        var pending = [window]
+        var visited = 0
+        while visited < maxNodes, let element = pending.popLast() {
+            visited += 1
+            let values = element.attributes([
+                kAXRoleAttribute, kAXTitleAttribute, kAXValueAttribute, kAXDescriptionAttribute, kAXChildrenAttribute,
+            ])
+            let role = values[0] as? String ?? "AXUnknown"
+            if prunedRoles.contains(role) { continue }
+            for (i, attribute) in [(1, "title"), (2, "value"), (3, "description")] where AX.text(values[i])?.contains(text) == true {
+                return (role, attribute)
+            }
+            pending.append(contentsOf: (values[4] as? [AXUIElement] ?? []).reversed())
+        }
+        return nil
+    }
+
     private mutating func walk(_ element: AXUIElement, depth: Int, indent: Int, parentKey: String,
                                inWebArea: Bool, ordinals: inout [String: Int], recurse: Bool = true, knownKey: String? = nil) {
         guard nodes.count < maxNodes, visits < maxVisits else {

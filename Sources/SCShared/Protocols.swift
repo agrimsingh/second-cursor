@@ -34,6 +34,8 @@ public enum SCError: Error, LocalizedError, Equatable {
 /// frontmost app, or switch Spaces unless a method says otherwise.
 public protocol DesktopControlling: AnyObject, Sendable {
     func closeSession(_ sessionID: String)
+    /// App processes watched for accessibility notifications: at most 16, least recently used evicted, exited ones dropped.
+    func observedApps() -> Int
     func permissionStatus() -> PermissionStatus
     func listApps(includeNotRunning: Bool) async -> [AppInfo]
     /// `appQuery` matches app name or bundle id (case-insensitive substring); nil lists all.
@@ -69,8 +71,13 @@ public protocol DesktopControlling: AnyObject, Sendable {
     /// `stopOnLayoutChange`, a pixel step whose window changed size since it was last observed stops the batch.
     func runBatch(windowID: UInt32, steps: [BatchStep], stopOnError: Bool, stopOnLayoutChange: Bool,
                   admit: @escaping @Sendable (BatchStep) throws -> Void) async throws -> [BatchStepResult]
-    /// Returns once the window's accessibility tree has stopped changing (~200 ms), or after ~3 s.
+    /// Returns once the window's app has finished reacting to its latest action, or after ~3 s.
     func settle(windowID: UInt32) async
+    /// Evaluates `condition` against the window once.
+    func checkCondition(windowID: UInt32, condition: WaitCondition) async throws -> ConditionResult
+    /// Re-checks `condition` on each accessibility notification from the window's app (and every 250 ms) until it
+    /// holds or `timeout` passes. The app's queue is free between checks, so other calls on the app go on meanwhile.
+    func waitFor(windowID: UInt32, condition: WaitCondition, timeout: TimeInterval) async throws -> ConditionResult
     /// Keeps `session`'s on-screen presence (arrow and menu bar) alive; called for every admitted window or app
     /// call, with the app it works in. With `showArrow` (keyboard actions), an arrow that is not showing yet
     /// appears near the window's focused element, if the window is on the user's current Space.

@@ -15,6 +15,7 @@ enum ToolCatalog {
         "inspect_element", "paste", "select_text", "get_window_state", "batch", "click", "drag", "type_text",
         "set_value", "press_key", "scroll", "perform_action",
         "screenshot", "move_to_agent_display", "return_window",
+        "wait_for",
     ]
 
     /// Native actions that return an observation of their window (see `observe`).
@@ -358,6 +359,9 @@ enum ToolCatalog {
                         "Returned after the action: tree (what changed since your last read of this window), both (tree and screenshot), screenshot, or none when chaining blind.",
                         enumValues: ["tree", "both", "screenshot", "none"], default: "tree")
                 }
+                if observingTools.contains(tool.name) || tool.name == "batch" {
+                    props["expect"] = expect
+                }
                 if tool.name == "browser_snapshot" {
                     props["full"] = boolean("Full outline; false enables session-local diffs.", default: true)
                 }
@@ -451,6 +455,33 @@ enum ToolCatalog {
                             "Operation-specific fields. Call operation=capabilities for argument help and approval requirements.",
                     ]),
                 ], required: ["operation"])),
+        Tool(
+            name: "wait_for",
+            description:
+                "Wait until text shows up in a window (or element_index has exactly value), or with gone=true until it goes away, then return status and what changed since your last read of the window. It wakes on the app's own change notifications, so it returns as soon as the change lands. Use it for search results, dialogs, saves or progress that take a moment, instead of reading the window again and again. status is verified, or failed when timeout_ms passed; detail says what was last seen.",
+            inputSchema: schema(
+                conditionFields.merging([
+                    "window_id": windowID,
+                    "caption": string("Optional: a few words shown beside the agent's cursor while it waits."),
+                ]) { $1 }),
+            annotations: .init(readOnlyHint: true)),
+    ]
+
+    /// Scalars only: Gemini through Cursor stringifies nested free-form objects. The router also takes expect as a
+    /// JSON string.
+    private static let conditionFields: [String: Value] = [
+        "text": string("Some element's title, value or description contains this (case-sensitive)."),
+        "element_index": integer("With value: an element [index] from your latest read of this window."),
+        "value": string("With element_index: the value that element must have, exactly."),
+        "gone": boolean("Wait for the condition to stop holding instead, e.g. a progress message to go away.", default: false),
+        "timeout_ms": integer("How long to wait, up to 10000.", default: 2000),
+    ]
+
+    private static let expect: Value = [
+        "type": "object",
+        "description":
+            "Optional check that the action worked, instead of reading the window again: text somewhere in the window, or element_index having exactly value. It is checked once before the action, then waited for after it (for batch, after the last step). The result's expect says verified, preexisting (it already held before the action), or failed with what was seen instead; failed is not an error.",
+        "properties": .object(conditionFields),
     ]
 
     /// Flat on each step rather than nested under args: Gemini through Cursor stringifies a free-form nested

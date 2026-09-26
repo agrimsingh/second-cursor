@@ -229,6 +229,37 @@ public struct BatchStepResult: Sendable, Equatable {
     }
 }
 
+/// What `expect` and `wait_for` wait for: `text` in some element's title, value or description, and/or the element
+/// `elementIndex` (of the session's latest observation) having exactly `value`. `gone` waits for it to stop holding.
+public struct WaitCondition: Sendable, Equatable {
+    public var text: String?
+    public var elementIndex: Int?
+    public var value: String?
+    public var gone: Bool
+
+    public init(text: String? = nil, elementIndex: Int? = nil, value: String? = nil, gone: Bool = false) {
+        self.text = text
+        self.elementIndex = elementIndex
+        self.value = value
+        self.gone = gone
+    }
+}
+
+public struct ConditionResult: Sendable, Equatable {
+    /// Whether the condition, with `gone` applied, holds.
+    public var met: Bool
+    /// What was last seen, e.g. the element's actual value.
+    public var detail: String
+    /// 0 when it held at the first check.
+    public var waited: TimeInterval
+
+    public init(met: Bool, detail: String, waited: TimeInterval = 0) {
+        self.met = met
+        self.detail = detail
+        self.waited = waited
+    }
+}
+
 public struct PermissionStatus: Codable, Sendable, Equatable {
     public var accessibility: Bool
     public var screenRecording: Bool

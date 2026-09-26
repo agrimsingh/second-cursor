@@ -85,7 +85,8 @@ final class ToolRouter: Sendable {
             if name == "bind_target" {
                 return try await bindTarget(args, session: session, deadline: receivedAt.addingTimeInterval(60))
             }
-            let timeout = Double(min(60_000, max(1, try args.int("timeout_ms", default: 60_000)))) / 1000
+            // wait_for's timeout_ms bounds its wait (at most 10 s), not the call.
+            let timeout = name == "wait_for" ? 60 : Double(min(60_000, max(1, try args.int("timeout_ms", default: 60_000)))) / 1000
             let deadline = receivedAt.addingTimeInterval(timeout)
             let suppliedID = try args.optionalString("operation_id")
             let id = suppliedID ?? UUID().uuidString
@@ -248,8 +249,10 @@ final class ToolRouter: Sendable {
         } else {
             return
         }
-        let caption = ToolCatalog.captionedTools.contains(name)
+        var caption = ToolCatalog.captionedTools.contains(name)
             ? ((try? args.optionalString("caption")).flatMap { $0 }.map(Self.caption) ?? "") : nil
+        // A wait is a read: it shows its caption when it has one and otherwise leaves the current one.
+        if name == "wait_for" { caption = (try? args.optionalString("caption")).flatMap { $0 }.map(Self.caption) }
         desktop.noteAgentActivity(
             session: session, windowID: try? args.windowID(), app: app, showArrow: Self.keyboardTools.contains(name),
             caption: caption)
