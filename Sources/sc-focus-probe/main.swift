@@ -3,6 +3,7 @@
 //   usage: sc-focus-probe --state <path>
 // Writes {"resign_active","resign_key","first_responder_changes","active","key","pid"} atomically to
 // <path> at launch and on every change. Run it from a .app bundle so LaunchServices activates it.
+// With --canvas <word> it is a custom-drawn background window instead (Canvas.swift, e2e/ocr.py).
 import AppKit
 
 final class ProbeWindow: NSWindow {
@@ -78,9 +79,18 @@ final class Probe: NSObject, NSApplicationDelegate {
 }
 
 let arguments = CommandLine.arguments
-let statePath = arguments.firstIndex(of: "--state").flatMap { $0 + 1 < arguments.count ? arguments[$0 + 1] : nil }
+func value(_ flag: String) -> String? {
+    arguments.firstIndex(of: flag).flatMap { $0 + 1 < arguments.count ? arguments[$0 + 1] : nil }
+}
+let statePath = value("--state")
 let app = NSApplication.shared
-let probe = Probe(statePath: statePath)
-app.setActivationPolicy(.regular)
+let probe: NSApplicationDelegate
+if let word = value("--canvas") {
+    probe = Canvas(word: word, statePath: statePath)
+    app.setActivationPolicy(.accessory)
+} else {
+    probe = Probe(statePath: statePath)
+    app.setActivationPolicy(.regular)
+}
 app.delegate = probe
 app.run()

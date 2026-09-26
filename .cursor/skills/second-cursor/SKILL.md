@@ -26,6 +26,8 @@ To find one element in a big window (a button, field or row), call `find_element
 
 Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`.
 
+When you can see text the outline lacks (custom-drawn apps such as DAWs, canvases, games), read with `ocr: true` instead of guessing from a screenshot: it adds `ocr="…"` to element lines and `text "…" (x,y wxh)` lines, which you click with x/y at their center.
+
 ## Code-first for multi-step flows
 
 When a flow has many steps or branches on what the UI shows, write a short Node script with the SDK and run it with the shell, instead of making dozens of tool calls. The script observes, decides, and acts in a loop, and prints only what you need.

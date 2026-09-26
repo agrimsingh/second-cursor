@@ -118,7 +118,8 @@ extension ToolRouter {
                 maxElements: try args.optionalInt("max_elements").map { min(max($0, 50), 3000) },
                 full: try args.bool("full", default: false),
                 scope: scope.index,
-                scopeLabel: scope.label
+                scopeLabel: scope.label,
+                ocr: try args.bool("ocr", default: false)
             )
             let snapshot = try await desktop.windowState(windowID: try args.windowID(), options: options)
             return ToolOutput(
@@ -428,6 +429,9 @@ extension ToolRouter {
         }
         if let shot = snapshot.screenshot { json["screenshot"] = screenshotJSON(shot, windowID: snapshot.window.id) }
         if let error = snapshot.screenshotError { json["screenshot_error"] = error }
+        if let ms = snapshot.ocrMS { json["ocr_ms"] = ms }
+        if let count = snapshot.ocrCount { json["ocr_count"] = count }
+        if let error = snapshot.ocrError { json["ocr_error"] = error }
         if let base = snapshot.diffBase { json["diff_base"] = base }
         if let scope = snapshot.scope { json["scope"] = scope }
         if let label = snapshot.scopeLabel { json["scope"] = label }

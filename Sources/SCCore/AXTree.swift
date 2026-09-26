@@ -18,6 +18,7 @@ struct TreeNode {
     let value: String?
     /// AXDescription, which `label` only shows when the element has no title.
     let description: String?
+    /// Global screen points. The outline prints it only for indexed elements.
     let frame: CGRect?
     let indexed: Bool
     let element: AXUIElement
@@ -183,7 +184,7 @@ struct TreeBuilder {
         var childIndent = indent
         if shown {
             var frame: CGRect?
-            if indexed, let position = AX.point(values[6]), let size = AX.size(values[7]) {
+            if let position = AX.point(values[6]), let size = AX.size(values[7]) {
                 frame = CGRect(origin: position, size: size)
             }
             nodes.append(TreeNode(indent: indent, role: role, label: label, value: value,

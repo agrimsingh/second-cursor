@@ -20,6 +20,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         /// their frames are relative to. `findElements` searches them.
         var nodes: [TreeNode]?
         var origin: CGPoint = .zero
+        /// `lines` never include recognized text, so plain reads diff as before. The last OCR read's text, and the
+        /// layout of each full read since, let the next OCR read diff against the previous outline with it merged in.
+        var recognized: [RecognizedText]?
+        var layout: OutlineLayout?
 
         init(pid: pid_t) { self.pid = pid }
     }
@@ -156,10 +160,28 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// A failed capture does not fail the read: the tree was taken and is now the diff baseline, so the caller
     /// must see it.
     public func windowState(windowID: UInt32, options: SnapshotOptions) async throws -> WindowSnapshot {
+        var recognized: [RecognizedText]?
+        var ocrError: String?
+        var ocrMS: Int?
+        if options.ocr {
+            if needsSettle(windowID) { await settle(windowID: windowID) }
+            if claimPaintWait(windowID) { try? await Task.sleep(nanoseconds: 150_000_000) }
+            let started = Date()
+            // Leaves time within the call's deadline for the tree walk.
+            let budget = max(0, min(15, (Execution.context.deadline?.timeIntervalSinceNow ?? 60) - 3))
+            do {
+                recognized = try await TextRecognition.recognize(windowID, budget: budget)
+            } catch {
+                ocrError = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            }
+            ocrMS = Int(Date().timeIntervalSince(started) * 1000)
+        }
         var snapshot = try await run(windowID: windowID) {
             if self.needsSettle(windowID) { self.settleNow(windowID) }
-            return try self.snapshot(windowID, options: options)
+            return try self.snapshot(windowID, options: options, recognized: recognized)
         }
+        snapshot.ocrMS = ocrMS
+        snapshot.ocrError = ocrError
         if options.includeScreenshot {
             do {
                 snapshot.screenshot = try await capture(windowID)
@@ -641,7 +663,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     // MARK: Snapshots
 
-    private func snapshot(_ wid: CGWindowID, options: SnapshotOptions) throws -> WindowSnapshot {
+    private func snapshot(_ wid: CGWindowID, options: SnapshotOptions, recognized: [RecognizedText]?) throws -> WindowSnapshot {
         let record = try record(wid)
         let window = try resolver.resolve(pid: record.pid, wid: wid)
         changes.watch(pid: record.pid, windowID: wid, window: window)
@@ -675,12 +697,22 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             builder.build(subtreeOf: root.element, key: root.key, inWebArea: root.inWebArea)
             var out = TreeRenderer.scoped(scope: handle, windowOrigin: frame.origin, nodes: builder.nodes,
                                           table: tree.table, maxElements: max(limit, 2000))
+            let shown = out.body.count - 1
             if builder.truncated, out.footer == nil { out.footer = TreeRenderer.walkLimitFooter }
             tree.elements.merge(out.elements) { _, scoped in scoped }
-            var result = WindowSnapshot(window: windowInfo(record, window: window), snapshotID: id, tree: out.text,
+            var text = out.text
+            var ocrCount: Int?
+            if let recognized {
+                let layout = OutlineLayout(nodes: builder.nodes, shown: shown, origin: frame.origin, window: nil)
+                let merged = TextRecognition.merge(recognized, lines: out.lines, keys: out.keys, layout: layout)
+                text = merged.lines.joined(separator: "\n")
+                ocrCount = merged.count
+            }
+            var result = WindowSnapshot(window: windowInfo(record, window: window), snapshotID: id, tree: text,
                                   elementCount: out.indexedCount, truncated: out.truncated || builder.truncated, scope: options.scope)
             result.scopeLabel = options.scope == nil ? options.scopeLabel : nil
             result.elements = out.structured
+            result.ocrCount = ocrCount
             return result
         }
 
@@ -691,17 +723,33 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let title = window.string(kAXTitleAttribute) ?? record.title
         var out = TreeRenderer.full(title: title, size: frame.size, windowOrigin: frame.origin, nodes: builder.nodes,
                                     table: tree.table, maxElements: limit)
+        let layout = OutlineLayout(nodes: builder.nodes, shown: out.body.count - 1, origin: frame.origin,
+                                   window: (title, frame.size))
         out.appendOrientation(focused: app.element(kAXFocusedUIElementAttribute))
         if builder.truncated, out.footer == nil { out.footer = TreeRenderer.walkLimitFooter }
         tree.table.retain(keys: Set(builder.nodes.map(\.key)))
         let base = tree.snapshotID
+        var lines = out.lines
+        var keys = out.keys
+        var ocrCount: Int?
+        if let recognized {
+            let merged = TextRecognition.merge(recognized, lines: out.lines, keys: out.keys, layout: layout)
+            lines = merged.lines
+            keys = merged.keys
+            ocrCount = merged.count
+        }
         var diff: String?
-        if !options.full, let lines = tree.lines, let keys = tree.keys {
-            diff = TreeRenderer.diff(previous: lines, previousKeys: keys, current: out.lines, currentKeys: out.keys)
+        if !options.full, var previous = tree.lines, var previousKeys = tree.keys {
+            if recognized != nil, let text = tree.recognized, let layout = tree.layout {
+                (previous, previousKeys, _) = TextRecognition.merge(text, lines: previous, keys: previousKeys, layout: layout)
+            }
+            diff = TreeRenderer.diff(previous: previous, previousKeys: previousKeys, current: lines, currentKeys: keys)
         }
         tree.snapshotID = id
         tree.lines = out.lines
         tree.keys = out.keys
+        if let recognized { tree.recognized = recognized }
+        if tree.recognized != nil { tree.layout = layout }
         tree.elements = out.elements
         tree.nodes = builder.nodes
         tree.origin = frame.origin
@@ -712,11 +760,12 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             }
         }
         var result = WindowSnapshot(
-            window: windowInfo(record, window: window), snapshotID: id, tree: diff ?? out.text,
+            window: windowInfo(record, window: window), snapshotID: id, tree: diff ?? lines.joined(separator: "\n"),
             elementCount: out.indexedCount, truncated: out.truncated || builder.truncated,
             isDiff: diff != nil, diffBase: diff != nil ? base : nil
         )
         result.elements = out.structured
+        result.ocrCount = ocrCount
         return result
     }
 
@@ -755,7 +804,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             var readWindow = false
             if self.storedTree(for: windowID).map({ $0.pid != record.pid || $0.nodes == nil }) ?? true {
                 if self.needsSettle(windowID) { self.settleNow(windowID) }
-                _ = try self.snapshot(windowID, options: SnapshotOptions(includeScreenshot: false, full: false))
+                _ = try self.snapshot(
+                    windowID, options: SnapshotOptions(includeScreenshot: false, full: false), recognized: nil)
                 readWindow = true
             }
             let tree = self.tree(for: windowID, pid: record.pid)
