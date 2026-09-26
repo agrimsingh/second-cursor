@@ -195,6 +195,7 @@ async function dispatch(activePort, { id, method, params }) {
       )
     )
       await requireAgentTab(params.tabId, params.session_id ?? "legacy");
+    const dispatchedAt = Date.now();
     reply = {
       id,
       result: await (params.tabId != null
@@ -205,7 +206,7 @@ async function dispatch(activePort, { id, method, params }) {
       params.tabId != null &&
       (ACTIONS.has(method) || (method === "extended" && EXTENDED_ACTIONS.has(params.operation)))
     )
-      noteAction(params.tabId);
+      noteAction(params.tabId, dispatchedAt);
   } catch (error) {
     reply = {
       id,

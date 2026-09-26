@@ -245,9 +245,13 @@ chrome.tabs.onRemoved.addListener((tabId) => settleContexts.delete(tabId));
 const lastAction = new Map();
 chrome.tabs.onRemoved.addListener((tabId) => lastAction.delete(tabId));
 
-/** Input that may make the page fetch and render something (a filter, a search, "load more"). */
-export function noteAction(tabId) {
-  lastAction.set(tabId, Date.now());
+/**
+ * Input that may make the page fetch and render something (a filter, a search, "load more"). `at` must be when the
+ * input was dispatched: a page that re-renders during the action has already reacted, and stamping the end of the
+ * action instead makes the next read wait out all of `reactMs` for a reaction that already happened.
+ */
+export function noteAction(tabId, at = Date.now()) {
+  lastAction.set(tabId, at);
 }
 
 /**
