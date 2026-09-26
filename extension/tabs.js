@@ -1,3 +1,4 @@
+import { removeCursor } from "./cursor.js";
 import { BridgeError, sleep } from "./errors.js";
 
 const GROUP_TITLE = "Second Cursor";
@@ -48,6 +49,7 @@ const claimExpired = (entry) =>
 
 // Releasing never closes the user's tab.
 async function dropTab(tabId) {
+  await removeCursor(tabId);
   await chrome.debugger.detach({ tabId }).catch(() => {});
   delete (await ownership())[tabId];
   await updateAgentTabs((s) => s.delete(tabId));

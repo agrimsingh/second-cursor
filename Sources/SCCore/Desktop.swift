@@ -217,6 +217,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 do {
                     try Execution.context.beforeDispatch()
                     try admit(step)
+                    if let caption = step.caption {
+                        self.cursor?.present(
+                            .activity(session: Execution.context.sessionID, app: nil, near: nil, caption: caption))
+                    }
                     let result = try self.perform(step)
                     self.markAction(on: step.windowID)
                     results.append(BatchStepResult(tool: step.tool, ok: true, result: result))

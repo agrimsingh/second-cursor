@@ -10,9 +10,12 @@ Flow: fresh TestInstance -> temp project whose .cursor/mcp.json points at the in
 
 Usage:  python3 e2e/agent_smoke.py
         python3 e2e/agent_smoke.py --run [--model <model>] [--timeout <seconds>]
+        python3 e2e/agent_smoke.py --run --models <a,b,...> [--repeat <n>]   compare models, n runs each
 Output: e2e/artifacts/agent-<ts>/ report.md, results.json, transcript.jsonl (verification calls),
         agent/ (prompt, stream-json events, stderr, the project's mcp.json with the token redacted),
-        agent/actions.jsonl (the instance's action log: every state-changing MCP call the agent made)
+        agent/actions.jsonl (the instance's action log: every state-changing MCP call the agent made),
+        agent/timing.json (agent loop split into model time and tool time, tool calls, token usage);
+        with more than one run, also e2e/artifacts/agent-compare-<ts>.md
 """
 import json
 import pathlib
@@ -22,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 import run
 from run import SCENARIOS, Skip, ToolError, element_index, scenario
@@ -82,6 +86,43 @@ def tool_events(events):
     return calls
 
 
+def timing(events, elapsed):
+    """Splits the agent loop into time inside tool calls (the union of their intervals, since a model may
+    call tools in parallel) and everything else, which is the model's time."""
+    init = next((e for e in events if e.get("type") == "system"), {})
+    final = next((e for e in reversed(events) if e.get("type") == "result"), {})
+    starts, intervals, names = {}, [], []
+    for e in events:
+        if e.get("type") != "tool_call":
+            continue
+        if e.get("subtype") == "started":
+            starts[e["call_id"]] = e["timestamp_ms"]
+            call = e.get("tool_call") or {}
+            kind = next(iter(call), "unknown")
+            tool = (call.get(kind) or {}).get("args", {}).get("toolName")
+            if kind.startswith("getMcpTools"):
+                names.append(f"schema:{tool}" if tool else "schema")
+            else:
+                names.append(tool or kind.removesuffix("ToolCall"))
+        elif e.get("subtype") == "completed" and e.get("call_id") in starts:
+            intervals.append((starts[e["call_id"]], e["timestamp_ms"]))
+    tool_ms, end = 0, None
+    for start, stop in sorted(intervals):
+        if end is None or start > end:
+            tool_ms += stop - start
+            end = stop
+        elif stop > end:
+            tool_ms += stop - end
+            end = stop
+    loop_ms = final.get("duration_ms") or 0
+    return {
+        "model": init.get("model"), "requested_model": MODEL, "loop_s": round(loop_ms / 1000, 1),
+        "model_s": round((loop_ms - tool_ms) / 1000, 1), "tool_s": round(tool_ms / 1000, 1),
+        "tool_calls": len(names), "used_batch": "batch" in names, "calls": names,
+        "process_s": round(elapsed, 1), "usage": final.get("usage"),
+    }
+
+
 @scenario
 def agent_calculator_to_textedit(ctx):
     inst = ctx.run.instance
@@ -90,11 +131,20 @@ def agent_calculator_to_textedit(ctx):
     agent = shutil.which("cursor-agent")
     ctx.require("cursor-agent is installed", agent, "install the Cursor Agent CLI")
 
-    text_window = ctx.launch_scratch_textedit("agent-notes.txt", TEXT)["id"]
-    launched = ctx.call("launch_app", app="Calculator", new_instance=True)
+    # Off the user's screen: a fixture window the user can see is one they can close mid-run, and Calculator
+    # quits with its last window.
+    text_window = ctx.launch_scratch_textedit("agent-notes.txt", TEXT, on_agent_display=True)["id"]
+    launched = ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(launched["app"]["pid"])
     calc = ctx.wait_for_window("Calculator", pid=launched["app"]["pid"])["id"]
+    run.clear_calculator(ctx, calc)
     ctx.require("fixture text is in place", full_text(ctx, text_window) == TEXT)
+    # The harness shares the agent's default session; a new turn makes the agent's first read a full outline,
+    # as it would be for a real agent, instead of a diff against the harness's reads.
+    ended = urllib.request.urlopen(urllib.request.Request(
+        ctx.mcp.url.rsplit("/", 1)[0] + "/turn-ended", data=b"{}", method="POST",
+        headers={"Authorization": f"Bearer {ctx.mcp.token}", "Content-Type": "application/json"}), timeout=15)
+    ctx.require("the harness's turn ended before the agent starts", json.loads(ended.read()).get("ok") is True)
 
     project = pathlib.Path(tempfile.mkdtemp(prefix="sc-agent-"))
     ctx.cleanups.append(lambda: shutil.rmtree(project, ignore_errors=True))
@@ -133,6 +183,12 @@ def agent_calculator_to_textedit(ctx):
     final = next((e for e in reversed(events) if e.get("type") == "result"), {})
     calls = tool_events(events)
     (out_dir / "tool-calls.txt").write_text("\n".join(f"{kind}: {detail}" for kind, detail in calls) + "\n")
+    split = timing(events, elapsed)
+    (out_dir / "timing.json").write_text(json.dumps(split, indent=2) + "\n")
+    ctx.run.notes.append(
+        f"{split['model']}: agent loop {split['loop_s']}s = model {split['model_s']}s + tools {split['tool_s']}s, "
+        f"{split['tool_calls']} tool calls, batch {'used' if split['used_batch'] else 'not used'} "
+        f"({split['process_s']}s including CLI startup)")
 
     ctx.check(f"cursor-agent finished within {TIMEOUT:.0f}s and exited 0", code == 0, f"exit {code} after {elapsed:.0f}s; {stderr[-300:]}")
     ctx.check("the agent reported success", final and not final.get("is_error"), final)
@@ -163,13 +219,53 @@ def plan():
     print("\nThis spends model usage. Re-run with --run to execute.")
 
 
+def seconds(value):
+    return "?" if value is None else f"{value}s"
+
+
+def median(values):
+    return values[len(values) // 2] if values else "?"
+
+
+def compare(rows):
+    lines = ["| Model | Run | Result | Loop | Model time | Tool time | Tool calls | Batch |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for row in rows:
+        t = row["timing"] or {}
+        lines.append(f"| {row['model'] or 'default'} | {row['dir']} | {'PASS' if row['passed'] else 'FAIL'} | "
+                     f"{seconds(t.get('loop_s'))} | {seconds(t.get('model_s'))} | {seconds(t.get('tool_s'))} | "
+                     f"{t.get('tool_calls', '?')} | {'yes' if t.get('used_batch') else 'no'} |")
+    lines += ["", "| Model | Passed | Median loop | Median tool calls |", "| --- | --- | --- | --- |"]
+    for model in dict.fromkeys(row["model"] for row in rows):
+        mine = [row for row in rows if row["model"] == model]
+        loops = sorted(row["timing"]["loop_s"] for row in mine if row["timing"])
+        counts = sorted(row["timing"]["tool_calls"] for row in mine if row["timing"])
+        lines.append(f"| {model or 'default'} | {sum(row['passed'] for row in mine)}/{len(mine)} | "
+                     f"{median(loops)}s | {median(counts)} |")
+    return "\n".join(lines) + "\n"
+
+
 if __name__ == "__main__":
     if "--run" not in sys.argv:
         plan()
         sys.exit(0)
-    # A model may reach for gated tools; the instance must grant or refuse without ever showing a dialog.
-    smoke = run.Run(config_overrides={"approvals": "allow", "appApproval": "off"}, browser=False)
-    renamed = smoke.dir.with_name(f"agent-{smoke.dir.name}")
-    smoke.dir.rename(renamed)
-    smoke.dir = renamed
-    sys.exit(0 if smoke.run(set()) else 1)
+    models = [m.strip() or None for m in (option("--models") or MODEL or "").split(",")]
+    repeat = int(option("--repeat", "1"))
+    rows = []
+    for model in models:
+        for _ in range(repeat):
+            MODEL = model
+            # A model may reach for gated tools; the instance must grant or refuse without ever showing a dialog.
+            smoke = run.Run(config_overrides={"approvals": "allow", "appApproval": "off"}, browser=False)
+            renamed = smoke.dir.with_name(f"agent-{smoke.dir.name}")
+            smoke.dir.rename(renamed)
+            smoke.dir = renamed
+            passed = smoke.run(set())
+            split = smoke.dir / "agent/timing.json"
+            rows.append({"model": model, "dir": smoke.dir.name, "passed": passed,
+                         "timing": json.loads(split.read_text()) if split.exists() else None})
+    if len(rows) > 1:
+        summary = run.ROOT / "artifacts" / f"agent-compare-{time.strftime('%Y%m%d-%H%M%S')}.md"
+        summary.write_text(f"# Agent smoke comparison\n\n{compare(rows)}")
+        print(f"\n{compare(rows)}\nSummary: {summary}")
+    sys.exit(0 if all(row["passed"] for row in rows) else 1)

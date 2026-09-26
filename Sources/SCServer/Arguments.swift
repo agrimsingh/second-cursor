@@ -152,4 +152,12 @@ struct Arguments {
         case .object(let object): return object.mapValues(jsonObject)
         }
     }
+
+    /// A nested object, or a JSON string holding one: some clients (Gemini through Cursor, for one)
+    /// cannot send a free-form nested object and stringify it instead.
+    static func nestedObject(_ value: Value) -> [String: Value]? {
+        if let object = value.objectValue { return object }
+        guard let text = value.stringValue else { return nil }
+        return try? JSONDecoder().decode([String: Value].self, from: Data(text.utf8))
+    }
 }

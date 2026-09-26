@@ -41,13 +41,22 @@ final class ToolRouter: Sendable {
         let receivedAt = Date()
         // The compact tool schema nests operation-specific fields. Keep flat 0.2 callers compatible.
         var raw = arguments
-        if name == "browser_command", let nested = raw.removeValue(forKey: "arguments")?.objectValue {
-            raw.merge(nested) { envelope, _ in envelope }
+        var malformedArguments = false
+        if name == "browser_command", let nested = raw.removeValue(forKey: "arguments"), !nested.isNull {
+            if let object = Arguments.nestedObject(nested) {
+                raw.merge(object) { envelope, _ in envelope }
+            } else {
+                malformedArguments = true
+            }
         }
         // A retry is identified by what the client sent, not by the window an app name resolved to.
         let requested = raw
         do {
             guard Self.toolNames.contains(name) else { throw SCError.invalidArgument("Unknown tool: \(name)") }
+            if malformedArguments {
+                throw SCError.invalidArgument(
+                    "arguments must be an object of the operation's fields; operation=capabilities lists them")
+            }
             raw = try await resolveAppTarget(name, raw)
             let args = Arguments(raw)
             let session = try args.optionalString("session_id") ?? "legacy"
@@ -224,18 +233,33 @@ final class ToolRouter: Sendable {
         "type_text", "press_key", "set_value", "paste", "select_text", "perform_action", "batch",
     ]
 
-    /// Window and app calls, reads included, keep the session's on-screen presence up until its turn ends.
+    /// Window, app and browser calls, reads included, keep the session's on-screen presence up until its turn
+    /// ends. A native action replaces the arrow's caption with its own, or clears it; reads leave it.
     private func noteActivity(_ name: String, _ args: Arguments, owner: WindowOwner?, session: String) {
         let app: String?
         if let owner, ToolCatalog.windowScopedTools.contains(name) {
             app = AppGuard.windowTarget(owner).name
         } else if name == "launch_app" {
             app = try? args.string("app")
+        } else if name.hasPrefix("browser_"), !["browser_status", "browser_instances"].contains(name) {
+            // The extension draws the browser cursor and its caption inside the tab.
+            desktop.noteAgentActivity(session: session, windowID: nil, app: "Chrome", showArrow: false, caption: nil)
+            return
         } else {
             return
         }
+        let caption = ToolCatalog.captionedTools.contains(name)
+            ? ((try? args.optionalString("caption")).flatMap { $0 }.map(Self.caption) ?? "") : nil
         desktop.noteAgentActivity(
-            session: session, windowID: try? args.windowID(), app: app, showArrow: Self.keyboardTools.contains(name))
+            session: session, windowID: try? args.windowID(), app: app, showArrow: Self.keyboardTools.contains(name),
+            caption: caption)
+    }
+
+    /// One line, trimmed to what fits beside the cursor.
+    static func caption(_ text: String) -> String {
+        let line = text.split(whereSeparator: \.isNewline).joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
+        return line.count > 80 ? String(line.prefix(79)) + "…" : line
     }
 
     private static func activityJSON(_ activity: AgentActivityStatus) -> [String: Any] {
@@ -244,6 +268,7 @@ final class ToolRouter: Sendable {
             "app": activity.app ?? NSNull(),
             "sessions": activity.sessions,
             "arrow": activity.arrow.map { ["x": $0.x, "y": $0.y] } ?? NSNull(),
+            "caption": activity.caption ?? NSNull(),
             "idle_seconds": activity.idleSeconds.map { ($0 * 10).rounded() / 10 } ?? NSNull(),
         ]
     }

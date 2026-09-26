@@ -3,6 +3,9 @@ import SCShared
 
 extension ToolRouter {
     func runBrowser(_ name: String, _ args: Arguments) async throws -> ToolOutput {
+        if ["browser_click", "browser_type", "browser_press_key", "browser_scroll", "browser_navigate"].contains(name) {
+            await showCaption(args)
+        }
         switch name {
         case "browser_instances":
             return ToolOutput(json: (try? JSONSerialization.jsonObject(with: await browser.instances())) as? [String:Any] ?? [:])
@@ -12,6 +15,7 @@ extension ToolRouter {
                 (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(value), options:.fragmentsAllowed)) ?? NSNull()
             }
             if let tid = try args.optionalInt("tab_id") { params["tabId"] = tid }
+            if let caption = try args.optionalString("caption") { params["caption"] = Self.caption(caption) }
             if try args.optionalString("operation") == "upload" {
                 for path in try args.strings("files") {
                     var directory: ObjCBool = false
@@ -91,5 +95,15 @@ extension ToolRouter {
         default:
             throw SCError.invalidArgument("Unknown tool \"\(name)\"")
         }
+    }
+
+    /// The extension draws the caption beside its in-page cursor (browser_command carries its own). Best effort:
+    /// an extension that predates captions refuses the method, and the action still runs.
+    private func showCaption(_ args: Arguments) async {
+        let caption = (try? args.optionalString("caption")).flatMap { $0 }.map(Self.caption) ?? ""
+        guard let tab = try? args.int("tab_id"),
+              let params = try? JSONSerialization.data(withJSONObject: ["tabId": tab, "caption": caption])
+        else { return }
+        _ = try? await browser.command("cursor.caption", params: params)
     }
 }

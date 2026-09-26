@@ -445,10 +445,11 @@ class Context:
             time.sleep(0.5)
         raise AssertionError(f"no {app} window (pid={pid}, title={title}) within {timeout}s")
 
-    def launch_scratch_textedit(self, filename, text):
+    def launch_scratch_textedit(self, filename, text, on_agent_display=False):
         path = self.scratch / filename
         path.write_text(text)
-        launched = self.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True)
+        launched = self.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True,
+                             on_agent_display=on_agent_display)
         pid = launched["app"]["pid"]
         self.kill_on_exit(pid)
         return self.wait_for_window("TextEdit", pid=pid, title=filename)
@@ -655,12 +656,26 @@ def value_of(tree, role="AXTextArea"):
     return json.loads(f'"{match.group(1)}"') if match else None
 
 
+def clear_calculator(ctx, wid):
+    """Calculator restores its last result on launch, and after earlier runs that is 7 x 6 = 42: start from 0 so
+    a 42 afterwards proves the new input."""
+    tree = ctx.tree(wid, include_screenshot=False)
+    clear = element_index(tree, "AXButton", "All Clear")
+    if clear is None:
+        clear = element_index(tree, "AXButton", "Clear")
+    if clear is not None:
+        ctx.call("click", window_id=wid, element_index=clear, observe="none")
+        tree = ctx.tree(wid, include_screenshot=False)
+    ctx.require("Calculator starts from 0", re.search(r'"Edit field" value="0"', tree), tree[:400])
+    return tree
+
+
 @scenario
 def batch_calculator(ctx):
     calc = ctx.call("launch_app", app="Calculator", new_instance=True)
     ctx.kill_on_exit(calc["app"]["pid"])
     wid = ctx.wait_for_window("Calculator", pid=calc["app"]["pid"])["id"]
-    tree = ctx.tree(wid, include_screenshot=False)
+    tree = clear_calculator(ctx, wid)
     labels = ["7", "Multiply", "6", "Equals"]
     indexes = [element_index(tree, "AXButton", label) for label in labels]
     ctx.require("calculator buttons are indexed", None not in indexes, tree[:300])
@@ -733,6 +748,38 @@ def batch_order_and_errors(ctx):
     ctx.check('observe="none" returns no observation', result.get("observation") is None, result)
 
 
+@scenario
+def nested_argument_shapes(ctx):
+    """Gemini through Cursor stringifies free-form nested objects; "[object Object]" is what it sent once."""
+    window = ctx.launch_scratch_textedit("shapes.txt", "")
+    wid = window["id"]
+    area, _ = text_area(ctx, wid)
+    result = ctx.call("batch", window_id=wid, steps=[
+        {"tool": "set_value", "args": json.dumps({"element_index": area, "value": "a"})},
+        {"tool": "type_text", "element_index": area, "text": "b"},
+        step("type_text", text="c"),
+    ])
+    ctx.check("a JSON-string args, args beside tool, and an args object all ran",
+              [s["ok"] for s in result["steps"]] == [True] * 3, result["steps"])
+    tree = (result.get("observation") or {}).get("tree", "")
+    ctx.check('the steps ran in order: value="abc"', value_of(tree) == "abc", tree[:300])
+
+    error = refused(ctx, "batch", window_id=wid, steps=[{"tool": "click", "args": "[object Object]"}])
+    ctx.check("an unparseable args string is refused by name, not as a missing element_index",
+              error and "args must be an object" in error and "[object Object]" in error, error)
+    # What Gemini sent when step args were a declared nested object.
+    error = refused(ctx, "batch", window_id=wid, steps=[{"tool": "click", "argsFOURTH_args_element_index": 5}])
+    ctx.check("a missing argument names the fields the step did not recognize",
+              error and "unrecognized fields: argsFOURTH_args_element_index" in error, error)
+    items = next(t for t in ctx.mcp.rpc("tools/list")["tools"] if t["name"] == "batch")["inputSchema"]["properties"]["steps"]["items"]
+    ctx.check("batch advertises flat steps: tool and the step's own arguments, no nested args",
+              {"tool", "element_index", "keys", "text"} <= set(items["properties"]) and "args" not in items["properties"],
+              sorted(items["properties"]))
+    error = refused(ctx, "browser_command", operation="click", arguments="[object Object]")
+    ctx.check("browser_command refuses an unparseable arguments string by name",
+              error and "arguments must be an object" in error, error)
+
+
 def png_pixels(data):
     """Minimal PNG decoder (8-bit RGB/RGBA, non-interlaced), enough to inspect screenshots without PIL."""
     import struct, zlib
@@ -768,6 +815,12 @@ def accent_pixels(pixels):
     return sum(1 for r, g, b in pixels if r > 200 and 40 < g < 130 and b < 70)
 
 
+def glow_pixels(pixels):
+    """Pixels tinted by the agent cursor's orange glow. The arrow itself is near black and white, so it is found by
+    its glow, which blends toward orange over light and dark backgrounds alike."""
+    return sum(1 for r, g, b in pixels if r > 90 and r - b > 60 and r - g > 25)
+
+
 @scenario
 def agent_cursor_visible(ctx):
     window = ctx.launch_scratch_textedit("cursor.txt", "line one\nline two")
@@ -782,11 +835,11 @@ def agent_cursor_visible(ctx):
     region = ctx.run.dir / "screenshots" / f"{ctx.name}-around-click.png"
     subprocess.run(["screencapture", "-x", "-R", f"{int(screen_x) - 10},{int(screen_y) - 10},48,48", str(region)], check=True)
     ctx.screenshots.append(region.relative_to(ctx.run.dir).as_posix())
-    ctx.check("the agent's orange arrow is drawn on screen at the click point", accent_pixels(png_pixels(region.read_bytes())) >= 20)
+    ctx.check("the agent's cursor is drawn on screen at the click point", glow_pixels(png_pixels(region.read_bytes())) >= 20)
 
     shot = ctx.mcp.call("screenshot", window_id=wid)[1][0]
-    ctx.check("the agent's own window screenshot does not include its arrow",
-              accent_pixels(png_pixels(base64.b64decode(shot["data"]))) < 5)
+    ctx.check("the agent's own window screenshot does not include its cursor",
+              glow_pixels(png_pixels(base64.b64decode(shot["data"]))) < 5)
     ctx.call("type_text", window_id=wid, text="Z")
     ctx.check("the click still landed", value_of(ctx.tree(wid, include_screenshot=False)) == "Zline one\nline two")
 
@@ -1386,6 +1439,374 @@ def browser(ctx):
 
         shot = ctx.call("browser_screenshot", tab_id=tid)
         ctx.check("background tab screenshot returned an image", shot.get("width", 0) > 0, shot)
+
+
+OVERLAY_ID = "second-cursor-overlay"
+
+
+def warm_pixels(png, around=None, half=30):
+    """Pixels tinted Cursor orange (the agent cursor's glow) in a PNG, or in a 2*half square `around` a point."""
+    import struct
+    width, height = struct.unpack(">II", png[16:24])
+    pixels = png_pixels(png)
+    xs, ys = range(width), range(height)
+    if around:
+        cx, cy = int(around[0]), int(around[1])
+        xs, ys = range(max(0, cx - half), min(width, cx + half)), range(max(0, cy - half), min(height, cy + half))
+    return sum(1 for y in ys for x in xs for r, g, b in [pixels[y * width + x]]
+               if r > 180 and r - b > 60 and r - g > 25)
+
+
+def dark_pixels(png, x0, y0, x1, y1):
+    import struct
+    width = struct.unpack(">I", png[16:20])[0]
+    pixels = png_pixels(png)
+    return sum(1 for y in range(y0, y1) for x in range(x0, x1) if max(pixels[y * width + x]) < 60)
+
+
+class DevTools:
+    """A page's own DevTools socket, which sees the tab the way a person does: past the extension and the concealment
+    it applies to the agent's captures. A minimal WebSocket client; the standard library has none.
+
+        with DevTools(page_socket(browser, url)) as page:
+            page.call("Page.captureScreenshot", {"format": "png"})
+    """
+
+    def __init__(self, ws_url):
+        import urllib.parse
+        self.url = urllib.parse.urlparse(ws_url)
+        self.next_id, self.buffer = 0, b""
+
+    def __enter__(self):
+        self.sock = socket.create_connection((self.url.hostname, self.url.port), timeout=15)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {self.url.path} HTTP/1.1\r\nHost: {self.url.netloc}\r\nUpgrade: websocket\r\n"
+                           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        while b"\r\n\r\n" not in self.buffer:
+            self.read(len(self.buffer) + 1, keep=True)
+        head, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise ConnectionError(head.decode(errors="replace")[:200])
+        return self
+
+    def __exit__(self, *exc):
+        self.sock.close()
+
+    def read(self, n, keep=False):
+        while len(self.buffer) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("DevTools socket closed")
+            self.buffer += chunk
+        if keep:
+            return None
+        out, self.buffer = self.buffer[:n], self.buffer[n:]
+        return out
+
+    def call(self, method, params=None):
+        import struct
+        self.next_id += 1
+        payload = json.dumps({"id": self.next_id, "method": method, "params": params or {}}).encode()
+        n = len(payload)
+        if n < 126:
+            header = bytes([0x81, 0x80 | n])
+        elif n < 65536:
+            header = bytes([0x81, 0x80 | 126]) + struct.pack(">H", n)
+        else:
+            header = bytes([0x81, 0x80 | 127]) + struct.pack(">Q", n)
+        mask = os.urandom(4)
+        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+        message = b""
+        while True:
+            first, second = self.read(2)
+            n = second & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self.read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self.read(8))[0]
+            data = self.read(n)
+            if (first & 0x0F) in (0, 1):
+                message += data
+            if first & 0x80 and message:
+                reply, message = json.loads(message), b""
+                if reply.get("id") == self.next_id:
+                    if "error" in reply:
+                        raise ToolError(f"{method}: {reply['error']}")
+                    return reply["result"]
+
+
+def page_socket(browser, url):
+    port = int((browser.profile / "DevToolsActivePort").read_text().split()[0])
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
+        targets = json.load(response)
+    return next(t["webSocketDebuggerUrl"] for t in targets if t.get("type") == "page" and t.get("url") == url)
+
+
+def overlay_in(document):
+    """The agent cursor's host in a DOM.getDocument(depth=-1, pierce=true) tree: its parent, attributes, the text in
+    its shadow root, and the point its cursor's tip sits on. None when the page has no cursor."""
+    stack = [(document, None)]
+    while stack:
+        node, parent = stack.pop()
+        if node.get("localName") == OVERLAY_ID:
+            break
+        stack += [(child, node) for child in node.get("children", []) + node.get("shadowRoots", [])]
+    else:
+        return None
+
+    def attributes(n):
+        return dict(zip(n.get("attributes", [])[::2], n.get("attributes", [])[1::2]))
+
+    shadow = (node.get("shadowRoots") or [{}])[0]
+    text, point, pill, inner = [], None, None, [shadow]
+    while inner:
+        n = inner.pop()
+        if n.get("nodeType") == 3:
+            text.append(n.get("nodeValue", ""))
+        classes = attributes(n).get("class", "").split()
+        if "cursor" in classes:
+            move = re.search(r"translate3d\((-?[\d.]+)px, (-?[\d.]+)px", attributes(n).get("style", ""))
+            point = move and (float(move.group(1)), float(move.group(2)))
+        if "pill" in classes:
+            pill = n.get("nodeId")
+        inner += reversed(n.get("children", []))
+    host = attributes(node)
+    return {"parent": parent and parent.get("localName"), "aria_hidden": host.get("aria-hidden"),
+            "shadow": shadow.get("shadowRootType"), "text": "".join(text), "point": point, "pill": pill}
+
+
+def poll(read, ok, timeout=2.0):
+    """Reads until `ok(value)` or the timeout; returns the last value read."""
+    deadline = time.time() + timeout
+    while True:
+        value = read()
+        if ok(value) or time.time() > deadline:
+            return value
+        time.sleep(0.15)
+
+
+@scenario
+def browser_cursor(ctx):
+    """The agent's cursor drawn inside agent tabs by the extension (extension/cursor.js).
+
+    Ways it can fail, and what covers each:
+    - It never shows: the isolated world, the closed shadow root, or the program fails (CSP, no debugger, a thrown
+      error), or the caption command is refused. Covered: host and caption read back with DOM.getDocument(pierce),
+      and a capture over the page's own DevTools socket must show the orange glow and the dark caption pill.
+    - It shows in the wrong place: tip offset from the hotspot, wrong point for a ref click, a typed-into field, a
+      scroll, a locator click, or a fill; or the first click makes it appear at 58% x 55% and fly over instead of
+      appearing at the target. Covered: the tip's translate is compared with each action's point.
+    - A keyboard action in a fresh tab shows nothing, or not at 58% x 55% of the viewport. Covered.
+    - The caption is missing, not fully typed out, not replaced by the next caption, or survives a caption-less
+      action. Covered.
+    - The agent sees its own cursor: browser_screenshot or browser_command screenshot right after a click (while it
+      is still animating) contains it; or the host or caption shows in browser_snapshot, dom_snapshot, locator
+      matching, or text/HTML exports; or the host is not aria-hidden, its shadow root is open, or it hangs off
+      <body> where "body *" walks list it. Covered.
+    - It interferes with the page: swallows or doubles a click, moves focus on a caption update, or throws into the
+      page's console log (which browser_command logs reports). Covered with a click counter, dom_snapshot focus,
+      and logs.
+    - Navigation wipes it and it never comes back, or comes back without its caption or somewhere else. Covered.
+    - It outlives the turn (still in the page ~1 s after POST /turn-ended), or the next turn's action does not bring
+      it back. Covered.
+    - Pointer input does not wait for the cursor to arrive (the click lands before the person sees the cursor get
+      there), waits until the spring settles instead of its first arrival, waits the whole 1.5 s cap, or waits when
+      the cursor does not travel. Covered by timing browser_command clicks, which return right after input.
+    - It waits in a tab nobody can see. Not exercised: headless Chrome reports every tab "visible", even behind a
+      new foreground tab, after Target.activateTarget on another tab, or with its window minimized.
+    - Not exercised: the 60 s idle fade (a minute of waiting), prefers-reduced-motion, cleanup on tab close, a newer
+      move cutting an older wait short (actions on one tab run one at a time).
+    """
+    if not ctx.call("browser_status").get("connected"):
+        raise Skip("Chrome extension not connected")
+    browser = getattr(ctx.run.instance, "browser", None)
+    with FixtureServer() as base:
+        url = f"{base}/cursor.html"
+        tid = ctx.call("browser_open", url=url)["tab"]["id"]
+        ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
+
+        def command(operation, tab=tid, **args):
+            return ctx.call("browser_command", tab_id=tab, operation=operation, **args)
+
+        def overlay(tab=tid):
+            document = command("cdp", tab, method="DOM.getDocument", params={"depth": -1, "pierce": True})
+            return overlay_in(document["result"]["root"])
+
+        def at(state, x, y, caption=None):
+            return bool(state and state["point"]) and abs(state["point"][0] - x) < 1.5 \
+                and abs(state["point"][1] - y) < 1.5 and (caption is None or state["text"] == caption)
+
+        def bounds(selector, tab=tid):
+            return command("inspect", tab, locator={"selector": selector})["bounds"]
+
+        def center(b):
+            return b["x"] + b["width"] / 2, b["y"] + b["height"] / 2
+
+        # The fixture has nothing orange, so any orange pixel is the cursor, wherever its animation has got to.
+        def own_capture(label, tab, extended=False):
+            if extended:
+                image = ctx.mcp.call("browser_command", tab_id=tab, operation="screenshot")[1][0]
+            else:
+                image = ctx.mcp.call("browser_screenshot", tab_id=tab)[1][0]
+            ctx.save_image(label, image)
+            count = warm_pixels(base64.b64decode(image["data"]))
+            ctx.check(f"the agent's own {'browser_command screenshot' if extended else 'browser_screenshot'}, right "
+                      "after the click, has no trace of its cursor", count <= 3, f"{count} orange pixels")
+
+        outline = ctx.call("browser_snapshot", tab_id=tid)["outline"]
+        button = re.search(r'\[(\w+)\] button "Count clicks"', outline)
+        field = re.search(r'\[(\w+)\] textbox "Name"', outline)
+        ctx.require("the fixture exposes its button and field", button and field, outline[:400])
+
+        ctx.call("browser_click", tab_id=tid, x=160, y=100, caption="Opening the menu")
+        own_capture("own-screenshot-after-click", tid)
+        state = poll(overlay, lambda s: at(s, 160, 100, "Opening the menu"))
+        ctx.require("after a captioned click the host is in the page with the caption in its shadow root",
+                    state and state["text"] == "Opening the menu", state)
+        ctx.check("the cursor appeared with its tip on the click point", at(state, 160, 100), state)
+        ctx.check("the host hangs off <html>, not <body>", state["parent"] == "html", state)
+        ctx.check("the host is aria-hidden", state["aria_hidden"] == "true", state)
+        ctx.check("its shadow root is closed", state["shadow"] == "closed", state)
+
+        if browser:
+            clip = {"x": 100, "y": 40, "width": 320, "height": 120, "scale": 1}
+            with DevTools(page_socket(browser, url)) as page:
+                seen = poll(lambda: base64.b64decode(page.call("Page.captureScreenshot",
+                                                               {"format": "png", "clip": clip})["data"]),
+                            lambda png: warm_pixels(png, (60, 60)) >= 40, timeout=3)
+                pill = overlay_in(page.call("DOM.getDocument", {"depth": -1, "pierce": True})["root"])["pill"]
+                handle = page.call("DOM.resolveNode", {"nodeId": pill})["object"]["objectId"]
+                # Fractional widths: text-overflow cuts the caption short when it overflows by even 0.1 px, which
+                # the integer scrollWidth and clientWidth round away.
+                widths = page.call("Runtime.callFunctionOn", {
+                    "objectId": handle, "returnByValue": True,
+                    "functionDeclaration": "function () { const s = getComputedStyle(this); return ["
+                                           "this.querySelector('.text').getBoundingClientRect().width, "
+                                           "this.getBoundingClientRect().width - parseFloat(s.paddingLeft) "
+                                           "- parseFloat(s.paddingRight)]; }",
+                })["result"]["value"]
+            path = ctx.run.dir / "screenshots" / f"{ctx.name}-as-a-person-sees-it.png"
+            path.write_bytes(seen)
+            ctx.screenshots.append(path.relative_to(ctx.run.dir).as_posix())
+            ctx.check("a person looking at the tab sees the cursor's orange glow at the click point",
+                      warm_pixels(seen, (60, 60)) >= 40, f"{warm_pixels(seen, (60, 60))} orange pixels")
+            # The pill starts 14 px right of and 20 px below the tip.
+            dark = dark_pixels(seen, 78, 82, 134, 102)
+            ctx.check("and the dark caption pill beside it", dark >= 400, f"{dark} of 1120 pixels dark")
+            ctx.check("the pill shows the whole caption, not cut off with an ellipsis", widths[0] <= widths[1],
+                      f"text width, pill content width = {widths}")
+
+        snapshot = json.dumps(ctx.call("browser_snapshot", tab_id=tid))
+        ctx.check("browser_snapshot (outline and elements) never shows the caption or the host",
+                  "Opening the menu" not in snapshot and OVERLAY_ID not in snapshot, snapshot[:300])
+        dom = json.dumps(command("dom_snapshot"))
+        ctx.check("dom_snapshot does not list the host or its caption",
+                  "Opening the menu" not in dom and OVERLAY_ID not in dom, dom[:300])
+        for locator in ({"selector": f"#{OVERLAY_ID}"}, {"text": "Opening the menu"}):
+            error = refused(ctx, "browser_command", tab_id=tid, operation="inspect", locator=locator)
+            ctx.check(f"locator {locator} matches nothing", error and "matched 0" in error, error)
+        for fmt in ("text", "html"):
+            content = command("export", format=fmt)["content"]
+            ctx.check(f"a {fmt} export has neither the caption nor the host",
+                      "Opening the menu" not in content and OVERLAY_ID not in content and "Count clicks" in content,
+                      content[:300])
+        ctx.check("the page got exactly one click",
+                  command("inspect", locator={"selector": "#count"})["text"] == "clicks=1")
+
+        ctx.call("browser_type", tab_id=tid, ref=field.group(1), text="ada")
+        box = bounds("#name")
+        typed_at = (box["x"] + min(24, box["width"] / 2), box["y"] + box["height"] / 2)
+        ctx.call("browser_press_key", tab_id=tid, keys="End", caption="Checking the field")
+        state = poll(overlay, lambda s: at(s, *typed_at, "Checking the field"))
+        ctx.check("typing into a field points near its left edge; the next caption replaces the old one",
+                  at(state, *typed_at, "Checking the field"), (state, typed_at))
+        focused = [e for e in command("dom_snapshot")["elements"] if e.get("focused")]
+        ctx.check("caption updates leave focus in the field the agent typed into",
+                  len(focused) == 1 and focused[0]["role"] == "textbox" and focused[0]["value"] == "ada", focused)
+
+        ctx.call("browser_click", tab_id=tid, ref=button.group(1))
+        pressed = center(bounds("#target"))
+        state = poll(overlay, lambda s: at(s, *pressed, ""), timeout=1.5)
+        ctx.check("a ref click points at the element's center, and without a caption clears it",
+                  at(state, *pressed, ""), (state, pressed))
+        ctx.check("the page got exactly one more click",
+                  command("inspect", locator={"selector": "#count"})["text"] == "clicks=2")
+
+        link = center(bounds("#next"))
+        ctx.call("browser_click", tab_id=tid, x=link[0], y=link[1], caption="Following the link")
+        state = poll(overlay, lambda s: at(s, *link, "Following the link"))
+        ctx.check("a link click loads a new document, and with no further action it has the cursor back on the "
+                  "link with its caption", at(state, *link, "Following the link"), state)
+        ctx.call("browser_navigate", tab_id=tid, url=f"{url}?page=2", caption="Opening page two")
+        state = poll(overlay, lambda s: at(s, *link, "Opening page two"))
+        ctx.check("after browser_navigate the cursor is back where it was, with the new caption",
+                  at(state, *link, "Opening page two"), state)
+        ctx.call("browser_click", tab_id=tid, x=500, y=400)
+        state = poll(overlay, lambda s: at(s, 500, 400, ""))
+        ctx.check("a click on the new page moves it to the new point", at(state, 500, 400, ""), state)
+        ctx.check("a click on empty page reached no button",
+                  command("inspect", locator={"selector": "#count"})["text"] == "clicks=0")
+
+        logs = command("logs")["logs"]
+        ctx.check("the overlay wrote nothing to the page's console log", not logs, logs[:3])
+
+        tid2 = ctx.call("browser_open", url=f"{url}?page=3")["tab"]["id"]
+        ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid2))
+        viewport = command("cdp", tid2, method="Page.getLayoutMetrics")["result"]["cssLayoutViewport"]
+        width, height = viewport["clientWidth"], viewport["clientHeight"]
+        ctx.call("browser_press_key", tab_id=tid2, keys="End", caption="Thinking it over")
+        state = poll(lambda: overlay(tid2), lambda s: at(s, width * 0.58, height * 0.55, "Thinking it over"))
+        ctx.check("a keyboard action in a fresh tab shows the cursor at 58% x 55% of the viewport",
+                  at(state, width * 0.58, height * 0.55, "Thinking it over"), (state, viewport))
+        ctx.call("browser_scroll", tab_id=tid2, direction="down")
+        state = poll(lambda: overlay(tid2), lambda s: at(s, width / 2, height / 2, ""))
+        ctx.check("a scroll points at the viewport center", at(state, width / 2, height / 2, ""), state)
+
+        pressed = center(bounds("#target", tid2))
+        command("click", tid2, locator={"selector": "#target"}, caption="Pressing by locator")
+        own_capture("own-extended-screenshot-after-click", tid2, extended=True)
+        state = poll(lambda: overlay(tid2), lambda s: at(s, *pressed, "Pressing by locator"))
+        ctx.check("a locator click points at the element's center with its caption",
+                  at(state, *pressed, "Pressing by locator"), (state, pressed))
+        command("fill", tid2, locator={"selector": "#name"}, text="grace")
+        filled = center(bounds("#name", tid2))
+        state = poll(lambda: overlay(tid2), lambda s: at(s, *filled, ""))
+        ctx.check("a fill points at the field's center", at(state, *filled, ""), (state, filled))
+
+        # browser_command click returns right after its mouse events, so its time is the wait plus a round trip.
+        import math
+
+        def timed_click(x, y):
+            started = time.time()
+            command("click", tid2, x=x, y=y)
+            return time.time() - started
+
+        timed_click(80, 80)
+        time.sleep(0.8)
+        still = sorted(timed_click(80, 80) for _ in range(3))[1]
+        ctx.check("a click with no travel does not wait for the cursor", still < 0.1, f"{still:.3f} s")
+        far = (650, 380)
+        distance = ((far[0] - 80) ** 2 + (far[1] - 80) ** 2) ** 0.5
+        # The spring's step response first reaches the target at (pi - acos(z)) / (w * sqrt(1 - z^2)), w = 2 pi / r.
+        response, damping = min(max(0.28 + distance / 4000, 0.28), 0.5), 0.86
+        arrives = (math.pi - math.acos(damping)) / (2 * math.pi / response * (1 - damping ** 2) ** 0.5)
+        travel = timed_click(*far)
+        ctx.check(f"a click {distance:.0f} px away waits for the cursor's first arrival (~{arrives * 1000:.0f} ms)",
+                  travel - still >= arrives - 0.05, f"{travel:.3f} s vs {still:.3f} s with no travel")
+        ctx.check("and well under the 1.5 s cap", travel < 1.0, f"{travel:.3f} s")
+        state = overlay(tid2)
+        ctx.check("it was dispatched at the cursor's target", at(state, *far), state)
+
+        request = urllib.request.Request(
+            ctx.mcp.url.rsplit("/", 1)[0] + "/turn-ended", data=b"{}", method="POST",
+            headers={"Authorization": f"Bearer {ctx.mcp.token}", "Content-Type": "application/json"})
+        urllib.request.urlopen(request, timeout=15).read()
+        gone = [poll(lambda t=t: overlay(t), lambda s: s is None, timeout=1.0) for t in (tid, tid2)]
+        ctx.check("both tabs' cursors are gone within ~1 s of POST /turn-ended", gone == [None, None], gone)
+        ctx.call("browser_click", tab_id=tid, x=300, y=300, caption="Back to work")
+        state = poll(overlay, lambda s: at(s, 300, 300, "Back to work"))
+        ctx.check("the next turn's first action brings it back at its target", at(state, 300, 300, "Back to work"),
+                  state)
 
 
 @scenario

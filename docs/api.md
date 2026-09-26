@@ -30,7 +30,7 @@ Pass `session_id` on subsequent tools. Omitting it uses the shared compatibility
 
 Supply an `operation_id` before submitting an action and reuse it only for an identical request; the server returns the existing outcome instead of running it again. `operation_status` reconciles timeouts and `cancel_operation` stops queued work, but neither can undo input already delivered. `timeout_ms` includes approval and queue time and is capped at 60000. Completed explicit IDs are kept for one hour (`operationRetentionSeconds`); calls without an ID keep no history unless they time out. `status.runtime` reports retained operations, result bytes, and open HTTP connections.
 
-Native batches cannot cross app processes. Browser batches cannot cross tabs. Both run in order and recheck admission between steps.
+Native batches cannot cross app processes. Browser batches cannot cross tabs. Both run in order and recheck admission between steps. A native step is the tool name plus that tool's arguments, `{"tool": "click", "element_index": 5}`; the older `{"tool": "click", "args": {...}}` still works, with `args` as an object or a JSON string. `browser_command`'s `arguments` may also be a JSON string. Both allowances exist because Gemini through Cursor stringifies free-form nested objects and garbles the keys of declared ones. A malformed `args` or `arguments` is refused with an error naming the field, and a step missing a required argument lists any fields it did not recognize.
 
 ## Approvals
 
@@ -44,7 +44,9 @@ Approvals limit what an agent can do through Second Cursor's tools. They are not
 
 ## Agent presence
 
-While an agent works, its orange arrow stays on screen at its last position (a slow glow marks the resting pose; with Reduce Motion it stays still), and the menu bar icon turns orange with "Agent active: <app>". Reads, keyboard actions, and pointer actions all keep it alive; the arrow is only drawn for windows on the Space you're viewing, while the menu bar indicator shows for any window. Both clear when the turn ends, the session closes, you pause the agent, or after 60 s without agent calls. `status.agent_activity` reports `{active, app, sessions, arrow, idle_seconds}`.
+While an agent works, its cursor (a black arrowhead with a white outline and an orange glow) stays on screen at its last position, and the menu bar icon turns orange with "Agent active: <app>". The cursor springs to each pointer action, or travels an arc on long moves, and the input is sent once it lands, as in Codex: about 0.2 s for a short move, at most 0.5 s for a long one, never more than 1.5 s. Only a cursor that is drawn is waited for, so actions on windows on another Space, and in background tabs, go at once. At rest it breathes and wobbles every few seconds so a running task looks alive; with Reduce Motion it stays still. Reads, keyboard actions, pointer actions, and browser calls all keep presence alive; the native cursor is only drawn for windows on the Space you're viewing, while the menu bar indicator shows for any window. Both clear when the turn ends, the session closes, you pause the agent, or after 60 s without agent calls. `status.agent_activity` reports `{active, app, sessions, arrow, caption, idle_seconds}`.
+
+Action tools take an optional `caption`: a few words shown in a pill beside the cursor, such as "Opening the Export menu". An action with a caption shows it; an action without one clears it; reads leave it. A `batch` takes one caption, and each step may set its own from that step on. Captions are trimmed to one line of at most 80 characters and end with the turn. Browser actions (`browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_navigate`, `browser_command`) take a caption too; the extension draws the same cursor and caption inside the agent's tab, and hides them from the agent's own screenshots, snapshots and DOM reads.
 
 ## Turn end
 

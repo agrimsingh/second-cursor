@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cursor fixture</title>
+<style>
+  html, body { margin: 0; background: #fff; color: #000; font: 16px -apple-system, sans-serif; }
+  body { height: 100vh; }
+  #target { position: absolute; left: 60px; top: 60px; width: 200px; height: 80px; background: #fff; border: 1px solid #bbb; font: inherit; color: #000; }
+  #name { position: absolute; left: 60px; top: 200px; width: 240px; font: inherit; }
+  #count { position: absolute; left: 60px; top: 260px; margin: 0; }
+  #next { position: absolute; left: 400px; top: 80px; color: #000; }
+</style>
+<button id="target">Count clicks</button>
+<a id="next" href="?page=next">Next page</a>
+<input id="name" aria-label="Name">
+<p id="count">clicks=0</p>
+<script>
+  let clicks = 0;
+  document.getElementById("target").addEventListener("click", () => {
+    clicks += 1;
+    document.getElementById("count").textContent = `clicks=${clicks}`;
+  });
+</script>

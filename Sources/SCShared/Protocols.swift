@@ -74,7 +74,8 @@ public protocol DesktopControlling: AnyObject, Sendable {
     /// Keeps `session`'s on-screen presence (arrow and menu bar) alive; called for every admitted window or app
     /// call, with the app it works in. With `showArrow` (keyboard actions), an arrow that is not showing yet
     /// appears near the window's focused element, if the window is on the user's current Space.
-    func noteAgentActivity(session: String, windowID: UInt32?, app: String?, showArrow: Bool)
+    /// `caption` is shown beside the arrow: nil leaves the current one, an empty string clears it.
+    func noteAgentActivity(session: String, windowID: UInt32?, app: String?, showArrow: Bool, caption: String?)
     /// `session`'s task is over (turn end, session close); presence goes once no session is active.
     func endAgentActivity(session: String)
     func agentActivity() -> AgentActivityStatus
@@ -86,8 +87,9 @@ public enum AgentCursorEvent: Sendable, Equatable {
     case drag(from: Point, to: Point)
     case scroll(at: Point)
     /// A call that moves nothing (a read or a keyboard action) keeps `session` active without moving the
-    /// arrow. `near` shows a hidden arrow there; nil leaves it as it is.
-    case activity(session: String, app: String?, near: Point?)
+    /// arrow. `near` shows a hidden arrow there; nil leaves it as it is. `caption` replaces the text beside
+    /// the arrow: nil leaves it, an empty string clears it.
+    case activity(session: String, app: String?, near: Point?, caption: String?)
     case end(session: String)
 }
 
@@ -99,21 +101,24 @@ public struct AgentActivityStatus: Sendable, Equatable {
     public var sessions: [String]
     /// Where the arrow's tip rests; nil while it is hidden.
     public var arrow: Point?
+    /// The text beside the arrow, if any.
+    public var caption: String?
     public var idleSeconds: Double?
 
     public init(active: Bool = false, app: String? = nil, sessions: [String] = [], arrow: Point? = nil,
-                idleSeconds: Double? = nil) {
+                caption: String? = nil, idleSeconds: Double? = nil) {
         self.active = active
         self.app = app
         self.sessions = sessions
         self.arrow = arrow
+        self.caption = caption
         self.idleSeconds = idleSeconds
     }
 }
 
 /// Draws the agent's own on-screen cursor (never the user's) and keeps it up while a task runs. Pointer
-/// events return once the cursor has arrived (bounded to ~0.25 s), so the action they announce happens
-/// where the user sees it; `activity` and `end` return at once.
+/// events return once the cursor has reached its target (bounded to 1.5 s), so the user sees where the action
+/// lands before it happens; `activity` and `end` return at once.
 public protocol AgentCursorPresenting: AnyObject, Sendable {
     func present(_ event: AgentCursorEvent)
     func activity() -> AgentActivityStatus

@@ -3,7 +3,7 @@ import Foundation
 import SCShared
 
 extension Desktop {
-    public func noteAgentActivity(session: String, windowID: UInt32?, app: String?, showArrow: Bool) {
+    public func noteAgentActivity(session: String, windowID: UInt32?, app: String?, showArrow: Bool, caption: String?) {
         guard let cursor else { return }
         var near: Point?
         // Same rule as pointer actions: never aim the arrow at a window on a Space the user is not viewing.
@@ -11,7 +11,7 @@ extension Desktop {
            record.isOnScreen {
             near = Self.restingPoint(record)
         }
-        cursor.present(.activity(session: session, app: app, near: near))
+        cursor.present(.activity(session: session, app: app, near: near, caption: caption))
     }
 
     public func endAgentActivity(session: String) {

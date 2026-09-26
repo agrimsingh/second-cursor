@@ -201,12 +201,15 @@ public struct BatchStep: Sendable, Equatable {
     public var windowID: UInt32
     public var action: BatchAction
     public var logDetail: String?
+    /// Shown beside the agent cursor while this step runs; nil keeps the batch's caption.
+    public var caption: String?
 
-    public init(tool: String, windowID: UInt32, action: BatchAction, logDetail: String? = nil) {
+    public init(tool: String, windowID: UInt32, action: BatchAction, logDetail: String? = nil, caption: String? = nil) {
         self.tool = tool
         self.windowID = windowID
         self.action = action
         self.logDetail = logDetail
+        self.caption = caption
     }
 }
 

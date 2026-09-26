@@ -1,4 +1,5 @@
 import { cdp, frameCDP } from "./cdp.js";
+import { concealDuring, dragTo, pointTo, setCaption, show } from "./cursor.js";
 import { exportContent } from "./exports.js";
 import { BridgeError, sleep } from "./errors.js";
 import { click, pressKey, scroll, type } from "./input.js";
@@ -22,6 +23,7 @@ function state(id) {
       dialog: null,
       chooser: null,
       dialogWaiters: new Set(),
+      naturalSize: null,
     });
   return events.get(id);
 }
@@ -127,7 +129,10 @@ function domOperation(p) {
     p.locator?.exact === false ? a.includes(b) : a.trim() === b;
   function locate() {
     const l = p.locator || {};
-    let found = [...root.querySelectorAll(l.selector || "*")];
+    // The agent's own cursor (cursor.js) is not part of the page.
+    let found = [...root.querySelectorAll(l.selector || "*")].filter(
+      (e) => e.id !== "second-cursor-overlay",
+    );
     if (l.role) found = found.filter((e) => role(e) === l.role);
     if (l.name !== undefined)
       found = found.filter((e) => matches(name(e), l.name));
@@ -402,7 +407,18 @@ function domOperation(p) {
     return { scroll_top: e.scrollTop, scroll_left: e.scrollLeft };
   }
   if (p.operation === "center") {
-    e.scrollIntoView({ block: "center", inline: "center" });
+    if (p.scroll === "if_needed") {
+      // Only as far as focusing the element would: the cursor must not move the page more than the action does.
+      const r = e.getBoundingClientRect(),
+        view = doc.defaultView;
+      if (
+        r.bottom < 0 ||
+        r.right < 0 ||
+        r.top > view.innerHeight ||
+        r.left > view.innerWidth
+      )
+        e.scrollIntoView({ block: "nearest", inline: "nearest" });
+    } else e.scrollIntoView({ block: "center", inline: "center" });
     const b = e.getBoundingClientRect();
     let x = b.x + b.width / 2,
       y = b.y + b.height / 2;
@@ -502,6 +518,33 @@ async function dom(tabId, p, object = false) {
   return value;
 }
 const ok = () => ({ ok: true });
+// Operations that act on the page; each sets the cursor's caption, or clears it when it has none.
+const CURSOR_OPERATIONS = new Set([
+  "click",
+  "drag",
+  "scroll",
+  "fill",
+  "type",
+  "paste",
+  "select_text",
+  "check",
+  "select_option",
+  "perform_action",
+  "press_key",
+  "back",
+  "forward",
+  "reload",
+]);
+// Moves the cursor to the element before the action and resolves when it arrives. A locator that matches nothing
+// is left for the action itself to report.
+const pointAtLocator = async (tabId, p) => {
+  const point = await dom(tabId, {
+    ...p,
+    operation: "center",
+    scroll: "if_needed",
+  }).catch(() => null);
+  if (point) await pointTo(tabId, point);
+};
 const PRIVATE_OPERATIONS = new Set([
   "user_tabs",
   "claim",
@@ -629,18 +672,16 @@ export async function extended(p) {
   await requireAgentTab(tabId, session);
   if (op === "release") return releaseTab(tabId, session);
   if (op === "retain") return retainTab(tabId, session, p.mode);
+  if (CURSOR_OPERATIONS.has(op)) setCaption(tabId, p.caption ?? "", session);
+  if (op === "dom_snapshot" || op === "inspect") return dom(tabId, p);
   if (
-    [
-      "dom_snapshot",
-      "inspect",
-      "fill",
-      "check",
-      "select_option",
-      "select_text",
-      "perform_action",
-    ].includes(op)
-  )
+    ["fill", "check", "select_option", "select_text", "perform_action"].includes(
+      op,
+    )
+  ) {
+    await pointAtLocator(tabId, p);
     return dom(tabId, p);
+  }
   if (op === "click") {
     const point = p.locator
       ? await dom(tabId, { ...p, operation: "center" })
@@ -663,13 +704,17 @@ export async function extended(p) {
         clickCount: p.count ?? 1,
         modifiers,
       });
+    await pointTo(tabId, point, p.count ?? 1);
     // Do not wait for navigation while a JS dialog is open.
     await send("mousePressed");
     await send("mouseReleased");
     return ok();
   }
   if (op === "type" || op === "press_key") {
-    if (p.locator) await dom(tabId, { ...p, operation: "focus" });
+    if (p.locator) {
+      if (op === "type") await pointAtLocator(tabId, p);
+      await dom(tabId, { ...p, operation: "focus" });
+    }
     if (op === "type") await type(tabId, { text: p.text });
     else await pressKey(tabId, p.keys);
     return ok();
@@ -677,17 +722,24 @@ export async function extended(p) {
   if (op === "paste") {
     if (!["text", "md", "html"].includes(p.format ?? "text"))
       throw new BridgeError("invalid_argument", "Unsupported paste format");
-    if (p.locator) return dom(tabId, p);
+    if (p.locator) {
+      await pointAtLocator(tabId, p);
+      return dom(tabId, p);
+    }
     if (p.format === "html")
       throw new BridgeError(
         "invalid_argument",
         "HTML paste requires a locator",
       );
+    show(tabId);
     await cdp(tabId, "Input.insertText", { text: p.text });
     return ok();
   }
   if (op === "scroll") {
-    if (p.locator) return dom(tabId, p);
+    if (p.locator) {
+      await pointAtLocator(tabId, p);
+      return dom(tabId, p);
+    }
     await scroll(tabId, p.direction, p.amount);
     return ok();
   }
@@ -698,6 +750,7 @@ export async function extended(p) {
         "invalid_argument",
         "Four drag coordinates required",
       );
+    await dragTo(tabId, { x: p.from_x, y: p.from_y }, { x: p.to_x, y: p.to_y });
     await cdp(tabId, "Input.dispatchMouseEvent", {
       type: "mousePressed",
       x: p.from_x,
@@ -735,10 +788,12 @@ export async function extended(p) {
     await settleAround(tabId, () =>
       cdp(tabId, "Page.navigateToHistoryEntry", { entryId: entry.id }),
     );
+    show(tabId);
     return ok();
   }
   if (op === "reload") {
     await settleAround(tabId, () => chrome.tabs.reload(tabId));
+    show(tabId);
     return ok();
   }
   if (op === "dialog") {
@@ -819,8 +874,19 @@ export async function extended(p) {
   if (op === "logs")
     return { logs: state(tabId).logs.slice(-(p.limit ?? 100)) };
   if (op === "viewport") {
-    if (p.reset) await cdp(tabId, "Emulation.clearDeviceMetricsOverride");
-    else {
+    const s = state(tabId);
+    const size = async () =>
+      (
+        await cdp(tabId, "Runtime.evaluate", {
+          expression: "[innerWidth, innerHeight]",
+          returnByValue: true,
+        })
+      ).result.value;
+    let want;
+    if (p.reset) {
+      await cdp(tabId, "Emulation.clearDeviceMetricsOverride");
+      [want, s.naturalSize] = [s.naturalSize, null];
+    } else {
       if (
         !Number.isInteger(p.width) ||
         !Number.isInteger(p.height) ||
@@ -831,12 +897,21 @@ export async function extended(p) {
           "invalid_argument",
           "Positive width and height required",
         );
+      s.naturalSize ??= await size();
       await cdp(tabId, "Emulation.setDeviceMetricsOverride", {
         width: p.width,
         height: p.height,
         deviceScaleFactor: 1,
         mobile: false,
       });
+      want = [p.width, p.height];
+    }
+    // The page resizes some time after the call returns; an action before then aims at the old layout.
+    const until = Date.now() + 1000;
+    while (want && Date.now() < until) {
+      const [width, height] = await size();
+      if (width === want[0] && height === want[1]) break;
+      await sleep(20);
     }
     return ok();
   }
@@ -872,11 +947,13 @@ export async function extended(p) {
       expression: "devicePixelRatio",
       returnByValue: true,
     });
-    const { data } = await cdp(tabId, "Page.captureScreenshot", {
-      format: "png",
-      captureBeyondViewport: true,
-      clip: { ...clip, scale: 1 / (result.value || 1) },
-    });
+    const { data } = await concealDuring(tabId, () =>
+      cdp(tabId, "Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: true,
+        clip: { ...clip, scale: 1 / (result.value || 1) },
+      }),
+    );
     const bytes = atob(data.slice(0, 32)),
       u32 = (o) =>
         ((bytes.charCodeAt(o) << 24) |

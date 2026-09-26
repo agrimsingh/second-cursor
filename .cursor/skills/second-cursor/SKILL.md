@@ -20,6 +20,7 @@ If tools fail with "not running" or permission errors, run `SecondCursor doctor`
 5. Pass `app: "TextEdit"` instead of `window_id` when the app has a single obvious window; use `window_id` from `list_windows` when it has several. Read the app with `get_window_state` first: actions by `app` go to the window you observed last, and are refused if you haven't observed one.
 6. For a sequence whose steps you already know (buttons to press, fields to fill), send one `batch` instead of many calls. End the batch before any step whose outcome you need to see (a menu, dialog, search results).
 7. After the task, observe once more and confirm the result before you say it is done.
+8. Give actions a short `caption` ("Opening the Export menu", "Searching for flights"): the user sees it beside your cursor while you work. Keep it under 60 characters; an action without one clears it.
 
 Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`.
 
@@ -47,7 +48,7 @@ try {
   const keys = ["7", "Multiply", "6", "Equals"].map((l) => index(tree, "AXButton", l));
   if (keys.some(Number.isNaN)) throw new Error(`Calculator buttons not found:\n${tree.slice(0, 400)}`);
   if (!Number.isNaN(index(tree, "AXButton", "All Clear"))) await calc.click(index(tree, "AXButton", "All Clear"));
-  await calc.batch(keys.map((i) => ({ tool: "click", args: { element_index: i } })));
+  await calc.batch(keys.map((i) => ({ tool: "click", element_index: i })));
   const result = (await calc.observe({ full: true })).tree.match(/\b42\b/)?.[0];
   if (!result) throw new Error("Calculator did not show 42");
 

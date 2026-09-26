@@ -140,7 +140,7 @@ export async function exportContent(tabId, p) {
     throw new BridgeError("invalid_argument", "Unknown export format");
   const expression =
     format === "html"
-      ? "document.documentElement.outerHTML"
+      ? `(()=>{const h=document.getElementById("second-cursor-overlay"),html=document.documentElement.outerHTML;return h?html.replace(h.outerHTML,""):html})()`
       : format === "md"
         ? `(${markdown.toString()})()`
         : "document.body.innerText";

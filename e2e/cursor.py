@@ -15,8 +15,12 @@ Ways this can fail, each caught below:
 - One session's turn end removes presence that another session still owns, or closing a session leaves it behind.
 - The menu bar item does not follow the same lifecycle ("Agent active: <app>" while working, "Idle" after), or it
   and the `status` tool's `agent_activity` disagree about where the arrow is.
-- Drawing the arrow delays the action: a drag waiting for its own animation, or a click re-running an appear
-  animation while the arrow is already resting on screen.
+- A pointer action waits longer than the arrow's travel: arrival never fires, so every action sits out the 1.5 s
+  timeout; a drag waits for its own animation; a click re-runs the appear animation while the arrow rests on screen;
+  or a keyboard action waits at all.
+- The caption beside the arrow is missing, stale or wrong: an action's caption never shows or does not reach
+  `status`; a read (which has no caption) clears it; an action without a caption leaves the previous one up; a
+  batch step's caption is ignored; the caption outlives the turn.
 
 Usage:  e2e/cursor.py [scenario ...]   (same targeting flags as e2e/run.py, e.g. SC_E2E_APP=build/SecondCursor.app)
 Output: e2e/artifacts/<run-id>/ (report.md, results.json, transcript.jsonl, screenshots/ with every pixel region read)
@@ -31,7 +35,7 @@ import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import run
-from run import ROOT, Run, SCENARIOS, Skip, accent_pixels, png_pixels, scenario
+from run import ROOT, Run, SCENARIOS, Skip, accent_pixels, glow_pixels, png_pixels, scenario, step
 from focus import FocusProbe, text_area
 
 # Importing focus registers its scenarios; this suite runs only its own.
@@ -66,10 +70,20 @@ def capture(ctx, stem, x, y, width, height):
 
 
 def arrow_pixels(ctx, point, stem):
-    """Orange pixels in a 48 pt square around a global point; the arrow's tip sits at the point it aims at."""
+    """Glow pixels in a 48 pt square around a global point; the arrow's tip sits at the point it aims at."""
     pixels = capture(ctx, stem, point[0] - 10, point[1] - 10, 48, 48)
     ctx.require("screen region captured (Screen Recording permission for the runner)", pixels is not None, stem)
-    return accent_pixels(pixels)
+    return glow_pixels(pixels)
+
+
+def pill_region(ctx, point, stem):
+    """Where the caption pill sits: from 20 to 46 pt below the tip, starting 30 pt right of it (clear of the arrow's
+    glow)."""
+    return capture(ctx, stem, point[0] + 30, point[1] + 18, 220, 30)
+
+
+def changed(before, after):
+    return sum(1 for a, b in zip(before, after) if sum(abs(x - y) for x, y in zip(a, b)) > 60)
 
 
 def inconclusive(ctx, label, detail):
@@ -301,7 +315,7 @@ def cursor_turn_end_is_per_session(ctx):
 
 
 @scenario
-def cursor_does_not_delay_actions(ctx):
+def cursor_arrival_timing(ctx):
     window, _, frame, local, _ = start(ctx, "latency.txt")
     wid = window["id"]
     far = (frame[0] + min(frame[2], window["frame"]["width"] - frame[0]) - 30,
@@ -318,12 +332,56 @@ def cursor_does_not_delay_actions(ctx):
     typing = timed("type_text", text="Z")
     numbers = f"appearing={appearing:.3f}s resting={[round(s, 3) for s in resting]} drag={drag:.3f}s type={typing:.3f}s"
     print(f"      {numbers}")
-    # The pointer path itself sleeps ~0.26 s per click and ~0.49 s per drag; the arrow may add at most its glide.
-    ctx.check("a click while the arrow rests on screen waits at most one short glide (median < 0.55 s)",
-              statistics.median(resting) < 0.55, numbers)
-    ctx.check("the first click's appear animation stays short (< 0.6 s)", appearing < 0.6, numbers)
+    # The pointer path itself sleeps ~0.26 s per click and ~0.49 s per drag. A click then waits for the arrow to
+    # land: at most 0.5 s for the long far<->local arcs, 0.18 s to appear. The drag starts where the arrow rests.
+    ctx.check("a click waits for the arrow to land, not for the 1.5 s timeout (median < 0.85 s, max < 1.2 s)",
+              statistics.median(resting) < 0.85 and max(resting) < 1.2, numbers)
+    ctx.check("the first click waits only for the appear animation (< 0.6 s)", appearing < 0.6, numbers)
     ctx.check("a drag does not wait for its own drag animation (< 0.8 s)", drag < 0.8, numbers)
     ctx.check("a keyboard action is not held up by the arrow (< 0.5 s)", typing < 0.5, numbers)
+
+
+@scenario
+def cursor_caption(ctx):
+    window, _, _, local, point = start(ctx, "caption.txt")
+    wid = window["id"]
+    ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none")
+    time.sleep(0.8)
+    bare = pill_region(ctx, point, "no-caption")
+    ctx.require("pill region captured", bare is not None)
+    ctx.check("status: no caption after an action without one", activity(ctx).get("caption") is None, activity(ctx))
+
+    text = "Checking the caption pill"
+    ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none", caption=text)
+    time.sleep(0.8)
+    shown = pill_region(ctx, point, "caption")
+    ctx.check("status reports the caption", activity(ctx).get("caption") == text, activity(ctx))
+    ctx.check("the pill is drawn beside the arrow", changed(bare, shown) > 400, changed(bare, shown))
+
+    ctx.call("get_window_state", window_id=wid, full=True)
+    ctx.check("a read keeps the caption", activity(ctx).get("caption") == text, activity(ctx))
+
+    ctx.call("batch", window_id=wid, observe="none", steps=[
+        step("press_key", keys="right", caption="Stepping right"),
+        step("press_key", keys="left", caption="Stepping back"),
+    ])
+    ctx.check("a batch step's caption replaces the batch's", activity(ctx).get("caption") == "Stepping back", activity(ctx))
+
+    ctx.call("press_key", window_id=wid, keys="right", observe="none", caption="  Moving\nright  ")
+    ctx.check("captions are trimmed to one line", activity(ctx).get("caption") == "Moving right", activity(ctx))
+
+    ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none")
+    time.sleep(0.6)
+    cleared = pill_region(ctx, point, "cleared")
+    ctx.check("an action without a caption clears it", activity(ctx).get("caption") is None, activity(ctx))
+    ctx.check("and the pill is gone", changed(bare, cleared) < 60, changed(bare, cleared))
+
+    ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none", caption=text)
+    turn_ended(ctx)
+    time.sleep(1.0)
+    ctx.check("the turn end takes the caption with it", activity(ctx).get("caption") is None, activity(ctx))
+    ended = pill_region(ctx, point, "after-turn-end")
+    ctx.check("and nothing is drawn where the pill was", changed(bare, ended) < 60, changed(bare, ended))
 
 
 if __name__ == "__main__":

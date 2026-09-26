@@ -22,6 +22,12 @@ enum ToolCatalog {
         "click", "drag", "type_text", "set_value", "press_key", "scroll", "perform_action", "select_text", "paste",
     ]
 
+    /// Actions that take a `caption` for the agent cursor.
+    static let captionedTools: Set<String> = observingTools.union([
+        "batch", "browser_click", "browser_type", "browser_press_key", "browser_scroll", "browser_navigate",
+        "browser_command",
+    ])
+
     static let tools: [Tool] =
         ([
             Tool(
@@ -100,19 +106,18 @@ enum ToolCatalog {
                             "minItems": .int(1),
                             "maxItems": .int(50),
                             "description":
-                                "Actions to run in order. Each step is {tool, args}; args are the standalone tool's arguments. window_id is inherited from the batch unless a step sets its own. wait takes {ms}.",
+                                "Actions to run in order. Each step is the tool name plus that tool's own arguments, e.g. {\"tool\": \"click\", \"element_index\": 5} or {\"tool\": \"press_key\", \"keys\": \"cmd+a\"}. window_id is inherited from the batch unless a step sets its own. wait takes ms.",
                             "items": .object([
                                 "type": "object",
-                                "properties": .object([
-                                    "tool": string(
-                                        "Step action.",
-                                        enumValues: [
-                                            "click", "type_text", "press_key", "set_value", "scroll", "drag",
-                                            "perform_action", "wait",
-                                        ]),
-                                    "args": .object(["type": "object", "description": "Arguments for the step's tool."]
-                                    ),
-                                ]),
+                                "properties": .object(
+                                    batchStepArguments.merging([
+                                        "tool": string(
+                                            "Step action.",
+                                            enumValues: [
+                                                "click", "type_text", "press_key", "set_value", "scroll", "drag",
+                                                "perform_action", "wait",
+                                            ])
+                                    ]) { $1 }),
                                 "required": .array(["tool"]),
                             ]),
                         ]),
@@ -130,7 +135,7 @@ enum ToolCatalog {
             Tool(
                 name: "click",
                 description:
-                    "Click an element by element_index (preferred; uses accessibility actions), or at x,y: window-local points by default, or pixels of your latest screenshot of this window with coordinate_space=\"screenshot\". Works in place on any window, including windows on other Spaces or behind other apps; the user's cursor and focus are untouched.",
+                    "Click an element by element_index (preferred; uses accessibility actions), or at x,y: window-local points by default, or pixels of your latest screenshot of this window with coordinate_space=\"screenshot\". Works in place on any window, including windows on other Spaces or behind other apps; the user's cursor and focus are untouched. To press several elements you already know, such as a series of calculator keys, use one batch call instead of separate clicks.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
@@ -344,6 +349,10 @@ enum ToolCatalog {
                         "How to read x/y: window (window-local points) or screenshot (pixels of your latest screenshot of this window; the server divides by its scale).",
                         enumValues: ["window", "screenshot"], default: "window")
                 }
+                if captionedTools.contains(tool.name) {
+                    props["caption"] = string(
+                        "Optional: a few words shown to the user beside the agent's cursor while this runs, e.g. \"Opening the Export menu\". Present tense, under 60 characters.")
+                }
                 if observingTools.contains(tool.name) {
                     props["observe"] = string(
                         "Returned after the action: tree (what changed since your last read of this window), both (tree and screenshot), screenshot, or none when chaining blind.",
@@ -442,6 +451,31 @@ enum ToolCatalog {
                             "Operation-specific fields. Call operation=capabilities for argument help and approval requirements.",
                     ]),
                 ], required: ["operation"])),
+    ]
+
+    /// Flat on each step rather than nested under args: Gemini through Cursor stringifies a free-form nested
+    /// object and garbles the keys of a declared one. The router still accepts {tool, args}.
+    static let batchStepArguments: [String: Value] = [
+        "window_id": integer("Only when this step targets another window than the batch."),
+        "element_index": elementIndex,
+        "x": number("click, scroll: x, in window points unless coordinate_space says otherwise."),
+        "y": number("click, scroll: y."),
+        "coordinate_space": string("click, drag, scroll: window or screenshot.", enumValues: ["window", "screenshot"]),
+        "button": string("click: mouse button.", enumValues: ["left", "right", "middle"]),
+        "count": integer("click: 2 for a double-click."),
+        "text": string("type_text: text to insert."),
+        "keystrokes_only": ["type": "boolean", "description": "type_text: send real key events instead of an accessibility insert."],
+        "keys": string("press_key: chord such as \"return\" or \"cmd+a\"."),
+        "value": string("set_value: new value."),
+        "direction": string("scroll: direction.", enumValues: ["up", "down", "left", "right"]),
+        "amount": integer("scroll: number of steps."),
+        "from_x": number("drag: start x."),
+        "from_y": number("drag: start y."),
+        "to_x": number("drag: end x."),
+        "to_y": number("drag: end y."),
+        "action": string("perform_action: accessibility action name."),
+        "ms": integer("wait: milliseconds."),
+        "caption": string("Shown beside the agent's cursor from this step on, replacing the batch's caption."),
     ]
 
     private static let windowID = integer("Window id from list_windows or launch_app. Omit to target app instead.")

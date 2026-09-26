@@ -2,11 +2,11 @@ import AppKit
 import QuartzCore
 import SCShared
 
-/// A borderless, click-through overlay that draws the agent's own arrow cursor and glides it to each
-/// action, so the user can watch the agent work. It never touches the real cursor; it only paints one.
-/// Between actions the arrow rests where it last pointed for as long as the task is active: from any agent
-/// call until every active session's turn has ended or it closed, the user pauses, or no call came for
-/// `idleTimeout`.
+/// A borderless, click-through overlay that draws the agent's own cursor and moves it to each action, so the user
+/// can watch the agent work. It never touches the real cursor; it only paints one. Between actions the cursor rests
+/// where it last pointed for as long as the task is active: from any agent call until every active session's turn
+/// has ended or it closed, the user pauses, or no call came for `idleTimeout`. The extension draws the same cursor
+/// inside agent Chrome tabs (extension/cursor.js); keep the two designs in step.
 final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Sendable {
     /// For hosts without a turn-end hook, which never say that a task is over.
     static let idleTimeout: TimeInterval = 60
@@ -15,17 +15,28 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
     var onActivityChange: ((AgentActivityStatus) -> Void)?
 
     private let window: NSWindow
-    private let arrow = CALayer()
+    private let root = CALayer()
+    /// Sits exactly on the tip; everything below is positioned relative to it.
+    private let cursor = CALayer()
+    /// The arrow and its glow, rotated and pressed around the tip without moving the caption.
+    private let pointer = CALayer()
+    private let glow = CAShapeLayer()
+    private let arrow = CAShapeLayer()
+    private let breath = CAGradientLayer()
     private let pulse = CAShapeLayer()
-    private let halo = CAShapeLayer()
+    private let pill = CALayer()
+    private let pillLabel = CATextLayer()
 
     // Main thread only.
-    private var lastPoint = CGPoint(x: -100, y: -100)
     private var restingAt: Point?
-    /// Bumped by every move and by hiding, so a finished animation only settles the arrow it started.
+    /// Bumped by every move and by hiding, so a finished animation only settles the move it started.
     private var generation = 0
+    /// Releases the action waiting for the current move to arrive.
+    private var pendingArrival: (() -> Void)?
     private var sessions: [String: Date] = [:]
     private var app: String?
+    private var caption: String?
+    private var typing: Timer?
     private var watchdog: Timer?
 
     private let lock = NSLock()
@@ -44,47 +55,31 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         window.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
 
-        let root = CALayer()
         root.frame = CGRect(origin: .zero, size: frame.size)
         let host = NSView(frame: CGRect(origin: .zero, size: frame.size))
         host.wantsLayer = true
         host.layer = root
         window.contentView = host
-
-        pulse.path = CGPath(ellipseIn: CGRect(x: -22, y: -22, width: 44, height: 44), transform: nil)
-        pulse.fillColor = NSColor.clear.cgColor
-        pulse.strokeColor = Self.accent.cgColor
-        pulse.lineWidth = 2.5
-        pulse.opacity = 0
-        root.addSublayer(pulse)
-
-        halo.path = CGPath(ellipseIn: CGRect(x: -16, y: -16, width: 32, height: 32), transform: nil)
-        halo.fillColor = Self.accent.cgColor
-        halo.opacity = 0
-        root.addSublayer(halo)
-
-        arrow.contents = Self.arrowImage()
-        arrow.frame = CGRect(x: 0, y: 0, width: 28, height: 28)
-        arrow.anchorPoint = CGPoint(x: 3.0 / 28, y: 1 - 4.0 / 28) // the arrow's tip
-        arrow.opacity = 0
-        root.addSublayer(arrow)
-
+        buildLayers()
         window.orderFrontRegardless()
     }
 
     func present(_ event: AgentCursorEvent) {
         switch event {
-        case let .activity(session, app, near):
-            DispatchQueue.main.async { self.noteActivity(session: session, app: app, near: near) }
+        case let .activity(session, app, near, caption):
+            DispatchQueue.main.async { self.noteActivity(session: session, app: app, near: near, caption: caption) }
         case let .end(session):
             DispatchQueue.main.async { self.end([session]) }
         case .click, .drag, .scroll:
             let arrived = DispatchSemaphore(value: 0)
             DispatchQueue.main.async { self.point(event) { arrived.signal() } }
             // Bounded so a busy main thread never stalls the action the cursor is announcing.
-            _ = arrived.wait(timeout: .now() + 0.25)
+            _ = arrived.wait(timeout: .now() + Self.arrivalTimeout)
         }
     }
+
+    /// Like Codex: the action waits until the user can see the cursor land, but never longer than this.
+    static let arrivalTimeout: TimeInterval = 1.5
 
     func activity() -> AgentActivityStatus {
         lock.lock()
@@ -96,15 +91,16 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
 
     // MARK: Lifecycle (main thread)
 
-    private func noteActivity(session: String, app: String?, near: Point?) {
+    private func noteActivity(session: String, app: String?, near: Point?, caption: String?) {
         sessions[session] = Date()
         if let app { self.app = app }
-        if let near, restingAt == nil { glide(to: near, rest: true) {} }
+        if let caption { setCaption(caption.isEmpty ? nil : caption) }
+        if let near, restingAt == nil { move(to: near, arrived: {}) { self.rest() } }
         watch()
         publish()
     }
 
-    /// The arrow goes once no session is left; the sessions that remain keep it.
+    /// The cursor goes once no session is left; the sessions that remain keep it.
     private func end(_ ended: [String]) {
         for session in ended { sessions[session] = nil }
         if sessions.isEmpty { hide() } else { publish() }
@@ -115,13 +111,16 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         app = nil
         watchdog?.invalidate()
         watchdog = nil
+        setCaption(nil)
+        releaseArrival()
         if restingAt != nil {
             restingAt = nil
             generation += 1
-            halo.removeAnimation(forKey: "breathe")
+            stopResting()
             CATransaction.begin()
-            CATransaction.setAnimationDuration(0.4)
-            arrow.opacity = 0
+            CATransaction.setAnimationDuration(0.3)
+            cursor.opacity = 0
+            cursor.transform = CATransform3DMakeScale(0.85, 0.85, 1)
             CATransaction.commit()
         }
         publish()
@@ -146,9 +145,10 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
     }
 
     private func publish() {
+        let active = !sessions.isEmpty
         let status = AgentActivityStatus(
-            active: !sessions.isEmpty, app: sessions.isEmpty ? nil : app, sessions: sessions.keys.sorted(),
-            arrow: restingAt)
+            active: active, app: active ? app : nil, sessions: sessions.keys.sorted(), arrow: restingAt,
+            caption: active ? caption : nil)
         lock.lock()
         let changed = published.active != status.active || published.app != status.app
         published = status
@@ -157,16 +157,22 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         if changed { onActivityChange?(status) }
     }
 
-    // MARK: Animation (main thread)
+    // MARK: Motion (main thread)
 
+    private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
+    /// `arrived` releases the action this event announces once the cursor reaches its target.
     private func point(_ event: AgentCursorEvent, arrived: @escaping () -> Void) {
         switch event {
         case let .click(at, count):
-            glide(to: at, rest: true) { self.flashPulse(count: count); arrived() }
+            move(to: at, arrived: arrived) {
+                self.press(count: count)
+                self.rest()
+            }
         case let .drag(from, to):
-            glide(to: from, rest: false) { self.dragLine(to: to); arrived() }
+            move(to: from, arrived: arrived) { self.slide(to: to) }
         case let .scroll(at):
-            glide(to: at, rest: true, then: arrived)
+            move(to: at, arrived: arrived) { self.rest() }
         case .activity, .end:
             arrived()
         }
@@ -174,51 +180,174 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         publish()
     }
 
-    /// At most ~0.15 s (0.18 s when appearing): the action waits for the arrow to arrive.
-    private func glide(to global: Point, rest: Bool, then: @escaping () -> Void) {
+    /// Short moves spring straight to the target; long ones travel an arc that bows away from the straight line,
+    /// leaning toward the direction of travel. A cursor that is not showing appears at the target. Arrival is when
+    /// the cursor reaches the target, not when its spring stops settling.
+    private func move(to global: Point, arrived: @escaping () -> Void, then landed: @escaping () -> Void) {
         let target = layerPoint(global)
-        let appearing = restingAt == nil
-        let distance = hypot(target.x - lastPoint.x, target.y - lastPoint.y)
-        let duration = appearing ? 0.18 : min(0.15, max(0.06, distance / 4000))
         generation += 1
         let move = generation
-        halo.removeAnimation(forKey: "breathe")
-        if appearing {
-            // Fly in from just below the target instead of from wherever the arrow was last hidden.
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            arrow.position = CGPoint(x: target.x + 14, y: target.y - 18)
-            CATransaction.commit()
-        }
-        lastPoint = target
+        releaseArrival()
+        pendingArrival = arrived
+        stopResting()
+        let appearing = restingAt == nil
+        let start = cursor.presentation()?.position ?? cursor.position
         restingAt = global
 
         CATransaction.begin()
-        CATransaction.setCompletionBlock {
-            if rest, move == self.generation { self.rest() }
-            then()
-        }
-        CATransaction.setAnimationDuration(duration)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
-        arrow.opacity = 1
-        arrow.position = target
+        CATransaction.setDisableActions(true)
+        cursor.position = target
+        placePill(at: target)
         CATransaction.commit()
 
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        pulse.position = target
-        halo.position = target
-        CATransaction.commit()
+        let arrival: TimeInterval
+        if appearing {
+            appear()
+            if let caption { showPill(caption) }
+            arrival = 0.18
+        } else {
+            arrival = travel(from: start, to: target)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + arrival) {
+            guard move == self.generation else { return }
+            self.releaseArrival()
+            landed()
+        }
     }
 
-    /// The idle pose between actions: a slow, faint glow around the tip, or a still arrow under Reduce Motion.
-    private func rest() {
-        guard restingAt != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+    /// An action still waiting on a move that a newer move or a hide replaced goes at once.
+    private func releaseArrival() {
+        pendingArrival?()
+        pendingArrival = nil
+    }
+
+    private func appear() {
+        cursor.opacity = 1
+        cursor.transform = CATransform3DIdentity
         let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = 0.0
-        fade.toValue = 0.28
-        let grow = CABasicAnimation(keyPath: "transform.scale")
+        fade.fromValue = 0
+        fade.toValue = 1
+        fade.duration = 0.18
+        cursor.add(fade, forKey: "appear-fade")
+        guard !reduceMotion else { return }
+        let grow = Self.spring("transform.scale", response: 0.42, damping: 0.86)
         grow.fromValue = 0.6
+        grow.toValue = 1
+        cursor.add(grow, forKey: "appear-scale")
+    }
+
+    /// Returns when the cursor reaches the target.
+    private func travel(from start: CGPoint, to target: CGPoint) -> TimeInterval {
+        let dx = target.x - start.x, dy = target.y - start.y
+        let distance = hypot(dx, dy)
+        guard distance >= 0.5 else { return 0 }
+        if reduceMotion {
+            let slide = CABasicAnimation(keyPath: "position")
+            slide.fromValue = NSValue(point: start)
+            slide.toValue = NSValue(point: target)
+            slide.duration = 0.12
+            cursor.add(slide, forKey: "move")
+            return slide.duration
+        }
+        let duration: CFTimeInterval
+        let arrival: TimeInterval
+        if distance < 200 {
+            let spring = Self.spring("position", response: 0.2, damping: 0.86)
+            spring.fromValue = NSValue(point: start)
+            spring.toValue = NSValue(point: target)
+            duration = spring.duration
+            // An underdamped spring first reaches its target after about one response period.
+            arrival = 0.2
+            cursor.add(spring, forKey: "move")
+        } else {
+            let arc = CAKeyframeAnimation(keyPath: "position")
+            let path = CGMutablePath()
+            path.move(to: start)
+            path.addQuadCurve(to: target, control: arcControl(from: start, to: target))
+            arc.path = path
+            arc.calculationMode = .paced
+            arc.duration = min(max(0.28 + distance / 4000, 0.28), 0.5)
+            arc.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 0.9, 0.35, 1)
+            duration = arc.duration
+            arrival = arc.duration
+            cursor.add(arc, forKey: "move")
+        }
+        // Clockwise (negative in this y-up space) when moving right, as if the tip were pulled along.
+        let lean = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+        lean.values = [0, -(dx / distance) * 10 * .pi / 180, 0]
+        lean.keyTimes = [0, 0.35, 1]
+        lean.duration = duration
+        lean.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        pointer.add(lean, forKey: "lean")
+        return arrival
+    }
+
+    /// The control point sits a quarter of the distance off the midpoint, on whichever side stays on screen,
+    /// preferring the side that bows upward.
+    private func arcControl(from start: CGPoint, to target: CGPoint) -> CGPoint {
+        let distance = hypot(target.x - start.x, target.y - start.y)
+        let mid = CGPoint(x: (start.x + target.x) / 2, y: (start.y + target.y) / 2)
+        let normal = CGPoint(x: -(target.y - start.y) / distance, y: (target.x - start.x) / distance)
+        let sides = [1.0, -1.0].map { side in
+            CGPoint(x: mid.x + normal.x * distance * 0.25 * side, y: mid.y + normal.y * distance * 0.25 * side)
+        }.sorted { $0.y > $1.y }
+        return sides.first { root.bounds.insetBy(dx: 8, dy: 8).contains($0) } ?? mid
+    }
+
+    /// The drag's second leg runs alongside the real drag, which is already moving by the time the cursor lands.
+    private func slide(to global: Point) {
+        let end = layerPoint(global)
+        let start = cursor.presentation()?.position ?? cursor.position
+        generation += 1
+        let move = generation
+        restingAt = global
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        cursor.position = end
+        placePill(at: end)
+        CATransaction.commit()
+
+        let slide = CABasicAnimation(keyPath: "position")
+        slide.fromValue = NSValue(point: start)
+        slide.toValue = NSValue(point: end)
+        slide.duration = reduceMotion ? 0.12 : 0.25
+        slide.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { if move == self.generation { self.rest() } }
+        cursor.add(slide, forKey: "move")
+        CATransaction.commit()
+        publish()
+    }
+
+    private func press(count: Int) {
+        let ring = CAAnimationGroup()
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 0.4
+        scale.toValue = 1.0
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.9
+        fade.toValue = 0.0
+        ring.animations = [scale, fade]
+        ring.duration = count > 1 ? 0.42 : 0.32
+        ring.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        pulse.add(ring, forKey: "pulse")
+        guard !reduceMotion else { return }
+        let dip = CAKeyframeAnimation(keyPath: "transform.scale")
+        dip.values = [1, 0.88, 1]
+        dip.keyTimes = [0, 0.35, 1]
+        dip.duration = 0.18
+        pointer.add(dip, forKey: "dip")
+    }
+
+    /// The idle pose between actions: a slow glow around the tip and, after a moment, a small wobble every few
+    /// seconds, so a task that is still running looks alive. A still cursor under Reduce Motion.
+    private func rest() {
+        guard restingAt != nil, !reduceMotion else { return }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.15
+        fade.toValue = 0.35
+        let grow = CABasicAnimation(keyPath: "transform.scale")
+        grow.fromValue = 0.8
         grow.toValue = 1.0
         let breathe = CAAnimationGroup()
         breathe.animations = [fade, grow]
@@ -226,50 +355,176 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         breathe.autoreverses = true
         breathe.repeatCount = .infinity
         breathe.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        halo.add(breathe, forKey: "breathe")
+        breath.add(breathe, forKey: "breathe")
+
+        let wobble = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+        wobble.values = [0, -9, 7, -5, 3, 0, 0].map { $0 * Double.pi / 180 }
+        wobble.keyTimes = [0, 0.08, 0.17, 0.26, 0.33, 0.39, 1]
+        wobble.duration = 3.6
+        wobble.repeatCount = .infinity
+        wobble.beginTime = CACurrentMediaTime() + 1.2
+        pointer.add(wobble, forKey: "wobble")
     }
 
-    private func flashPulse(count: Int) {
-        pulse.position = arrow.position
-        let scale = CABasicAnimation(keyPath: "transform.scale")
-        scale.fromValue = 0.4
-        scale.toValue = 1.0
-        let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = 0.9
-        fade.toValue = 0.0
-        let group = CAAnimationGroup()
-        group.animations = [scale, fade]
-        group.duration = count > 1 ? 0.42 : 0.32
-        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        pulse.add(group, forKey: "pulse")
+    private func stopResting() {
+        breath.removeAnimation(forKey: "breathe")
+        pointer.removeAnimation(forKey: "wobble")
     }
 
-    /// Runs alongside the real drag instead of before it: Pointer.drag presses ~0.2 s after the arrow
-    /// arrives and then moves for ~0.2 s.
-    private func dragLine(to global: Point) {
-        let start = arrow.position
-        let end = layerPoint(global)
-        generation += 1
-        let move = generation
-        lastPoint = end
-        restingAt = global
+    private static func spring(_ keyPath: String, response: Double, damping: Double) -> CASpringAnimation {
+        let spring = CASpringAnimation(keyPath: keyPath)
+        let stiffness = pow(2 * .pi / response, 2)
+        spring.mass = 1
+        spring.stiffness = stiffness
+        spring.damping = 2 * damping * stiffness.squareRoot()
+        spring.duration = spring.settlingDuration
+        return spring
+    }
 
-        let slide = CABasicAnimation(keyPath: "position")
-        slide.fromValue = NSValue(point: start)
-        slide.toValue = NSValue(point: end)
-        slide.beginTime = CACurrentMediaTime() + 0.2
-        slide.duration = 0.2
-        slide.fillMode = .backwards
-        slide.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    // MARK: Caption (main thread)
+
+    private func setCaption(_ text: String?) {
+        guard text != caption else { return }
+        caption = text
+        typing?.invalidate()
+        typing = nil
+        if let text {
+            if restingAt != nil { showPill(text) }
+        } else {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.15)
+            pill.opacity = 0
+            CATransaction.commit()
+        }
+        publish()
+    }
+
+    /// Types the caption out, at most 0.4 s, with a caret while it runs. The pill takes its final width at once so
+    /// it does not grow while typing.
+    private func showPill(_ text: String) {
+        let size = (text as NSString).size(withAttributes: [.font: Self.captionFont])
+        let width = min(320, ceil(size.width) + 18)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        CATransaction.setCompletionBlock { if move == self.generation { self.rest() } }
-        arrow.position = end
-        pulse.position = end
-        halo.position = end
-        arrow.add(slide, forKey: "drag")
+        pill.bounds = CGRect(x: 0, y: 0, width: width, height: 26)
+        pillLabel.frame = CGRect(x: 9, y: 5, width: width - 18, height: 16)
+        placePill(at: cursor.position)
         CATransaction.commit()
-        publish()
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.12)
+        pill.opacity = 1
+        CATransaction.commit()
+
+        let characters = Array(text)
+        guard !reduceMotion, characters.count > 1 else {
+            setLabel(text)
+            return
+        }
+        let started = CACurrentMediaTime()
+        let total = min(0.4, 0.018 * Double(characters.count))
+        setLabel("▏")
+        let timer = Timer(timeInterval: 0.018, repeats: true) { [weak self] timer in
+            guard let self else { return timer.invalidate() }
+            let progress = (CACurrentMediaTime() - started) / total
+            let shown = min(characters.count, Int((Double(characters.count) * progress).rounded(.up)))
+            if shown >= characters.count {
+                self.setLabel(text)
+                timer.invalidate()
+            } else {
+                self.setLabel(String(characters.prefix(shown)) + "▏")
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        typing = timer
+    }
+
+    private func setLabel(_ text: String) {
+        pillLabel.string = NSAttributedString(
+            string: text, attributes: [.font: Self.captionFont, .foregroundColor: Self.captionText])
+    }
+
+    /// Below and to the right of the tip, flipped left or above near the screen's edges.
+    private func placePill(at tip: CGPoint) {
+        let size = pill.bounds.size
+        var origin = CGPoint(x: 14, y: -20 - size.height)
+        if tip.x + origin.x + size.width > root.bounds.maxX - 4 { origin.x = -14 - size.width }
+        if tip.y + origin.y < root.bounds.minY + 4 { origin.y = 20 }
+        pill.frame = CGRect(origin: origin, size: size)
+    }
+
+    // MARK: Layers
+
+    private func buildLayers() {
+        let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
+        cursor.bounds = .zero
+        cursor.opacity = 0
+        root.addSublayer(cursor)
+
+        breath.type = .radial
+        breath.colors = [Self.accent.withAlphaComponent(0.5).cgColor, Self.accent.withAlphaComponent(0).cgColor]
+        breath.startPoint = CGPoint(x: 0.5, y: 0.5)
+        breath.endPoint = CGPoint(x: 1, y: 1)
+        // Centered on the arrow's body, 8 pt right of and below the tip.
+        breath.frame = CGRect(x: -8, y: -24, width: 32, height: 32)
+        breath.opacity = 0
+        cursor.addSublayer(breath)
+
+        pulse.path = CGPath(ellipseIn: CGRect(x: -22, y: -22, width: 44, height: 44), transform: nil)
+        pulse.fillColor = NSColor.clear.cgColor
+        pulse.strokeColor = Self.accent.cgColor
+        pulse.lineWidth = 2.5
+        pulse.opacity = 0
+        cursor.addSublayer(pulse)
+
+        // 24 pt box, tip at (3, 3) from the top left; this layer is y-up, so the tip is at (3, 21).
+        pointer.bounds = CGRect(x: 0, y: 0, width: 24, height: 24)
+        pointer.anchorPoint = CGPoint(x: 3.0 / 24, y: 21.0 / 24)
+        pointer.position = .zero
+        cursor.addSublayer(pointer)
+        let path = Self.arrowPath()
+        for (layer, radius, opacity) in [(glow, 9.0, Float(0.45)), (arrow, 3.5, Float(0.85))] {
+            layer.frame = pointer.bounds
+            layer.path = path
+            layer.fillColor = Self.ink.cgColor
+            layer.strokeColor = NSColor.white.cgColor
+            layer.lineWidth = 1.5
+            layer.lineJoin = .round
+            layer.shadowPath = path
+            layer.shadowColor = Self.accent.cgColor
+            layer.shadowRadius = radius
+            layer.shadowOpacity = opacity
+            layer.shadowOffset = .zero
+            pointer.addSublayer(layer)
+        }
+
+        pill.anchorPoint = .zero
+        pill.backgroundColor = Self.ink.withAlphaComponent(0.94).cgColor
+        pill.cornerRadius = 8
+        pill.borderWidth = 1
+        pill.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        pill.shadowColor = NSColor.black.cgColor
+        pill.shadowOpacity = 0.25
+        pill.shadowRadius = 5
+        pill.shadowOffset = CGSize(width: 0, height: -2)
+        pill.opacity = 0
+        pillLabel.contentsScale = scale
+        pillLabel.truncationMode = .end
+        pillLabel.isWrapped = false
+        pillLabel.actions = ["contents": NSNull(), "string": NSNull(), "bounds": NSNull(), "position": NSNull()]
+        pill.addSublayer(pillLabel)
+        cursor.addSublayer(pill)
+    }
+
+    /// An arrowhead without a tail, pointing up and to the left at 45 degrees.
+    private static func arrowPath() -> CGPath {
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: 3, y: 21))
+        path.addLine(to: CGPoint(x: 21, y: 13.8))
+        path.addLine(to: CGPoint(x: 12.6, y: 11.4))
+        path.addLine(to: CGPoint(x: 10.2, y: 3))
+        path.closeSubpath()
+        return path
     }
 
     // MARK: Geometry
@@ -285,29 +540,8 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
     }
 
-    private static let accent = NSColor(red: 0.96, green: 0.31, blue: 0.0, alpha: 1) // Cursor brand accent
-
-    private static func arrowImage() -> CGImage {
-        let size = CGSize(width: 28, height: 28)
-        // The path is in top-left-origin coordinates (tip at 3,4).
-        let image = NSImage(size: size, flipped: true) { _ in
-            let path = NSBezierPath()
-            path.move(to: NSPoint(x: 3, y: 25))
-            path.line(to: NSPoint(x: 3, y: 4))
-            path.line(to: NSPoint(x: 18, y: 12))
-            path.line(to: NSPoint(x: 11, y: 12))
-            path.line(to: NSPoint(x: 16, y: 22))
-            path.line(to: NSPoint(x: 12, y: 24))
-            path.line(to: NSPoint(x: 8, y: 15))
-            path.close()
-            accent.setFill()
-            path.fill()
-            NSColor.white.setStroke()
-            path.lineWidth = 1.5
-            path.stroke()
-            return true
-        }
-        var rect = CGRect(origin: .zero, size: size)
-        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)!
-    }
+    private static let accent = NSColor(srgbRed: 245 / 255, green: 78 / 255, blue: 0, alpha: 1) // Cursor brand accent
+    private static let ink = NSColor(srgbRed: 20 / 255, green: 18 / 255, blue: 11 / 255, alpha: 1)
+    private static let captionText = NSColor(srgbRed: 237 / 255, green: 236 / 255, blue: 236 / 255, alpha: 1)
+    private static let captionFont = NSFont.systemFont(ofSize: 12, weight: .medium)
 }

@@ -1,3 +1,4 @@
+import { hideSession, setCaption, show } from "./cursor.js";
 import { BridgeError } from "./errors.js";
 import { click, pressKey, screenshot, scroll, type } from "./input.js";
 import { snapshot, structuredSnapshot } from "./snapshot.js";
@@ -29,9 +30,15 @@ chrome.tabs.onRemoved.addListener((id) => {
 });
 const handlers = {
   extended: extended,
-  "session.close": ({ session_id }) => {
+  // Sent just before the action it describes, which must not wait for the overlay.
+  "cursor.caption": ({ tabId, caption, session_id }) => {
+    setCaption(tabId, caption, session_id);
+    return {};
+  },
+  "session.close": async ({ session_id }) => {
     for (const key of observations.keys())
       if (key.startsWith(session_id + ":")) observations.delete(key);
+    await hideSession(session_id);
     return closeSession(session_id);
   },
   // Only for the app's local approval prompt text; tab ids never come from here to the model.
@@ -39,9 +46,10 @@ const handlers = {
     const tab = await chrome.tabs.get(tabId);
     return { url: tab.url || tab.pendingUrl || "", title: tab.title || "" };
   },
-  "session.end_turn": ({ session_id }) => {
+  "session.end_turn": async ({ session_id }) => {
     for (const key of observations.keys())
       if (key.startsWith(session_id + ":")) observations.delete(key);
+    await hideSession(session_id);
     return endTurn(session_id);
   },
   "tabs.list": async ({ session_id }) => ({ tabs: await listTabs(session_id) }),
@@ -57,9 +65,11 @@ const handlers = {
     };
   },
   "tabs.close": ({ tabId }) => closeTab(tabId),
-  "tab.navigate": async ({ tabId, url }) => ({
-    tab: await navigateTab(tabId, url),
-  }),
+  "tab.navigate": async ({ tabId, url }) => {
+    const tab = await navigateTab(tabId, url);
+    show(tabId);
+    return { tab };
+  },
   "tab.snapshot": async ({ tabId, session_id, full }) => {
     await requireAgentTab(tabId);
     const key = `${session_id}:${tabId}`;
@@ -255,27 +265,32 @@ function connect() {
       const instance_id = data.instance_id ?? crypto.randomUUID();
       await chrome.storage.local.set({ instance_id });
       const ua = navigator.userAgent;
-      current.postMessage({
-        type: "hello",
-        version: VERSION,
-        instance_id,
-        profile_name: data.profile_name ?? "Default",
-        name: ua.includes("Edg/")
-          ? "Edge"
-          : ua.includes("Chrome/")
-            ? "Chrome / Chromium"
-            : "Chromium",
-        capabilities: [
-          "ax",
-          "dom",
-          "input",
-          "dialogs",
-          "files",
-          "screenshots",
-          "exports",
-          "cdp",
-        ],
-      });
+      try {
+        current.postMessage({
+          type: "hello",
+          version: VERSION,
+          instance_id,
+          profile_name: data.profile_name ?? "Default",
+          name: ua.includes("Edg/")
+            ? "Edge"
+            : ua.includes("Chrome/")
+              ? "Chrome / Chromium"
+              : "Chromium",
+          capabilities: [
+            "ax",
+            "dom",
+            "input",
+            "dialogs",
+            "files",
+            "screenshots",
+            "exports",
+            "cdp",
+          ],
+        });
+      } catch {
+        // The host went away while storage was read (an app restart, or it refused the connection);
+        // onDisconnect has already scheduled the retry.
+      }
     });
 }
 

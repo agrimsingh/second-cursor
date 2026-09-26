@@ -423,7 +423,7 @@ extension ToolRouter {
             throw SCError.invalidArgument(
                 "Step \(index): tool must be one of \(batchTools.sorted().joined(separator: ", "))")
         }
-        let args = Arguments(raw["args"]?.objectValue ?? [:]).aliasing(aliases[tool] ?? [:])
+        let args = Arguments(try stepArguments(raw, index: index, tool: tool)).aliasing(aliases[tool] ?? [:])
         let windowID =
             try args.optionalInt("window_id").map { id -> UInt32 in
                 guard let wid = UInt32(exactly: id) else {
@@ -433,7 +433,13 @@ extension ToolRouter {
             } ?? defaultWindow
 
         func require<T>(_ value: T?, _ what: String) throws -> T {
-            guard let value else { throw SCError.invalidArgument("Step \(index) (\(tool)): \(what) is required") }
+            guard let value else {
+                let unknown = args.raw.keys.filter {
+                    ToolCatalog.batchStepArguments[$0] == nil && aliases[tool]?[$0] == nil && $0 != "milliseconds"
+                }.sorted()
+                let hint = unknown.isEmpty ? "" : "; unrecognized fields: \(unknown.joined(separator: ", "))"
+                throw SCError.invalidArgument("Step \(index) (\(tool)): \(what) is required\(hint)")
+            }
             return value
         }
         let action: BatchAction
@@ -469,7 +475,22 @@ extension ToolRouter {
             let ms = try args.optionalInt("ms") ?? args.optionalInt("milliseconds")
             action = .wait(milliseconds: try require(ms, "ms"))
         }
-        return BatchStep(tool: tool, windowID: windowID, action: action, logDetail: args.logDetail)
+        return BatchStep(
+            tool: tool, windowID: windowID, action: action, logDetail: args.logDetail,
+            caption: try args.optionalString("caption").map(ToolRouter.caption))
+    }
+
+    /// Accepts args as an object, a JSON string, or fields beside tool. A malformed args value must fail
+    /// loudly: silently dropping it makes the step report a missing argument instead.
+    private static func stepArguments(_ raw: [String: Value], index: Int, tool: String) throws -> [String: Value] {
+        var merged = raw.filter { $0.key != "tool" && $0.key != "args" }
+        guard let value = raw["args"], !value.isNull else { return merged }
+        guard let object = Arguments.nestedObject(value) else {
+            let got = value.stringValue.map { ", not the string \"\($0.prefix(60))\"" } ?? ""
+            throw SCError.invalidArgument("Step \(index) (\(tool)): args must be an object such as {\"element_index\": 5}\(got)")
+        }
+        merged.merge(object) { $1 }
+        return merged
     }
 
     private func launchApp(_ args: Arguments) async throws -> ToolOutput {

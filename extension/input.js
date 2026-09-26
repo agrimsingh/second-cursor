@@ -1,4 +1,5 @@
 import { cdp } from "./cdp.js";
+import { concealDuring, pointTo, show } from "./cursor.js";
 import { BridgeError, withTimeout } from "./errors.js";
 import { parseChord } from "./keys.js";
 
@@ -39,24 +40,35 @@ export async function click(tabId, { ref, x, y }) {
   else if (Number.isFinite(x) && Number.isFinite(y)) point = { x, y };
   else throw new BridgeError("invalid_argument", "click needs a ref or both x and y");
 
+  await pointTo(tabId, point, 1);
   const mouse = (params) => cdp(tabId, "Input.dispatchMouseEvent", { x: point.x, y: point.y, modifiers: 0, ...params });
   await mouse({ type: "mouseMoved", button: "none", buttons: 0 });
   await mouse({ type: "mousePressed", button: "left", buttons: 1, clickCount: 1 });
   await mouse({ type: "mouseReleased", button: "left", buttons: 0, clickCount: 1 });
 }
 
+// Where a text cursor would sit in a field: near its left edge, vertically centered.
+function fieldPoint(quad) {
+  const xs = [quad[0], quad[2], quad[4], quad[6]], ys = [quad[1], quad[3], quad[5], quad[7]];
+  const left = Math.min(...xs), width = Math.max(...xs) - left;
+  return { x: left + Math.min(24, width / 2), y: (Math.min(...ys) + Math.max(...ys)) / 2 };
+}
+
 export async function type(tabId, { ref, text, submit }) {
   if (ref != null && ref !== "") {
-    await cdp(tabId, "DOM.focus", { backendNodeId: backendNodeId(ref) }).catch((error) => {
+    const id = backendNodeId(ref);
+    await cdp(tabId, "DOM.focus", { backendNodeId: id }).catch((error) => {
       throw refError(ref, error);
     });
-  }
+    pointTo(tabId, () => cdp(tabId, "DOM.getBoxModel", { backendNodeId: id }).then(({ model }) => fieldPoint(model.border)));
+  } else show(tabId);
   if (text) await cdp(tabId, "Input.insertText", { text: String(text) });
   if (submit) await pressKey(tabId, "Enter");
 }
 
 export async function pressKey(tabId, keys) {
   const { modifiers, key, command } = parseChord(keys);
+  show(tabId);
   const send = (params) => cdp(tabId, "Input.dispatchKeyEvent", params);
   let bits = 0;
   for (const m of modifiers) {
@@ -80,9 +92,9 @@ export async function scroll(tabId, direction, amount) {
   const delta = { up: [0, -distance], down: [0, distance], left: [-distance, 0], right: [distance, 0] }[direction];
   if (!delta) throw new BridgeError("invalid_argument", "direction must be up, down, left or right");
   const { cssLayoutViewport: viewport } = await cdp(tabId, "Page.getLayoutMetrics");
-  await cdp(tabId, "Input.dispatchMouseEvent", {
-    type: "mouseWheel", x: viewport.clientWidth / 2, y: viewport.clientHeight / 2, deltaX: delta[0], deltaY: delta[1],
-  });
+  const point = { x: viewport.clientWidth / 2, y: viewport.clientHeight / 2 };
+  await pointTo(tabId, point);
+  await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", ...point, deltaX: delta[0], deltaY: delta[1] });
 }
 
 function pngSize(base64) {
@@ -96,13 +108,15 @@ export async function screenshot(tabId) {
   const { cssVisualViewport: vp } = await cdp(tabId, "Page.getLayoutMetrics");
   const { result } = await cdp(tabId, "Runtime.evaluate", { expression: "window.devicePixelRatio", returnByValue: true });
   const dpr = Number(result?.value) || 1;
-  const { data } = await withTimeout(
-    cdp(tabId, "Page.captureScreenshot", {
-      format: "png",
-      clip: { x: vp.pageX, y: vp.pageY, width: vp.clientWidth, height: vp.clientHeight, scale: 1 / dpr },
-    }),
-    15000,
-    "Screenshot timed out; Chrome is not rendering this tab",
+  const { data } = await concealDuring(tabId, () =>
+    withTimeout(
+      cdp(tabId, "Page.captureScreenshot", {
+        format: "png",
+        clip: { x: vp.pageX, y: vp.pageY, width: vp.clientWidth, height: vp.clientHeight, scale: 1 / dpr },
+      }),
+      15000,
+      "Screenshot timed out; Chrome is not rendering this tab",
+    ),
   );
   const { width, height } = pngSize(data);
   return { data, width, height, scale: 1 };
