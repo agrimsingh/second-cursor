@@ -91,11 +91,11 @@ At the end of each agent turn, `SecondCursor --turn-ended` tells the app the tur
 | Area | Tools |
 | --- | --- |
 | Status | `status` |
-| Apps and windows | `list_apps`, `list_windows`, `launch_app`, `get_window_state`, `screenshot` |
+| Apps and windows | `list_apps`, `list_windows`, `launch_app`, `get_window_state`, `find_elements`, `screenshot` |
 | Sessions | `session`, `bind_target`, `operation_status`, `cancel_operation` |
 | Editing | `inspect_element`, `select_text`, `paste` |
 | Extended browser | `browser_instances`, `browser_command` (DOM, dialogs, files, exports, screenshots, history, assets) |
-| Input | `batch`, `click`, `drag`, `type_text`, `set_value`, `press_key`, `scroll`, `perform_action` |
+| Input | `batch` (also as `act`), `click`, `drag`, `type_text`, `set_value`, `press_key`, `scroll`, `perform_action` |
 | Agent display (optional) | `agent_display`, `move_to_agent_display`, `return_window` |
 | Browser | `browser_status`, `browser_tabs`, `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_screenshot`, `browser_close` |
 
@@ -123,6 +123,7 @@ python3 e2e/instance.py       # test-instance isolation
 python3 e2e/focus.py          # focus safety; puts a probe window in front and takes focus while it runs
 python3 e2e/cursor.py         # arrow and menu-bar presence; also takes over the screen while it runs
 python3 e2e/latency.py        # per-call timings, written to latency.json
+python3 e2e/find.py           # find_elements, act, the compact tool surface
 ```
 
 `SC_E2E_APP=build/SecondCursor.app` tests another bundle, and `--installed` targets your running app instead (opt-in). `python3 e2e/setup.py` runs `install-mcp` against a temporary `HOME` and checks that your real client configs are unchanged.

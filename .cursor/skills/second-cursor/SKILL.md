@@ -22,6 +22,8 @@ If tools fail with "not running" or permission errors, run `SecondCursor doctor`
 7. After the task, observe once more and confirm the result before you say it is done.
 8. Give actions a short `caption` ("Opening the Export menu", "Searching for flights"): the user sees it beside your cursor while you work. Keep it under 60 characters; an action without one clears it.
 
+To find one element in a big window (a button, field or row), call `find_elements` with `text` and/or `role` instead of reading the whole outline again: it searches your latest observation, including elements a truncated outline left out, and returns their `[index]` lines.
+
 Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`.
 
 ## Code-first for multi-step flows

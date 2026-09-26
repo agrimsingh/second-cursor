@@ -51,6 +51,7 @@ public final class SecondCursorServer: @unchecked Sendable {
     public func start(config: SCConfig) async throws {
         let router = ToolRouter(desktop: desktop, agentDisplay: agentDisplay, browser: browser, config: config,
                                 connectionCount: { [listener] in listener.activeConnectionCount })
+        let tools = ToolCatalog.advertised(surface: config.toolSurface)
         let pipeline = StandardValidationPipeline(validators: [
             OriginValidator.localhost(),
             StaticBearerTokenValidator(token: config.token),
@@ -71,12 +72,12 @@ public final class SecondCursorServer: @unchecked Sendable {
                     guard request.method == "POST", let body = request.body else { return .error(statusCode:400,.invalidRequest("POST JSON required")) }
                     do {
                         let payload = try JSONDecoder().decode(APIRequest.self,from:body)
-                        if payload.tool == "tools/list" { return .data(try JSONEncoder().encode(ToolCatalog.tools),headers:["Content-Type":"application/json"]) }
+                        if payload.tool == "tools/list" { return .data(try JSONEncoder().encode(tools),headers:["Content-Type":"application/json"]) }
                         let result = await router.call(name:payload.tool,arguments:payload.args ?? [:])
                         return .data(try JSONEncoder().encode(result),headers:["Content-Type":"application/json"])
                     } catch { return .error(statusCode:400,.invalidRequest("Malformed request: \(error.localizedDescription)")) }
                 }
-                return await Self.handle(request, pipeline: pipeline, router: router)
+                return await Self.handle(request, pipeline: pipeline, router: router, tools: tools)
             }
         } catch let error as IOError where error.errnoCode == EADDRINUSE {
             throw StartError.portInUse(config.port)
@@ -124,7 +125,8 @@ public final class SecondCursorServer: @unchecked Sendable {
     /// One MCP `Server` per HTTP request: the stateless transport keys in-flight requests by
     /// JSON-RPC id and a long-lived `Server` refuses a second `initialize`, so sharing one
     /// instance breaks reconnecting clients and collides ids across concurrent clients.
-    private static func handle(_ request: HTTPRequest, pipeline: StandardValidationPipeline, router: ToolRouter) async -> HTTPResponse {
+    private static func handle(_ request: HTTPRequest, pipeline: StandardValidationPipeline, router: ToolRouter,
+                               tools: [Tool]) async -> HTTPResponse {
         let transport = StatelessHTTPServerTransport(validationPipeline: pipeline)
         let server = Server(
             name: "second-cursor",
@@ -133,7 +135,7 @@ public final class SecondCursorServer: @unchecked Sendable {
             capabilities: .init(tools: .init(listChanged: false))
         )
         await server.withMethodHandler(ListTools.self) { _ in
-            ListTools.Result(tools: ToolCatalog.tools)
+            ListTools.Result(tools: tools)
         }
         await server.withMethodHandler(CallTool.self) { params in
             await router.call(name: params.name, arguments: params.arguments ?? [:])

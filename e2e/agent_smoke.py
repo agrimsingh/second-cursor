@@ -11,6 +11,8 @@ Flow: fresh TestInstance -> temp project whose .cursor/mcp.json points at the in
 Usage:  python3 e2e/agent_smoke.py
         python3 e2e/agent_smoke.py --run [--model <model>] [--timeout <seconds>]
         python3 e2e/agent_smoke.py --run --models <a,b,...> [--repeat <n>]   compare models, n runs each
+        --config key=value (repeatable) merges into the test instance's config, e.g. --config toolSurface=compact;
+        values that parse as JSON (2, true, ["a"]) are used as such, anything else as a string
 Output: e2e/artifacts/agent-<ts>/ report.md, results.json, transcript.jsonl (verification calls),
         agent/ (prompt, stream-json events, stderr, the project's mcp.json with the token redacted),
         agent/actions.jsonl (the instance's action log: every state-changing MCP call the agent made),
@@ -44,8 +46,28 @@ def option(name, default=None):
     return default
 
 
+def config_overrides():
+    overrides = {}
+    for flag, pair in zip(sys.argv, sys.argv[1:]):
+        if flag != "--config":
+            continue
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            raise SystemExit(f"--config takes key=value, got {pair!r}")
+        try:
+            overrides[key] = json.loads(value)
+        except json.JSONDecodeError:
+            overrides[key] = value
+    return overrides
+
+
+def config_label(config):
+    return ", ".join(f"{k}={v if isinstance(v, str) else json.dumps(v)}" for k, v in config.items()) or "default"
+
+
 MODEL = option("--model")
 TIMEOUT = float(option("--timeout", "300"))
+CONFIG = config_overrides()
 
 PROMPT = """Use only the tools of the MCP server named "{server}" (Second Cursor: it operates Mac apps in the \
 background). Do not use the shell, AppleScript, files, a browser, or any other MCP server.
@@ -116,9 +138,9 @@ def timing(events, elapsed):
             end = stop
     loop_ms = final.get("duration_ms") or 0
     return {
-        "model": init.get("model"), "requested_model": MODEL, "loop_s": round(loop_ms / 1000, 1),
+        "model": init.get("model"), "requested_model": MODEL, "config": CONFIG, "loop_s": round(loop_ms / 1000, 1),
         "model_s": round((loop_ms - tool_ms) / 1000, 1), "tool_s": round(tool_ms / 1000, 1),
-        "tool_calls": len(names), "used_batch": "batch" in names, "calls": names,
+        "tool_calls": len(names), "used_batch": bool({"batch", "act"} & set(names)), "calls": names,
         "process_s": round(elapsed, 1), "usage": final.get("usage"),
     }
 
@@ -186,7 +208,7 @@ def agent_calculator_to_textedit(ctx):
     split = timing(events, elapsed)
     (out_dir / "timing.json").write_text(json.dumps(split, indent=2) + "\n")
     ctx.run.notes.append(
-        f"{split['model']}: agent loop {split['loop_s']}s = model {split['model_s']}s + tools {split['tool_s']}s, "
+        f"{split['model']} (config: {config_label(CONFIG)}): agent loop {split['loop_s']}s = model {split['model_s']}s + tools {split['tool_s']}s, "
         f"{split['tool_calls']} tool calls, batch {'used' if split['used_batch'] else 'not used'} "
         f"({split['process_s']}s including CLI startup)")
 
@@ -214,6 +236,7 @@ def plan():
     print(__doc__.strip())
     print("\nWould run, in a temp project with only a project-level .cursor/mcp.json for the test instance:")
     print("  " + " ".join(agent_command("<temp project>", "<prompt>")))
+    print(f"\nTest instance config: {json.dumps(instance_config())}")
     print(f"\nPrompt ({SERVER}, window ids filled in at run time):\n")
     print(PROMPT.format(server=SERVER, calc="<calculator window>", text="<textedit window>"))
     print("\nThis spends model usage. Re-run with --run to execute.")
@@ -227,12 +250,18 @@ def median(values):
     return values[len(values) // 2] if values else "?"
 
 
+def instance_config():
+    """A model may reach for gated tools; the instance must grant or refuse without ever showing a dialog."""
+    return {"approvals": "allow", "appApproval": "off", **CONFIG}
+
+
 def compare(rows):
-    lines = ["| Model | Run | Result | Loop | Model time | Tool time | Tool calls | Batch |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines = ["| Model | Config | Run | Result | Loop | Model time | Tool time | Tool calls | Batch |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for row in rows:
         t = row["timing"] or {}
-        lines.append(f"| {row['model'] or 'default'} | {row['dir']} | {'PASS' if row['passed'] else 'FAIL'} | "
+        lines.append(f"| {row['model'] or 'default'} | {config_label(row['config'])} | {row['dir']} | "
+                     f"{'PASS' if row['passed'] else 'FAIL'} | "
                      f"{seconds(t.get('loop_s'))} | {seconds(t.get('model_s'))} | {seconds(t.get('tool_s'))} | "
                      f"{t.get('tool_calls', '?')} | {'yes' if t.get('used_batch') else 'no'} |")
     lines += ["", "| Model | Passed | Median loop | Median tool calls |", "| --- | --- | --- | --- |"]
@@ -255,14 +284,13 @@ if __name__ == "__main__":
     for model in models:
         for _ in range(repeat):
             MODEL = model
-            # A model may reach for gated tools; the instance must grant or refuse without ever showing a dialog.
-            smoke = run.Run(config_overrides={"approvals": "allow", "appApproval": "off"}, browser=False)
+            smoke = run.Run(config_overrides=instance_config(), browser=False)
             renamed = smoke.dir.with_name(f"agent-{smoke.dir.name}")
             smoke.dir.rename(renamed)
             smoke.dir = renamed
             passed = smoke.run(set())
             split = smoke.dir / "agent/timing.json"
-            rows.append({"model": model, "dir": smoke.dir.name, "passed": passed,
+            rows.append({"model": model, "config": CONFIG, "dir": smoke.dir.name, "passed": passed,
                          "timing": json.loads(split.read_text()) if split.exists() else None})
     if len(rows) > 1:
         summary = run.ROOT / "artifacts" / f"agent-compare-{time.strftime('%Y%m%d-%H%M%S')}.md"

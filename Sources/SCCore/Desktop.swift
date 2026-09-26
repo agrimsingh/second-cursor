@@ -16,6 +16,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         /// The element limit of the last read, kept so later reads and diffs cut the outline at the same place.
         var maxElements: Int?
         var elements: [Int: SnapshotElement] = [:]
+        /// Every element the last full read walked, including those its outline cut off, and the window origin
+        /// their frames are relative to. `findElements` searches them.
+        var nodes: [TreeNode]?
+        var origin: CGPoint = .zero
 
         init(pid: pid_t) { self.pid = pid }
     }
@@ -572,6 +576,14 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         tree.lines = out.lines
         tree.keys = out.keys
         tree.elements = out.elements
+        tree.nodes = builder.nodes
+        tree.origin = frame.origin
+        // findElements hands out indexes for elements past the outline's cut; they keep working while the element exists.
+        for node in builder.nodes where node.indexed {
+            if let index = tree.table.existingIndex(forKey: node.key), tree.elements[index] == nil {
+                tree.elements[index] = SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key)
+            }
+        }
         var result = WindowSnapshot(
             window: windowInfo(record, window: window), snapshotID: id, tree: diff ?? out.text,
             elementCount: out.indexedCount, truncated: out.truncated || builder.truncated,
@@ -607,6 +619,62 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let node = nodes[match]
         return (SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key),
                 "\"\(TreeBuilder.escape(node.label, limit: 120))\"")
+    }
+
+    /// Runs on the app queue because it may index elements the outline left out, which makes them actionable.
+    public func findElements(windowID: UInt32, text: String?, role: String?, limit: Int) async throws -> ElementSearch {
+        try await run(windowID: windowID) {
+            let record = try self.record(windowID)
+            var readWindow = false
+            if self.storedTree(for: windowID).map({ $0.pid != record.pid || $0.nodes == nil }) ?? true {
+                if self.needsSettle(windowID) { self.settleNow(windowID) }
+                _ = try self.snapshot(windowID, options: SnapshotOptions(includeScreenshot: false, full: false))
+                readWindow = true
+            }
+            let tree = self.tree(for: windowID, pid: record.pid)
+            guard let nodes = tree.nodes, let snapshotID = tree.snapshotID else { throw SCError.staleSnapshot(windowID) }
+            let ranked = Self.rank(nodes, text: text, role: role)
+            let matches = ranked.prefix(max(limit, 1)).map { nodes[$0] }
+            // Rendering only the matches numbers them from the window's table, exactly as the outline would.
+            let out = TreeRenderer.full(title: "", size: .zero, windowOrigin: tree.origin, nodes: matches,
+                                        table: tree.table, maxElements: .max)
+            tree.elements.merge(out.elements) { current, _ in current }
+            let needle = text?.lowercased()
+            let lines = zip(matches, out.lines.dropFirst()).map { node, line -> String in
+                var line = String(line.drop { $0 == " " })
+                if let needle, let description = node.description, description != node.label,
+                   description.lowercased().contains(needle) {
+                    line += " description=\"\(TreeBuilder.escape(description, limit: 120))\""
+                }
+                return line
+            }
+            return ElementSearch(lines: lines, total: ranked.count, snapshotID: snapshotID, readWindow: readWindow)
+        }
+    }
+
+    /// Positions of the nodes that match, best first: `text` equal to a label, value or description (ignoring case
+    /// and surrounding whitespace), then a prefix of one, then inside one; within a tier, indexed elements come
+    /// first, then outline order.
+    private static func rank(_ nodes: [TreeNode], text: String?, role: String?) -> [Int] {
+        let needle = text?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let wanted = role.map { $0.lowercased().hasPrefix("ax") ? $0.lowercased() : "ax" + $0.lowercased() }
+        var scored: [(tier: Int, unindexed: Int, position: Int)] = []
+        for (position, node) in nodes.enumerated() {
+            if let wanted, node.role.lowercased() != wanted { continue }
+            var tier = 0
+            if let needle, !needle.isEmpty {
+                let tiers = [node.label, node.value, node.description].compactMap { field -> Int? in
+                    guard let field = field?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return nil }
+                    if field == needle { return 0 }
+                    if field.hasPrefix(needle) { return 1 }
+                    return field.contains(needle) ? 2 : nil
+                }
+                guard let best = tiers.min() else { continue }
+                tier = best
+            }
+            scored.append((tier, node.indexed ? 0 : 1, position))
+        }
+        return scored.sorted { ($0.tier, $0.unindexed, $0.position) < ($1.tier, $1.unindexed, $1.position) }.map(\.position)
     }
 
     private func element(_ wid: CGWindowID, _ index: Int) throws -> (CGWindowRecord, SnapshotElement) {

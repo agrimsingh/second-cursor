@@ -16,6 +16,8 @@ struct TreeNode {
     let role: String
     let label: String
     let value: String?
+    /// AXDescription, which `label` only shows when the element has no title.
+    let description: String?
     let frame: CGRect?
     let indexed: Bool
     let element: AXUIElement
@@ -164,7 +166,8 @@ struct TreeBuilder {
             if indexed, let position = AX.point(values[6]), let size = AX.size(values[7]) {
                 frame = CGRect(origin: position, size: size)
             }
-            nodes.append(TreeNode(indent: indent, role: role, label: label, value: value, frame: frame,
+            nodes.append(TreeNode(indent: indent, role: role, label: label, value: value,
+                                  description: values[2] as? String, frame: frame,
                                   indexed: indexed, element: element, inWebArea: inWebArea, key: key, actions: actions, states: states))
             childIndent += 1
         }
@@ -221,6 +224,8 @@ final class IndexTable {
         byKey[key] = index
         return index
     }
+
+    func existingIndex(forKey key: String) -> Int? { byKey[key] }
 
     /// Drops keys no longer present so the numbering does not grow without bound over a long session.
     func retain(keys: Set<String>) {

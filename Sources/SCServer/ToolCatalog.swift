@@ -15,6 +15,7 @@ enum ToolCatalog {
         "inspect_element", "paste", "select_text", "get_window_state", "batch", "click", "drag", "type_text",
         "set_value", "press_key", "scroll", "perform_action",
         "screenshot", "move_to_agent_display", "return_window",
+        "find_elements",
     ]
 
     /// Native actions that return an observation of their window (see `observe`).
@@ -28,7 +29,28 @@ enum ToolCatalog {
         "browser_command",
     ])
 
-    static let tools: [Tool] =
+    /// Every callable tool. `act` is `batch` under another name and description, sharing its schema so that
+    /// batch's parameters, present and future, reach it; the router runs it as batch.
+    static let tools: [Tool] = catalog.flatMap { tool in
+        guard tool.name == "batch" else { return [tool] }
+        return [tool, Tool(name: "act", description: actDescription, inputSchema: tool.inputSchema, annotations: tool.annotations)]
+    }
+
+    /// Hidden from tools/list by `toolSurface: "compact"`; they stay callable.
+    static let compactHiddenTools: Set<String> = [
+        "click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "batch",
+    ]
+
+    /// What tools/list shows: the single-action tools and batch, or ("compact") act in their place.
+    static func advertised(surface: String?) -> [Tool] {
+        let hidden = surface == "compact" ? compactHiddenTools : ["act"]
+        return tools.filter { !hidden.contains($0.name) }
+    }
+
+    private static let actDescription =
+        "Act on one window: run a list of steps strictly in order, then get one observation after the UI settles. This is the way to act, with one step or many: put every step you already know in one call (pressing a known series of buttons, filling known fields, typing followed by a shortcut), and end the list before any step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet); then look at the observation and send the next list. Each step is a tool name (click, type_text, press_key, set_value, scroll, drag, perform_action, wait) plus that action's arguments. Element indexes come from get_window_state or find_elements and are not refreshed between steps. Pixel steps (x/y) take coordinate_space and stop the list if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the list stops at the first failure. The observation is a diff like get_window_state unless full=true."
+
+    private static let catalog: [Tool] =
         ([
             Tool(
                 name: "status",
@@ -92,6 +114,18 @@ enum ToolCatalog {
                             "Also return an elements JSON array on full and scoped reads, for code consumers.",
                             default: false),
                     ]),
+                annotations: .init(readOnlyHint: true)
+            ),
+            Tool(
+                name: "find_elements",
+                description:
+                    "Search the window's latest observation for elements by text and/or role, instead of reading a big window's whole outline. Text matches each element's label, value and description, ignoring case: exact matches first, then prefixes, then substrings. The search covers every element of that observation, including ones a truncated outline (max_elements) left out. Returns matching outline lines with [index] and frames, like get_window_state's; use the indexes with act or the other actions. It does not read the app again: it sees the UI as of the latest get_window_state or action observation of this window (observation_id). After the UI changed without an observation (observe=none, or time passing), call get_window_state first. A window this session has not observed yet is read once, and that read becomes its observation.",
+                inputSchema: schema([
+                    "window_id": windowID,
+                    "text": string("Text to look for in labels, values and descriptions."),
+                    "role": string("Accessibility role, such as AXButton or button."),
+                    "limit": integer("Most matches to return, 1-100.", default: 20),
+                ]),
                 annotations: .init(readOnlyHint: true)
             ),
             Tool(
@@ -370,7 +404,7 @@ enum ToolCatalog {
                         props["observation_id"] = string("Reject a superseded observation.")
                     }
                 }
-                if action || ["get_window_state", "browser_snapshot", "inspect_element"].contains(tool.name) {
+                if action || ["get_window_state", "browser_snapshot", "inspect_element", "find_elements"].contains(tool.name) {
                     props["timeout_ms"] = integer("Call deadline, including approval and queue time; max 60000.")
                 }
                 schema["properties"] = .object(props)

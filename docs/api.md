@@ -52,6 +52,14 @@ Action tools take an optional `caption`: a few words shown in a pill beside the 
 
 `POST /turn-ended` (same token and origin checks as `/api`, optional body `{"session_id": "…"}`, default `legacy`) resets that session's diff baselines so the next read is full, clears its session app approvals, and releases personal tabs it claimed. Agent-created tabs stay open and the session stays open. It returns `{ok, session_id, released_tabs, cleared_app_approvals}`. `SecondCursor --turn-ended` calls it, always exits 0, and ignores stdin, so it can run as an agent-stop hook; `scripts/cursor-hooks.json` is a Cursor sample and `install-mcp --client cursor --with-hook` merges it.
 
+## Finding elements
+
+`find_elements` searches the session's latest observation of a window instead of reading the window again: `{window_id | app, text?, role?, limit?}`, with at least one of `text` and `role`. `text` matches each element's label, value and description, ignoring case: exact matches rank first, then prefixes, then substrings; within a rank, indexed elements come before plain text, then outline order. `role` is an AX role with or without the `AX` prefix (`AXButton`, `button`). The search covers every element the latest read walked (up to 2500, or three times `max_elements`), including elements a truncated outline left out; those get indexes like any other and stay actionable while they exist. The result is `{matches, total, observation_id, window_id}`: up to `limit` (default 20, 1–100) outline lines with `[index]` and frames, the number of matches before the limit, and the read that was searched. `hint` asks to refine the query when `total` exceeds the limit, or to read again when nothing matched. An action's observation counts as a read, so a search after an action sees its result; after a change without one (`observe: "none"`, another client, time passing), call `get_window_state` first. A window the session has not observed yet is read once (`read_window: true`), and that read becomes the session's observation and the baseline of its next diff. By `app`, it searches the app window the session observed last, or the app's main window when there is none. It is a read: the same gates as `get_window_state`, and nothing is logged.
+
+## act and the compact tool surface
+
+`act` is `batch` under another name: the same schema, arguments, results, errors and action log lines (logged as `batch`). Its description presents it as the way to act, with one step or many. `toolSurface` in the config chooses what `tools/list` advertises on `/mcp` and `/api`: `"full"` (the default) lists every tool except `act`; `"compact"` lists `act` and `find_elements` and hides `click`, `type_text`, `press_key`, `set_value`, `scroll`, `drag`, `perform_action` and `batch`. Every tool stays callable either way, so existing clients and the SDK keep working. The value is read at startup; anything other than `"compact"` counts as `"full"`. `python3 e2e/agent_smoke.py --run --config toolSurface=compact` measures a model on the compact surface.
+
 ## Native editing
 
 - `select_text`: element index, exact text, optional prefix/suffix, and selection_type `text`, `cursor_before`, or `cursor_after`. Ambiguous matches fail.
@@ -122,6 +130,7 @@ python3 e2e/setup.py      # stdio proxy, doctor, turn end, install-mcp
 python3 e2e/focus.py      # focus safety; puts a probe window in front and takes focus while it runs
 python3 e2e/cursor.py     # arrow and menu-bar presence; also takes over the screen while it runs
 python3 e2e/latency.py    # per-call timings, written to latency.json
+python3 e2e/find.py       # find_elements, act, the compact tool surface
 python3 e2e/agent_smoke.py --run   # a real Cursor agent drives the tools (costs model usage)
 ```
 

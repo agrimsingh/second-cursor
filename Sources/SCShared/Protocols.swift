@@ -46,6 +46,11 @@ public protocol DesktopControlling: AnyObject, Sendable {
     /// `newInstance` starts a separate process so the agent never shares a window with the user.
     func launchApp(_ query: String, urls: [URL], newInstance: Bool) async throws -> AppInfo
     func windowState(windowID: UInt32, options: SnapshotOptions) async throws -> WindowSnapshot
+    /// Searches the session's latest full read of the window, including elements its outline left out, without
+    /// reading the app again; a window the session has not read yet is read once first. `text` matches labels,
+    /// values and descriptions case-insensitively (exact, then prefix, then substring); `role` is an AX role
+    /// with or without the "AX" prefix. At least one of them is set.
+    func findElements(windowID: UInt32, text: String?, role: String?, limit: Int) async throws -> ElementSearch
     /// `modifiers` are held during the click, e.g. ["shift"] or ["cmd"].
     func click(windowID: UInt32, target: ClickTarget, button: MouseButton, count: Int, modifiers: [String]) async throws -> ActionResult
     /// Press at `from`, move to `to`, release; window-local points.

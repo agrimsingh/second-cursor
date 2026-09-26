@@ -139,6 +139,24 @@ public struct WindowSnapshot: Sendable, Equatable {
     }
 }
 
+/// Elements of a window's latest full read that matched a search, best first, as outline lines.
+public struct ElementSearch: Sendable, Equatable {
+    public var lines: [String]
+    /// Matches before `limit` was applied.
+    public var total: Int
+    /// The read that was searched.
+    public var snapshotID: String
+    /// True when this session had not read the window yet, so the search read it first.
+    public var readWindow: Bool
+
+    public init(lines: [String], total: Int, snapshotID: String, readWindow: Bool) {
+        self.lines = lines
+        self.total = total
+        self.snapshotID = snapshotID
+        self.readWindow = readWindow
+    }
+}
+
 public struct Point: Codable, Sendable, Equatable {
     public var x: Double
     public var y: Double

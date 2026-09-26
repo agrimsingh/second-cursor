@@ -27,6 +27,11 @@ extension ToolRouter {
         if Self.observedWindowTools.contains(name) || (name == "get_window_state" && indexScoped) {
             let session = try args.optionalString("session_id") ?? "legacy"
             resolved["window_id"] = .int(Int(try observedWindow(app, session: session)))
+        } else if name == "find_elements",
+            let pinned = try? observedWindow(app, session: try args.optionalString("session_id") ?? "legacy")
+        {
+            // A search runs on what the session saw; an app it has not seen is read afresh like get_window_state.
+            resolved["window_id"] = .int(Int(pinned))
         } else {
             resolved["window_id"] = .int(Int(try await desktop.appWindow(app)))
         }
@@ -57,7 +62,8 @@ extension ToolRouter {
     /// Remembers the window a read, or an action's observation, showed the session.
     func noteObservation(_ name: String, _ args: Arguments, owner: WindowOwner?, output: ToolOutput, session: String) {
         guard let owner, ToolCatalog.windowScopedTools.contains(name),
-            name == "get_window_state" || name == "screenshot" || output.json["observation"] is [String: Any],
+            name == "get_window_state" || name == "screenshot" || name == "find_elements"
+                || output.json["observation"] is [String: Any],
             let windowID = try? args.windowID()
         else { return }
         noteObserved(windowID, owner: owner, session: session)
@@ -116,6 +122,28 @@ extension ToolRouter {
             return ToolOutput(
                 json: await snapshotJSON(snapshot, structured: structured),
                 images: snapshot.screenshot.map { [$0] } ?? [])
+
+        case "find_elements":
+            let text = try args.optionalString("text")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let role = try args.optionalString("role")?.trimmingCharacters(in: .whitespaces)
+            guard !(text ?? "").isEmpty || !(role ?? "").isEmpty else {
+                throw SCError.invalidArgument("Pass text, role, or both")
+            }
+            let limit = min(max(try args.int("limit", default: 20), 1), 100)
+            let windowID = try args.windowID()
+            let found = try await desktop.findElements(
+                windowID: windowID, text: text?.isEmpty == false ? text : nil,
+                role: role?.isEmpty == false ? role : nil, limit: limit)
+            var json: [String: Any] = [
+                "matches": found.lines, "total": found.total, "observation_id": found.snapshotID, "window_id": windowID,
+            ]
+            if found.readWindow { json["read_window"] = true }
+            if found.total > limit {
+                json["hint"] = "Showing \(limit) of \(found.total) matches; refine the query (longer text, or a role)"
+            } else if found.total == 0 {
+                json["hint"] = "No element of observation \(found.snapshotID) matches; if the UI changed since, call get_window_state and search again"
+            }
+            return ToolOutput(json: json)
 
         case "click":
             guard let target = try Self.inWindowPoints(args.clickTarget(), args, windowID: args.windowID()) else {

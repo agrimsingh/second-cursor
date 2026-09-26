@@ -37,7 +37,10 @@ final class ToolRouter: Sendable {
             retentionSeconds: config.operationRetentionSeconds ?? 3600)
     }
 
-    func call(name: String, arguments: [String: Value]) async -> CallTool.Result {
+    func call(name called: String, arguments: [String: Value]) async -> CallTool.Result {
+        // act is batch for clients that see the compact tool surface; one code path keeps their gates, logging and
+        // parameters identical.
+        let name = called == "act" ? "batch" : called
         let receivedAt = Date()
         // The compact tool schema nests operation-specific fields. Keep flat 0.2 callers compatible.
         var raw = arguments

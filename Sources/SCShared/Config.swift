@@ -45,6 +45,9 @@ public struct SCConfig: Codable, Sendable {
     /// How every local approval is answered: "prompt" (nil) asks the user; "deny" refuses without UI; "allow" grants
     /// without UI, honored only when `SC_HOME` is set (disposable test instances), otherwise treated as "prompt".
     public var approvals: String?
+    /// Which tools tools/list advertises: "full" (nil) or "compact", which lists `act` instead of `batch` and the
+    /// single-action tools. Every tool stays callable either way.
+    public var toolSurface: String?
 
     public init(port: Int, token: String, blockedBundleIDs: [String], confirmationRequiredTools: [String]) {
         self.port = port
