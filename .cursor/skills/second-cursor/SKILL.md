@@ -27,6 +27,10 @@ To find one element in a big window (a button, field or row), call `find_element
 
 Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`.
 
+When a task is about a list in a browser tab (search results, a feed, a table), take what you need from the list itself. Result cards usually show the name, price, rating and delivery time. Open an item's own page only when the list lacks a fact the task asks for: each page load costs seconds, and opening every result can double the task's time.
+
+If you hand UI work to a subagent and choose its model, medium reasoning effort is usually enough. In browser tests it matched extra-high effort's accuracy and ran up to twice as fast.
+
 When you can see text the outline lacks (custom-drawn apps such as DAWs, canvases, games), read with `ocr: true` instead of guessing from a screenshot: it adds `ocr="…"` to element lines and `text "…" (x,y wxh)` lines, which you click with x/y at their center.
 
 ## Code-first for multi-step flows

@@ -86,6 +86,10 @@ At the end of each agent turn, `SecondCursor --turn-ended` tells the app the tur
 
 `.cursor/skills/second-cursor/SKILL.md` tells an agent when to use Second Cursor and how to work with it. It covers the observe-then-act loop, and writing a short Node script with `sdk/index.mjs` instead of dozens of tool calls when a flow branches. It also sets the safety rules: ask before sending, deleting or purchasing, and never read password managers. Copy it into another project's `.cursor/skills/`, or into your personal skills, to use it outside this repo.
 
+### Choose a model
+
+Second Cursor runs no model of its own. Whatever client you connect brings one, so pick it in that client. For UI work, medium reasoning effort is usually enough. In real-agent runs on three browser tasks, Grok 4.7 at medium effort was as accurate as at extra-high effort every time. It finished a product search twice as fast, but saved little on long multi-step tasks, where it took more steps.
+
 ## Tools
 
 | Area | Tools |
