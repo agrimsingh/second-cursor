@@ -127,7 +127,7 @@ python3 e2e/find.py           # find_elements, act, the compact tool surface
 python3 e2e/focus.py --takeover   # focus safety; takes focus and covers the screen, so run it while you are away
 ```
 
-Apart from `focus.py --takeover` and `setup.py --ui`, the suites put their windows on the agent display, so they run from whatever Space you are on without covering your screen or taking focus.
+Apart from `focus.py --takeover`, `setup.py --ui` and `run.py --on-screen`, the suites put their windows on the agent display, so they run from whatever Space you are on without covering your screen or taking focus.
 
 `SC_E2E_APP=build/SecondCursor.app` tests another bundle, and `--installed` targets your running app instead (opt-in). `python3 e2e/setup.py` runs `install-mcp` against a temporary `HOME` and checks that your real client configs are unchanged.
 

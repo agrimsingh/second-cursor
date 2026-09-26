@@ -6,13 +6,15 @@ pair, but a bare custom surface (a canvas, a DAW panel, a game view: nothing acc
 copy, so a toggle flips back. The fixture (sc-focus-probe --clicks) opens on the agent display, so this suite never
 depends on the Space the user is viewing and never shows on their screen.
 
-Ways this can fail, each covered by click_delivery:
+Ways this can fail, covered by click_delivery and scroll_delivery:
 - A custom view that accepts the first click into an inactive window gets two mouse-downs per click.
 - A plain custom view (the AppKit default, which does not accept the first click) gets two, or none.
 - A standard button is pressed twice, or not at all.
 - A text view's caret does not move to the click point (the channel it needs was dropped).
 - A double-click reaches a custom view as more or fewer than two presses.
 - A drag on a custom surface starts twice.
+- A scroll step reaches a custom view or a standard scroll view as two wheel events (or none), so content moves
+  twice as far as asked; or the standard scroll view does not move.
 
 Usage:  e2e/clicks.py [scenario ...]   (same targeting flags as e2e/run.py, e.g. SC_E2E_APP=build/SecondCursor.app)
 Output: e2e/artifacts/<run-id>/ (report.md, results.json, transcript.jsonl)
@@ -102,6 +104,18 @@ def click_delivery(ctx):
     ctx.call("drag", window_id=fx.wid, from_x=x - 40, from_y=y, to_x=x + 40, to_y=y, observe="none")
     got = fx.settled("first_mouse", before, 1)
     ctx.check("a drag on the custom view started exactly once", got == 1, got)
+
+
+@scenario
+def scroll_delivery(ctx):
+    fx = ClickFixture(ctx)
+    for target in ("plain", "list"):
+        before = fx.read()[f"{target}_wheel"]
+        x, y = fx.center(target)
+        ctx.call("scroll", window_id=fx.wid, x=x, y=y, direction="down", amount=2, observe="none")
+        got = fx.settled(f"{target}_wheel", before, 2)
+        ctx.check(f"{target}: two scroll steps arrived as exactly two wheel events", got == 2, got)
+    ctx.check("the standard scroll view moved its content", fx.read()["list_offset"] > 0, fx.read()["list_offset"])
 
 
 if __name__ == "__main__":

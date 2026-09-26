@@ -13,6 +13,8 @@ Usage:  e2e/run.py [scenario ...] [--installed] [--browser | --no-browser]
                        uses browser tools); --no-browser never starts it
         --approvals    human-attended only: the test instance uses "approvals": "prompt" and may show real
                        approval dialogs (default "allow"; scenarios may override to "deny")
+        --on-screen    also run the checks that need a window on the user's screen (a launch that leaves the
+                       window where the app puts it, return_window); by default every window stays on the agent display
         SC_E2E_APP=build/SecondCursor.app   launch test instances from another bundle
 Output: e2e/artifacts/<run-id>/report.md, results.json, transcript.jsonl, screenshots/, instance/ (app logs)
 """
@@ -56,6 +58,7 @@ DEFAULT_BLOCKED_BUNDLE_IDS = [
     "com.apple.systempreferences", "com.apple.preference.security",
 ]
 PROTOCOL_VERSION = "2025-06-18"
+ON_SCREEN = "--on-screen" in sys.argv
 
 EXPECTED_TOOLS = {
     "status", "list_apps", "list_windows", "launch_app", "get_window_state", "batch", "click", "drag", "type_text",
@@ -529,10 +532,11 @@ def blocked_apps(ctx):
 
 @scenario
 def textedit_background(ctx):
-    window = ctx.launch_scratch_textedit("notes.txt", "alpha", on_agent_display=False)
-    ctx.check("new window stays where the app put it", not window.get("on_agent_display"), window)
-    if not window["is_on_screen"]:
-        # The app put it on a Space the user is not viewing; the editing checks run where every Space can reach them.
+    if ON_SCREEN:
+        window = ctx.launch_scratch_textedit("notes.txt", "alpha", on_agent_display=False)
+        ctx.check("new window stays where the app put it", not window.get("on_agent_display"), window)
+    if not ON_SCREEN or not window["is_on_screen"]:
+        # The editing checks run where every Space can reach them and the user never sees them.
         window = ctx.launch_scratch_textedit("notes-hosted.txt", "alpha")
     wid = window["id"]
 
@@ -1363,6 +1367,8 @@ def batch_layout_guard(ctx):
 
 @scenario
 def agent_display_optional(ctx):
+    if not ON_SCREEN:
+        raise Skip("moves a window on and off the user's screen; run with --on-screen to include it")
     display = ctx.call("agent_display", action="create")
     ctx.require("agent display is active", display["is_active"] and display.get("bounds"), display)
     window = ctx.launch_scratch_textedit("hosted.txt", "hosted", on_agent_display=False)
