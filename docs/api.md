@@ -24,6 +24,10 @@ Window tools take `window_id` or `app` (name or bundle id). For reads and screen
 
 Pass `observation_id` when acting on a previous observation; a superseded one is rejected. Pixel actions also stop when the window changed size since it was last observed. Read `get_window_state` at the start of each turn before acting.
 
+## Text recognition
+
+`get_window_state` with `ocr: true` also reads the text drawn in the window, for apps that draw text accessibility does not expose (DAWs, games, canvases). Recognition runs on device with Apple's Vision framework, on a full-resolution capture of the window rather than the 1024 px screenshot. Recognized text that repeats the label, value or title of an element it overlaps is left out, even with a stray glyph attached, such as the chevron beside a document title. Text inside an indexed element goes on that element's line as `ocr="…"` (several joined with ` | `). Other text becomes a line without an index under the deepest container holding it, such as `text "Export" (412,88 40x14)`, framed in window points; it is not an accessibility element, so click it with x/y at its center. Results add `ocr_ms` (capture and recognition) and `ocr_count` (texts merged); if recognition fails, the outline still comes back, with `ocr_error`. With `scope`, only text inside that element is kept. Recognized text only takes part in diffs between `ocr` reads: a read without `ocr` compares plain outlines, so it never reports recognized lines as removed, and an `ocr` read compares against the previous outline with the last recognized text merged in. On an M2 Pro a read with `ocr` costs about 0.2 s for a small window and 0.3–0.6 s for a 1300×850 pt one. The first recognition on a Mac, and again after an OS update, waits while Vision compiles its model for the Neural Engine, which takes a minute or more; such a read gives up on text after 15 s and returns `ocr_error`, and the compile finishes in the background while the app keeps running.
+
 ## Sessions, ownership, and retries
 
 Pass `session_id` on subsequent tools. Omitting it uses the shared compatibility session `legacy`; independent hosts should create their own. Native reads are permitted across sessions. Explicit-session actions hold an idle lease on the window; legacy actions respect existing leases but never take one. Leases expire after five idle minutes (`claimIdleSeconds`), and in-flight actions keep theirs. `bind_target` claims or releases `window:<id>`. Closing a session cancels queued work, releases targets and approvals, closes temporary agent-created tabs, and releases claimed personal tabs without closing them.
@@ -122,6 +126,7 @@ python3 e2e/setup.py      # stdio proxy, doctor, turn end, install-mcp
 python3 e2e/focus.py      # focus safety; puts a probe window in front and takes focus while it runs
 python3 e2e/cursor.py     # arrow and menu-bar presence; also takes over the screen while it runs
 python3 e2e/latency.py    # per-call timings, written to latency.json
+python3 e2e/ocr.py        # text recognition; a small custom-drawn fixture window on the agent display, timings in ocr-timings.json
 python3 e2e/agent_smoke.py --run   # a real Cursor agent drives the tools (costs model usage)
 ```
 

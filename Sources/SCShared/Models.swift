@@ -94,15 +94,18 @@ public struct SnapshotOptions: Sendable, Equatable {
     public var scope: Int?
     /// Like `scope`, naming the container by its label (exact match first, then case-insensitive).
     public var scopeLabel: String?
+    /// Recognizes the text on the window's pixels and merges what accessibility does not already show.
+    public var ocr: Bool
 
     public init(includeScreenshot: Bool = true, includeMenuBar: Bool = false, maxElements: Int? = nil,
-                full: Bool = true, scope: Int? = nil, scopeLabel: String? = nil) {
+                full: Bool = true, scope: Int? = nil, scopeLabel: String? = nil, ocr: Bool = false) {
         self.includeScreenshot = includeScreenshot
         self.includeMenuBar = includeMenuBar
         self.maxElements = maxElements
         self.full = full
         self.scope = scope
         self.scopeLabel = scopeLabel
+        self.ocr = ocr
     }
 }
 
@@ -124,6 +127,10 @@ public struct WindowSnapshot: Sendable, Equatable {
     /// Set instead of `screenshot` when the capture failed; the tree is still valid.
     public var screenshotError: String?
     public var elements: [ElementInfo] = []
+    /// For `ocr` reads: capture plus recognition time, how many recognized texts were merged, or why it failed.
+    public var ocrMS: Int?
+    public var ocrCount: Int?
+    public var ocrError: String?
 
     public init(window: WindowInfo, snapshotID: String, tree: String, elementCount: Int, truncated: Bool,
                 isDiff: Bool = false, diffBase: String? = nil, scope: Int? = nil, screenshot: Screenshot? = nil) {
