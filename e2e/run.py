@@ -1479,6 +1479,19 @@ def browser(ctx):
         outline = ctx.call("browser_snapshot", tab_id=tid)["outline"]
         ctx.check("typing + submit reached the page", "Hello, second cursor" in outline, outline[:500])
 
+        # Models write batch steps in the compact schema's shape, with each step's fields under arguments.
+        ctx.call("browser_command", tab_id=tid, operation="batch", steps=[
+            {"operation": "fill", "arguments": {"locator": {"label": "Name"}, "text": "nested"}},
+            {"operation": "click", "arguments": json.dumps({"locator": {"role": "button", "name": "Submit"}})},
+        ])
+        outline = ctx.call("browser_snapshot", tab_id=tid)["outline"]
+        ctx.check("batch steps with their fields under arguments, as an object or a JSON string, both ran",
+                  "Hello, nested" in outline, outline[:500])
+        error = refused(ctx, "browser_command", tab_id=tid, operation="batch",
+                        steps=[{"operation": "click", "arguments": "[object Object]"}])
+        ctx.check("a batch step's unparseable arguments string is refused by step and name",
+                  error and "Batch step 1: arguments must be an object" in error, error)
+
         link = re.search(r'\[(\w+)\] link "Next page"', outline)
         ctx.require("snapshot exposes the link with a ref", link, outline[:500])
         ctx.call("browser_click", tab_id=tid, ref=link.group(1))

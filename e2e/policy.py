@@ -326,6 +326,18 @@ def browser_batch_refuses_sensitive_steps(ctx):
             logged,
         )
         ctx.check(f"no step of the {operation} batch ran", name_value() == "unchanged")
+    for label, step in [
+        ("fields under arguments", {"operation": "history", "arguments": {"from": 0}}),
+        ("operation under arguments", {"arguments": {"operation": "history", "from": 0}}),
+    ]:
+        error = refused(lambda: command(operation="batch", steps=[
+            {"operation": "fill", "locator": {"label": "Name"}, "text": "nested"}, step]))
+        ctx.check(f"a history step with its {label} is refused the same way",
+                  error is not None and "call history on its own" in error, error)
+        ctx.check(f"no step of that batch ran ({label})", name_value() == "unchanged")
+    command(operation="batch", steps=[
+        {"operation": "fill", "arguments": {"operation": "history", "locator": {"label": "Name"}, "text": "kept"}}])
+    ctx.check("a step's own operation wins over one nested under arguments", name_value() == "kept")
     ctx.check("no dialog was shown", not observe()["second_cursor_windows"])
     command(operation="batch", steps=[{"operation": "fill", "locator": {"label": "Name"}, "text": "batched"}])
     ctx.check("a batch without sensitive steps still runs", name_value() == "batched")

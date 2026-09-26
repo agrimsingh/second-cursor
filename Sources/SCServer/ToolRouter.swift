@@ -42,24 +42,20 @@ final class ToolRouter: Sendable {
         // parameters identical.
         let name = called == "act" ? "batch" : called
         let receivedAt = Date()
-        // The compact tool schema nests operation-specific fields. Keep flat 0.2 callers compatible.
         var raw = arguments
-        var malformedArguments = false
-        if name == "browser_command", let nested = raw.removeValue(forKey: "arguments"), !nested.isNull {
-            if let object = Arguments.nestedObject(nested) {
-                raw.merge(object) { envelope, _ in envelope }
-            } else {
-                malformedArguments = true
+        var malformedArguments: Error?
+        if name == "browser_command" {
+            do {
+                raw = try Self.flatBrowserCommand(raw)
+            } catch {
+                malformedArguments = error
             }
         }
         // A retry is identified by what the client sent, not by the window an app name resolved to.
         let requested = raw
         do {
             guard Self.toolNames.contains(name) else { throw SCError.invalidArgument("Unknown tool: \(name)") }
-            if malformedArguments {
-                throw SCError.invalidArgument(
-                    "arguments must be an object of the operation's fields; operation=capabilities lists them")
-            }
+            if let malformedArguments { throw malformedArguments }
             raw = try await resolveAppTarget(name, raw)
             let args = Arguments(raw)
             let session = try args.optionalString("session_id") ?? "legacy"
@@ -179,6 +175,30 @@ final class ToolRouter: Sendable {
         } catch {
             return Self.failure(error)
         }
+    }
+
+    private static let malformedNested =
+        "arguments must be an object of the operation's fields; operation=capabilities lists them"
+
+    /// The compact schema nests a browser_command's operation fields under `arguments`, and models write batch steps
+    /// the same way. Lifts them beside `operation`, in the call and in each step, before the browser policy reads
+    /// them; fields already beside `operation` win, so a nested `operation` or `method` cannot replace the real one.
+    private static func flatBrowserCommand(_ raw: [String: Value]) throws -> [String: Value] {
+        var flat = try lifted(raw, malformed: malformedNested)
+        if flat["operation"]?.stringValue == "batch", let steps = flat["steps"]?.arrayValue {
+            flat["steps"] = .array(try steps.enumerated().map { index, step in
+                guard let object = step.objectValue else { return step }
+                return .object(try lifted(object, malformed: "Batch step \(index + 1): \(malformedNested)"))
+            })
+        }
+        return flat
+    }
+
+    private static func lifted(_ object: [String: Value], malformed: String) throws -> [String: Value] {
+        var object = object
+        guard let nested = object.removeValue(forKey: "arguments"), !nested.isNull else { return object }
+        guard let fields = Arguments.nestedObject(nested) else { throw SCError.invalidArgument(malformed) }
+        return object.merging(fields) { envelope, _ in envelope }
     }
 
     private func bindTarget(_ args: Arguments, session: String, deadline: Date) async throws -> CallTool.Result {

@@ -106,7 +106,7 @@ Locators use one or more of `selector`, `role`/`name`, `label`, `text`, `placeho
 | assets | List observed resources; action:bundle and asset_ids return selected bodies |
 | clipboard | action read/write, text; asks first; the page origin must allow clipboard access |
 | cdp | Asks first; only Page.getLayoutMetrics, Page.getNavigationHistory, DOM.getDocument and Accessibility.getFullAXTree |
-| batch | Array of extended operation arguments; returns results and a final DOM observation |
+| batch | Array of extended operation arguments, each flat or nested under `arguments` like the call itself; returns results and a final DOM observation |
 
 A dialog-triggering action returns the observed dialog instead of waiting for the click to complete. File choosers are intercepted, so files can be assigned without moving the system cursor. Google Workspace exports need a signed-in document; YouTube transcripts need captions. These service-specific paths are not covered by the local fixture suites.
 

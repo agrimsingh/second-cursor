@@ -599,7 +599,7 @@ const OPERATION_ARGUMENTS = {
   screenshot: "optional full_page boolean or clip:{x,y,width,height}",
   cdp: "method from cdp_allowlist; optional params object. Local approval required.",
   batch:
-    "steps array of {operation,...arguments}. One tab, 1..50 steps, no nested batches. Executed by the native runtime.",
+    "steps array of {operation,...fields}, or {operation,arguments:{...fields}} like the call itself. One tab, 1..50 steps, no nested batches. Executed by the native runtime.",
   clipboard: "action read/write; text for write. Local approval required.",
 };
 
