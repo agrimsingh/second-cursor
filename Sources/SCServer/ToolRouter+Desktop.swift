@@ -21,9 +21,10 @@ extension ToolRouter {
         guard ToolCatalog.windowScopedTools.contains(name), raw["window_id"]?.isNull ?? true, !PauseState.isPaused,
             let app = try args.optionalString("app")?.trimmingCharacters(in: .whitespaces), !app.isEmpty
         else { return raw }
-        let scoped = try args.optionalInt("scope") != nil
+        // A label scope is looked up afresh like a plain read; an index scope refers to what the session saw.
+        let indexScoped = try args.scope().index != nil
         var resolved = raw
-        if Self.observedWindowTools.contains(name) || (name == "get_window_state" && scoped) {
+        if Self.observedWindowTools.contains(name) || (name == "get_window_state" && indexScoped) {
             let session = try args.optionalString("session_id") ?? "legacy"
             resolved["window_id"] = .int(Int(try observedWindow(app, session: session)))
         } else {
@@ -102,11 +103,14 @@ extension ToolRouter {
 
         case "get_window_state":
             let structured = try args.bool("structured", default: false)
+            let scope = try args.scope()
             let options = SnapshotOptions(
                 includeScreenshot: try args.bool("include_screenshot", default: false),
                 includeMenuBar: try args.bool("include_menu_bar", default: false),
+                maxElements: try args.optionalInt("max_elements").map { min(max($0, 50), 3000) },
                 full: try args.bool("full", default: false),
-                scope: try args.optionalInt("scope")
+                scope: scope.index,
+                scopeLabel: scope.label
             )
             let snapshot = try await desktop.windowState(windowID: try args.windowID(), options: options)
             return ToolOutput(
@@ -114,7 +118,7 @@ extension ToolRouter {
                 images: snapshot.screenshot.map { [$0] } ?? [])
 
         case "click":
-            guard let target = try args.clickTarget() else {
+            guard let target = try Self.inWindowPoints(args.clickTarget(), args, windowID: args.windowID()) else {
                 throw SCError.invalidArgument("Pass element_index, or both x and y")
             }
             let buttonName = try args.optionalString("button")?.lowercased() ?? "left"
@@ -134,8 +138,9 @@ extension ToolRouter {
                 }
                 return value
             }
-            let from = Point(x: try coordinate("from_x"), y: try coordinate("from_y"))
-            let to = Point(x: try coordinate("to_x"), y: try coordinate("to_y"))
+            let windowID = try args.windowID()
+            let from = try Self.windowPoint(try coordinate("from_x"), try coordinate("from_y"), args, windowID: windowID)
+            let to = try Self.windowPoint(try coordinate("to_x"), try coordinate("to_y"), args, windowID: windowID)
             let modifiers = try args.strings("modifiers")
             return try await act(args) {
                 try await desktop.drag(windowID: $0, from: from, to: to, modifiers: modifiers)
@@ -162,7 +167,7 @@ extension ToolRouter {
             return try await act(args) { try await desktop.pressKey(windowID: $0, keys: keys) }
 
         case "scroll":
-            let target = try args.clickTarget()
+            let target = try Self.inWindowPoints(args.clickTarget(), args, windowID: args.windowID())
             let direction = try args.direction()
             let amount = try Self.scrollAmount(args, target: target)
             return try await act(args) {
@@ -198,7 +203,7 @@ extension ToolRouter {
         case "screenshot":
             let windowID = try args.windowID()
             let shot = try await desktop.screenshot(windowID: windowID)
-            var json = Shape.screenshot(shot)
+            var json = screenshotJSON(shot, windowID: windowID)
             json["window_id"] = windowID
             return ToolOutput(json: json, images: [shot])
 
@@ -251,7 +256,7 @@ extension ToolRouter {
     /// Settles, then adds `observation` to `json` and returns its screenshot, if any. The tree is a diff
     /// against this session's previous read of the window (full when there is none) and becomes the
     /// window's current observation. The action already happened, so a failed read is reported as
-    /// `observation_error` beside it rather than thrown.
+    /// `observation_error` beside it rather than thrown; with `both`, a failed capture still returns the tree.
     private func attachObservation(_ windowID: UInt32, mode: String, full: Bool, to json: inout [String: Any]) async
         -> [Screenshot]
     {
@@ -260,12 +265,16 @@ extension ToolRouter {
             case "tree", "both":
                 let snapshot = try await desktop.windowState(
                     windowID: windowID, options: SnapshotOptions(includeScreenshot: mode == "both", full: full))
-                json["observation"] = await snapshotJSON(snapshot)
+                var observation = await snapshotJSON(snapshot)
+                if let error = observation.removeValue(forKey: "screenshot_error") {
+                    json["observation_error"] = "Screenshot failed (the tree above is current): \(error)"
+                }
+                json["observation"] = observation
                 return snapshot.screenshot.map { [$0] } ?? []
             case "screenshot":
                 await desktop.settle(windowID: windowID)
                 let shot = try await desktop.screenshot(windowID: windowID)
-                json["observation"] = Shape.screenshot(shot)
+                json["observation"] = screenshotJSON(shot, windowID: windowID)
                 return [shot]
             default:
                 return []
@@ -300,10 +309,54 @@ extension ToolRouter {
         {
             json["elements"] = elements
         }
-        if let shot = snapshot.screenshot { json["screenshot"] = Shape.screenshot(shot) }
+        if let shot = snapshot.screenshot { json["screenshot"] = screenshotJSON(shot, windowID: snapshot.window.id) }
+        if let error = snapshot.screenshotError { json["screenshot_error"] = error }
         if let base = snapshot.diffBase { json["diff_base"] = base }
         if let scope = snapshot.scope { json["scope"] = scope }
+        if let label = snapshot.scopeLabel { json["scope"] = label }
         return json
+    }
+
+    private static let screenshotScales = ScreenshotScales()
+
+    /// Shapes a window screenshot and remembers its scale, so `coordinate_space: "screenshot"` can read pixels off it.
+    private func screenshotJSON(_ shot: Screenshot, windowID: UInt32) -> [String: Any] {
+        Self.screenshotScales.note(shot.scale, windowID: windowID, session: Execution.context.sessionID)
+        var json = Shape.screenshot(shot)
+        json["coordinates"] =
+            "pass coordinate_space: \"screenshot\" to click at image pixels, or divide by "
+            + "\(String(format: "%.4g", shot.scale)) for window points"
+        return json
+    }
+
+    private static func screenshotCoordinates(_ args: Arguments) throws -> Bool {
+        switch try args.optionalString("coordinate_space")?.lowercased() ?? "window" {
+        case "window": return false
+        case "screenshot": return true
+        default: throw SCError.invalidArgument("coordinate_space must be window or screenshot")
+        }
+    }
+
+    /// x/y in window points. With `coordinate_space: "screenshot"` they are pixels of this session's latest
+    /// screenshot of the window, so they are divided by its scale.
+    private static func windowPoint(_ x: Double, _ y: Double, _ args: Arguments, windowID: UInt32) throws -> Point {
+        guard try screenshotCoordinates(args) else { return Point(x: x, y: y) }
+        guard let scale = screenshotScales.scale(windowID: windowID, session: Execution.context.sessionID), scale > 0
+        else {
+            throw SCError.invalidArgument(
+                "coordinate_space \"screenshot\" needs a screenshot of window \(windowID) taken in this session "
+                    + "(screenshot, get_window_state with include_screenshot, or observe=both); none was")
+        }
+        return Point(x: x / scale, y: y / scale)
+    }
+
+    private static func inWindowPoints(_ target: ClickTarget?, _ args: Arguments, windowID: UInt32) throws -> ClickTarget? {
+        guard case .point(let x, let y)? = target else {
+            _ = try screenshotCoordinates(args)
+            return target
+        }
+        let point = try windowPoint(x, y, args, windowID: windowID)
+        return .point(x: point.x, y: point.y)
     }
 
     private static let batchTools: Set<String> = [
@@ -388,7 +441,7 @@ extension ToolRouter {
         case "click":
             let button = MouseButton(rawValue: try args.optionalString("button")?.lowercased() ?? "left")
             action = .click(
-                target: try require(try args.clickTarget(), "element_index or x and y"),
+                target: try require(try inWindowPoints(args.clickTarget(), args, windowID: windowID), "element_index or x and y"),
                 button: try require(button, "button left, right or middle"),
                 count: min(max(try args.int("count", default: 1), 1), 3))
         case "type_text":
@@ -400,16 +453,16 @@ extension ToolRouter {
         case "set_value":
             action = .setValue(elementIndex: try args.int("element_index"), value: try args.string("value"))
         case "scroll":
-            let target = try args.clickTarget()
+            let target = try inWindowPoints(args.clickTarget(), args, windowID: windowID)
             action = .scroll(target: target, direction: try args.direction(), amount: try scrollAmount(args, target: target))
         case "drag":
             action = .drag(
-                from: Point(
-                    x: try require(try args.optionalDouble("from_x"), "from_x"),
-                    y: try require(try args.optionalDouble("from_y"), "from_y")),
-                to: Point(
-                    x: try require(try args.optionalDouble("to_x"), "to_x"),
-                    y: try require(try args.optionalDouble("to_y"), "to_y")))
+                from: try windowPoint(
+                    try require(try args.optionalDouble("from_x"), "from_x"),
+                    try require(try args.optionalDouble("from_y"), "from_y"), args, windowID: windowID),
+                to: try windowPoint(
+                    try require(try args.optionalDouble("to_x"), "to_x"),
+                    try require(try args.optionalDouble("to_y"), "to_y"), args, windowID: windowID))
         case "perform_action":
             action = .performAction(elementIndex: try args.int("element_index"), action: try args.string("action"))
         default:
@@ -474,5 +527,26 @@ extension ToolRouter {
     private static func url(_ string: String) -> URL {
         if let url = URL(string: string), let scheme = url.scheme, scheme.count > 1 { return url }
         return URL(fileURLWithPath: (string as NSString).expandingTildeInPath)
+    }
+}
+
+/// The scale of each session's latest screenshot of each window.
+private final class ScreenshotScales: @unchecked Sendable {
+    private let lock = NSLock()
+    private var scales: [String: (scale: Double, at: Date)] = [:]
+
+    func note(_ scale: Double, windowID: UInt32, session: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if scales.count >= 512 {
+            scales = Dictionary(uniqueKeysWithValues: scales.sorted { $0.value.at > $1.value.at }.prefix(256).map { ($0.key, $0.value) })
+        }
+        scales["\(session):\(windowID)"] = (scale, Date())
+    }
+
+    func scale(windowID: UInt32, session: String) -> Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return scales["\(session):\(windowID)"]?.scale
     }
 }

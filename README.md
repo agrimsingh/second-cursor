@@ -23,6 +23,7 @@ flowchart LR
 - **Windows on other Spaces.** macOS hides off-Space windows from the normal window list, so Second Cursor finds them through the app's main/focused window or a remote-token lookup (and, for Electron apps, through their web areas).
 - **Background keyboard.** Keys are posted to the target app's process. Command shortcuts (cmd+a, cmd+z, ...) briefly hand the app AppKit focus without raising it, press the matching menu item, then give focus back.
 - **Parallel.** Each app gets its own serial queue, so agents working in different apps run at the same time while actions within one app stay ordered.
+- **Visible presence.** While an agent works, its orange arrow rests at its last position and the menu bar icon turns orange. Both clear when the agent's turn ends (with the Cursor stop hook), when you pause, or after a minute without agent calls.
 - **Batching.** `batch` runs a predictable sequence of steps on one window as a single uninterrupted block, then returns one observation once the UI has settled, so a model spends one round trip instead of one per action. A pixel step stops the batch if the window changed size since the model last looked at it, because its coordinates would point at the old layout.
 - **Browser.** A Chrome extension drives only the tabs it opens itself, in a "Second Cursor" tab group, over Chrome's debugger API. Existing user tabs are available only through local approval for discovery and claim operations; session cleanup leaves them open.
 - **Optional agent display.** An invisible virtual monitor is available as a private workspace (`agent_display`, `move_to_agent_display`). It is never used unless asked for.
@@ -120,6 +121,8 @@ python3 e2e/setup.py          # mcp stdio proxy, doctor, --turn-ended, install-m
 python3 e2e/policy.py         # approvals in deny mode (no UI), turn end, action log
 python3 e2e/instance.py       # test-instance isolation
 python3 e2e/focus.py          # focus safety; puts a probe window in front and takes focus while it runs
+python3 e2e/cursor.py         # arrow and menu-bar presence; also takes over the screen while it runs
+python3 e2e/latency.py        # per-call timings, written to latency.json
 ```
 
 `SC_E2E_APP=build/SecondCursor.app` tests another bundle, and `--installed` targets your running app instead (opt-in). `python3 e2e/setup.py` runs `install-mcp` against a temporary `HOME` and checks that your real client configs are unchanged.

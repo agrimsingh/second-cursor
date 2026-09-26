@@ -58,6 +58,7 @@ final class ToolRouter: Sendable {
                 case "close":
                     sessions.close(session)
                     desktop.closeSession(session)
+                    desktop.endAgentActivity(session: session)
                     appApprovals.clear(session: session)
                     let payload = try JSONSerialization.data(withJSONObject: ["session_id": session])
                     _ = try? await browser.command("session.close", params: payload)
@@ -115,6 +116,7 @@ final class ToolRouter: Sendable {
                 // Record admission only after approval. Refusals are recorded once below.
                 _ = try await admit(name, args)
                 admitted = true
+                noteActivity(name, args, owner: owner, session: session)
                 let mutating = ToolCatalog.actionTools.contains(name)
                 let target = mutating ? try args.optionalInt("window_id").map { "window:\($0)" } : nil
                 let context = ExecutionContext(
@@ -132,6 +134,9 @@ final class ToolRouter: Sendable {
                             return name.hasPrefix("browser_")
                                 ? try await self.runBrowser(name, args)
                                 : try await self.runDesktop(name, args, owner: owner)
+                        }
+                        if name == "status" {
+                            result.json["agent_activity"] = Self.activityJSON(self.desktop.agentActivity())
                         }
                         if suppliedID != nil { result.json["operation_id"] = id }
                         self.noteObservation(name, args, owner: owner, output: result, session: session)
@@ -214,6 +219,35 @@ final class ToolRouter: Sendable {
             || (name == "agent_display" && (try? args.string("action"))?.lowercased() != "status")
     }
 
+    /// Calls that act without moving the pointer; they show the arrow too when it is not up yet.
+    private static let keyboardTools: Set<String> = [
+        "type_text", "press_key", "set_value", "paste", "select_text", "perform_action", "batch",
+    ]
+
+    /// Window and app calls, reads included, keep the session's on-screen presence up until its turn ends.
+    private func noteActivity(_ name: String, _ args: Arguments, owner: WindowOwner?, session: String) {
+        let app: String?
+        if let owner, ToolCatalog.windowScopedTools.contains(name) {
+            app = AppGuard.windowTarget(owner).name
+        } else if name == "launch_app" {
+            app = try? args.string("app")
+        } else {
+            return
+        }
+        desktop.noteAgentActivity(
+            session: session, windowID: try? args.windowID(), app: app, showArrow: Self.keyboardTools.contains(name))
+    }
+
+    private static func activityJSON(_ activity: AgentActivityStatus) -> [String: Any] {
+        [
+            "active": activity.active,
+            "app": activity.app ?? NSNull(),
+            "sessions": activity.sessions,
+            "arrow": activity.arrow.map { ["x": $0.x, "y": $0.y] } ?? NSNull(),
+            "idle_seconds": activity.idleSeconds.map { ($0 * 10).rounded() / 10 } ?? NSNull(),
+        ]
+    }
+
     /// The app a call would read or operate, when per-app approval applies to it.
     private func appNeedingApproval(_ name: String, _ args: Arguments, owner: WindowOwner?) async throws -> AppTarget? {
         guard appApprovals.appApprovalRequired else { return nil }
@@ -256,6 +290,7 @@ final class ToolRouter: Sendable {
     /// the agent opened stay open). The session itself stays open, and work already in flight is not cancelled.
     func endTurn(session: String) async -> [String: Any] {
         desktop.closeSession(session)
+        desktop.endAgentActivity(session: session)
         sessions.forgetObservations(session: session)
         let cleared = appApprovals.clear(session: session)
         var released = 0

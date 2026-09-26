@@ -100,6 +100,16 @@ struct Arguments {
         return direction
     }
 
+    /// `scope` is an element index when it reads as an integer (12 or "12"), otherwise a container label.
+    func scope() throws -> (index: Int?, label: String?) {
+        guard let value = present("scope") else { return (nil, nil) }
+        if let index = Int(value, strict: false) { return (index, nil) }
+        guard let label = String(value, strict: false)?.trimmingCharacters(in: .whitespaces), !label.isEmpty else {
+            throw SCError.invalidArgument("scope must be an element index or a container label")
+        }
+        return (nil, label)
+    }
+
     /// `element_index` wins when both it and x/y are given.
     func clickTarget() throws -> ClickTarget? {
         if let index = try optionalInt("element_index") { return .element(index: index) }

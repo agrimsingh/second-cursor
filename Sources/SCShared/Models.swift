@@ -85,19 +85,24 @@ public struct Screenshot: Sendable, Equatable {
 public struct SnapshotOptions: Sendable, Equatable {
     public var includeScreenshot: Bool
     public var includeMenuBar: Bool
-    public var maxElements: Int
+    /// Most indexed elements to list. nil keeps the value of the window's previous read (400 at first), so a
+    /// diff never compares outlines cut at different lengths.
+    public var maxElements: Int?
     /// `false` returns a diff against the window's previous full snapshot when one exists.
     public var full: Bool
     /// When set, returns only the subtree rooted at this element index, at full depth.
     public var scope: Int?
+    /// Like `scope`, naming the container by its label (exact match first, then case-insensitive).
+    public var scopeLabel: String?
 
-    public init(includeScreenshot: Bool = true, includeMenuBar: Bool = false, maxElements: Int = 400,
-                full: Bool = true, scope: Int? = nil) {
+    public init(includeScreenshot: Bool = true, includeMenuBar: Bool = false, maxElements: Int? = nil,
+                full: Bool = true, scope: Int? = nil, scopeLabel: String? = nil) {
         self.includeScreenshot = includeScreenshot
         self.includeMenuBar = includeMenuBar
         self.maxElements = maxElements
         self.full = full
         self.scope = scope
+        self.scopeLabel = scopeLabel
     }
 }
 
@@ -114,7 +119,10 @@ public struct WindowSnapshot: Sendable, Equatable {
     public var isDiff: Bool
     public var diffBase: String?
     public var scope: Int?
+    public var scopeLabel: String?
     public var screenshot: Screenshot?
+    /// Set instead of `screenshot` when the capture failed; the tree is still valid.
+    public var screenshotError: String?
     public var elements: [ElementInfo] = []
 
     public init(window: WindowInfo, snapshotID: String, tree: String, elementCount: Int, truncated: Bool,

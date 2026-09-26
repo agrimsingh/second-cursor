@@ -10,8 +10,11 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let table = IndexTable()
         var snapshotID: String?
         var observationID: String?
-        /// The last full rendering; the next diff is computed against it.
+        /// The last full rendering and its frame-free keys; the next diff is computed against them.
         var lines: [String]?
+        var keys: [String]?
+        /// The element limit of the last read, kept so later reads and diffs cut the outline at the same place.
+        var maxElements: Int?
         var elements: [Int: SnapshotElement] = [:]
 
         init(pid: pid_t) { self.pid = pid }
@@ -27,7 +30,14 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     private var trees: [String: WindowTree] = [:]
     /// Window size when the agent last observed it; pixel coordinates it sends are relative to that layout.
     private var observedSizes: [String: CGSize] = [:]
-    private var lastAction: [CGWindowID: Date] = [:]
+    /// The latest action on each window, and what has happened since: reads settle once and captures wait for a
+    /// repaint once per action.
+    private struct Activity {
+        let at: Date
+        var settled = false
+        var painted = false
+    }
+    private var activity: [CGWindowID: Activity] = [:]
 
     /// Draws the agent's visible cursor. Set once by the app at launch; command-line tools leave it nil.
     public var cursor: AgentCursorPresenting?
@@ -127,13 +137,28 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         return try await Apps.launch(app, urls: urls, newInstance: newInstance)
     }
 
+    /// A failed capture does not fail the read: the tree was taken and is now the diff baseline, so the caller
+    /// must see it.
     public func windowState(windowID: UInt32, options: SnapshotOptions) async throws -> WindowSnapshot {
         var snapshot = try await run(windowID: windowID) {
-            if self.actedRecently(on: windowID) { self.settleNow(windowID) }
+            if self.needsSettle(windowID) { self.settleNow(windowID) }
             return try self.snapshot(windowID, options: options)
         }
-        if options.includeScreenshot { snapshot.screenshot = try await Capture.window(windowID) }
+        if options.includeScreenshot {
+            do {
+                snapshot.screenshot = try await capture(windowID)
+            } catch {
+                snapshot.screenshotError = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            }
+        }
         return snapshot
+    }
+
+    /// Custom-drawn apps (Ableton, games) update their accessibility tree before they repaint, so a capture right
+    /// after the tree settles can show the previous frame. Once per action, give the window a frame's worth of time.
+    private func capture(_ wid: CGWindowID) async throws -> Screenshot {
+        if claimPaintWait(wid) { try? await Task.sleep(nanoseconds: 150_000_000) }
+        return try await Capture.window(wid)
     }
 
     public func click(windowID: UInt32, target: ClickTarget, button: MouseButton, count: Int, modifiers: [String]) async throws -> ActionResult {
@@ -321,50 +346,50 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     private func markAction(on wid: CGWindowID) {
         lock.lock()
-        lastAction[wid] = Date()
+        activity[wid] = Activity(at: Date())
         lock.unlock()
     }
 
-    private func actedRecently(on wid: CGWindowID) -> Bool {
+    /// Acted on in the last 2 s and not yet seen to settle since.
+    private func needsSettle(_ wid: CGWindowID) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return lastAction[wid].map { Date().timeIntervalSince($0) < 2 } ?? false
+        guard let entry = activity[wid], Date().timeIntervalSince(entry.at) < 2 else { return false }
+        return !entry.settled
+    }
+
+    /// True at most once per action, for a window acted on in the last 2 s.
+    private func claimPaintWait(_ wid: CGWindowID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var entry = activity[wid], Date().timeIntervalSince(entry.at) < 2, !entry.painted else { return false }
+        entry.painted = true
+        activity[wid] = entry
+        return true
     }
 
     /// Polls a fingerprint of the accessibility tree until it holds still for `quiet`, so an
-    /// observation reflects the UI after the app has finished reacting, not mid-update.
+    /// observation reflects the UI after the app has finished reacting, not mid-update. A window that
+    /// never holds still (meters, playback) counts as settled after `cap`, so the next read does not wait again.
     @discardableResult
-    private func settleNow(_ wid: CGWindowID, quiet: TimeInterval = 0.3, cap: TimeInterval = 3) -> Bool {
+    private func settleNow(_ wid: CGWindowID, quiet: TimeInterval = 0.2, cap: TimeInterval = 3) -> Bool {
         guard let record = WindowList.record(wid), let window = try? resolver.resolve(pid: record.pid, wid: wid) else { return false }
-        func fingerprint() -> Int {
-            var builder = TreeBuilder(maxNodes: 600, maxDepth: 40)
-            builder.build(window: window, menuBar: nil)
-            var hasher = Hasher()
-            for node in builder.nodes {
-                hasher.combine(node.key)
-                hasher.combine(node.value)
-                if let frame = node.frame {
-                    hasher.combine(frame.minX)
-                    hasher.combine(frame.minY)
-                    hasher.combine(frame.width)
-                    hasher.combine(frame.height)
-                }
-            }
-            return hasher.finalize()
+        func fingerprint() -> Int { TreeBuilder.fingerprint(window: window, maxNodes: 1000) }
+        defer {
+            lock.lock()
+            activity[wid]?.settled = true
+            lock.unlock()
         }
         let deadline = Date().addingTimeInterval(cap)
         var last = fingerprint()
         var lastChange = Date()
         while Date() < deadline {
-            usleep(80_000)
+            usleep(60_000)
             let current = fingerprint()
             if current != last {
                 last = current
                 lastChange = Date()
             } else if Date().timeIntervalSince(lastChange) >= quiet {
-                lock.lock()
-                lastAction[wid] = nil
-                lock.unlock()
                 return true
             }
         }
@@ -392,10 +417,13 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         try await act(windowID) { try self.performNamedAction(windowID, elementIndex: elementIndex, action: action) }
     }
 
+    /// Only a window acted on moments ago goes through its app's queue (to settle first), so an idle
+    /// screenshot never waits behind a busy or hung app.
     public func screenshot(windowID: UInt32) async throws -> Screenshot {
+        if needsSettle(windowID) { await settle(windowID: windowID) }
         guard let record = WindowList.record(windowID) else { throw SCError.windowNotFound(windowID) }
         noteObserved(windowID, size: record.bounds.size)
-        return try await Capture.window(windowID)
+        return try await capture(windowID)
     }
 
     // MARK: Windows
@@ -487,37 +515,58 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let id = String(UUID().uuidString.prefix(8)).lowercased()
         noteObserved(wid, size: record.bounds.size)
         tree.observationID = id
+        let limit = max(1, options.maxElements ?? tree.maxElements ?? 400)
+        tree.maxElements = limit
+        let maxNodes = max(2500, limit * 3)
 
-        if let scope = options.scope {
-            guard tree.snapshotID != nil else { throw SCError.staleSnapshot(wid) }
-            guard let root = tree.elements[scope] else { throw SCError.elementNotFound(scope) }
-            guard root.element.isAlive else {
-                throw SCError.actionFailed("Element \(scope) no longer exists; call get_window_state again")
+        if options.scope != nil || options.scopeLabel != nil {
+            let root: SnapshotElement
+            let handle: String
+            if let scope = options.scope {
+                guard tree.snapshotID != nil else { throw SCError.staleSnapshot(wid) }
+                guard let element = tree.elements[scope] else { throw SCError.elementNotFound(scope) }
+                guard element.element.isAlive else {
+                    throw SCError.actionFailed("Element \(scope) no longer exists; call get_window_state again")
+                }
+                root = element
+                handle = "[\(scope)]"
+            } else {
+                let label = options.scopeLabel ?? ""
+                (root, handle) = try labelledContainer(label, in: window, windowID: wid, maxNodes: maxNodes)
+                // A label needs no earlier read, and the indexes it returns must be actionable.
+                if tree.snapshotID == nil { tree.snapshotID = id }
             }
-            var builder = TreeBuilder()
+            var builder = TreeBuilder(maxNodes: maxNodes)
             builder.build(subtreeOf: root.element, key: root.key, inWebArea: root.inWebArea)
-            let out = TreeRenderer.scoped(scope: scope, windowOrigin: frame.origin, nodes: builder.nodes,
-                                          table: tree.table, maxElements: max(options.maxElements, 2000))
+            var out = TreeRenderer.scoped(scope: handle, windowOrigin: frame.origin, nodes: builder.nodes,
+                                          table: tree.table, maxElements: max(limit, 2000))
+            if builder.truncated, out.footer == nil { out.footer = TreeRenderer.walkLimitFooter }
             tree.elements.merge(out.elements) { _, scoped in scoped }
             var result = WindowSnapshot(window: windowInfo(record, window: window), snapshotID: id, tree: out.text,
-                                  elementCount: out.indexedCount, truncated: out.truncated || builder.truncated, scope: scope)
+                                  elementCount: out.indexedCount, truncated: out.truncated || builder.truncated, scope: options.scope)
+            result.scopeLabel = options.scope == nil ? options.scopeLabel : nil
             result.elements = out.structured
             return result
         }
 
-        var builder = TreeBuilder()
+        var builder = TreeBuilder(maxNodes: maxNodes)
         let app = AXUIElementCreateApplication(record.pid)
         let menuBar = options.includeMenuBar ? app.element(kAXMenuBarAttribute) : nil
         builder.build(window: window, menuBar: menuBar)
         let title = window.string(kAXTitleAttribute) ?? record.title
         var out = TreeRenderer.full(title: title, size: frame.size, windowOrigin: frame.origin, nodes: builder.nodes,
-                                    table: tree.table, maxElements: options.maxElements)
+                                    table: tree.table, maxElements: limit)
         out.appendOrientation(focused: app.element(kAXFocusedUIElementAttribute))
+        if builder.truncated, out.footer == nil { out.footer = TreeRenderer.walkLimitFooter }
         tree.table.retain(keys: Set(builder.nodes.map(\.key)))
         let base = tree.snapshotID
-        let diff = options.full ? nil : tree.lines.flatMap { TreeRenderer.diff(previous: $0, current: out.lines) }
+        var diff: String?
+        if !options.full, let lines = tree.lines, let keys = tree.keys {
+            diff = TreeRenderer.diff(previous: lines, previousKeys: keys, current: out.lines, currentKeys: out.keys)
+        }
         tree.snapshotID = id
         tree.lines = out.lines
+        tree.keys = out.keys
         tree.elements = out.elements
         var result = WindowSnapshot(
             window: windowInfo(record, window: window), snapshotID: id, tree: diff ?? out.text,
@@ -526,6 +575,34 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         )
         result.elements = out.structured
         return result
+    }
+
+    /// The first element in walk order labelled exactly `label`, else case-insensitively; containers (elements with
+    /// children in the outline) win over leaves, so a heading that repeats a panel's name does not shadow the panel.
+    private func labelledContainer(_ label: String, in window: AXUIElement, windowID: CGWindowID,
+                                   maxNodes: Int) throws -> (SnapshotElement, String) {
+        var builder = TreeBuilder(maxNodes: maxNodes)
+        builder.build(window: window, menuBar: nil)
+        let nodes = builder.nodes
+        func hasChildren(_ i: Int) -> Bool { i + 1 < nodes.count && nodes[i + 1].indent > nodes[i].indent }
+        let exact = nodes.indices.filter { nodes[$0].label == label }
+        let folded = nodes.indices.filter { nodes[$0].label.caseInsensitiveCompare(label) == .orderedSame }
+        guard let match = exact.first(where: hasChildren) ?? exact.first ?? folded.first(where: hasChildren) ?? folded.first
+        else {
+            var candidates: [String] = []
+            for i in nodes.indices where hasChildren(i) && !nodes[i].label.isEmpty {
+                let quoted = "\"\(TreeBuilder.escape(nodes[i].label, limit: 40))\""
+                if !candidates.contains(quoted) { candidates.append(quoted) }
+                if candidates.count == 12 { break }
+            }
+            throw SCError.invalidArgument(
+                "No element labelled \"\(TreeBuilder.escape(label, limit: 80))\" in window \(windowID); "
+                    + (candidates.isEmpty ? "it has no labelled containers" : "labelled containers: " + candidates.joined(separator: ", "))
+                    + ". Pass one of these, or an element index")
+        }
+        let node = nodes[match]
+        return (SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key),
+                "\"\(TreeBuilder.escape(node.label, limit: 120))\"")
     }
 
     private func element(_ wid: CGWindowID, _ index: Int) throws -> (CGWindowRecord, SnapshotElement) {

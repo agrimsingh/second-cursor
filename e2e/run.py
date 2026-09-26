@@ -776,7 +776,6 @@ def agent_cursor_visible(ctx):
     wid = window["id"]
     _, frame = text_area(ctx, wid)
     local = (frame[0] + 3, frame[1] + 6)
-    # The arrow fades soon after the click; waiting for a post-action observation could miss it.
     ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none")
 
     screen_x, screen_y = window["frame"]["x"] + local[0], window["frame"]["y"] + local[1]
@@ -1086,6 +1085,204 @@ def scope_reads(ctx):
     ctx.check("scoped read excludes elements outside the subtree", "AXButton" not in scoped["tree"], scoped["tree"][:300])
     ctx.check("scoped read is not a diff", not scoped.get("is_diff"), scoped)
     ctx.check("the scoped element index still acts", ctx.call("set_value", window_id=wid, element_index=area, value="ok").get("ok"))
+
+
+def links_document(ctx, name, count=200):
+    """A TextEdit window whose text area holds `count` links: that many indexed elements, all of which move on a scroll."""
+    path = ctx.scratch / name
+    path.write_text("<html><body>" + "".join(
+        f'<p>Paragraph {i} <a href="https://example.com/{i}">link {i}</a> trailing text</p>' for i in range(count))
+        + "</body></html>")
+    launched = ctx.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True)
+    ctx.kill_on_exit(launched["app"]["pid"])
+    return ctx.wait_for_window("TextEdit", pid=launched["app"]["pid"], title=name)
+
+
+MOVED_LINE = re.compile(r"^~ (\d+) elements moved \(scroll or resize\); frames above are current", re.M)
+
+
+@scenario
+def scroll_moved_diff(ctx):
+    """A scroll shifts every frame; the observation must stay a compact diff instead of falling back to the full tree."""
+    wid = links_document(ctx, "scroll.html")["id"]
+    full = ctx.call("get_window_state", window_id=wid, full=True)
+    link = element_index(full["tree"], "AXLink", "link 0")
+    ctx.require("the 200 links are indexed", link is not None and full["element_count"] > 200, full["tree"][:300])
+    before = element_frame(full["tree"], link)
+
+    seen = ctx.call("scroll", window_id=wid, direction="down", amount=5).get("observation") or {}
+    tree = seen.get("tree", "")
+    moved = MOVED_LINE.search(tree)
+    ctx.check("the scroll's observation is a diff, not the full tree", seen.get("is_diff"),
+              {k: seen.get(k) for k in ("is_diff", "element_count")})
+    ctx.check("one ~ line counts the elements that only moved", moved and int(moved.group(1)) >= 100, tree[-400:])
+    ctx.check("moved links are not resent as -/+ lines", not re.search(r"^[-+].*AXLink", tree, re.M), tree[:400])
+    ctx.check("a frames-only change is just the ~ line", moved and len(tree.splitlines()) == 1, tree[:400])
+    ctx.check("the diff is under 5% of the full tree", len(tree) < len(full["tree"]) / 20, (len(tree), len(full["tree"])))
+
+    after = ctx.call("get_window_state", window_id=wid)
+    ctx.check("the scroll advanced the baseline: the next read reports no changes",
+              after.get("is_diff") and after["tree"] == "(no changes)", after["tree"][:300])
+    now = ctx.call("get_window_state", window_id=wid, full=True)["tree"]
+    ctx.check("link 0 kept its index across the scroll", element_index(now, "AXLink", "link 0") == link, now[:300])
+    moved_to = element_frame(now, link)
+    ctx.check("a full read reports the moved frame", moved_to and before and moved_to[1] < before[1], (before, moved_to))
+
+    bold = element_index(now, "AXCheckBox", "bold")
+    ctx.require("the bold checkbox is indexed", bold is not None, now[-600:])
+    result = ctx.call("batch", window_id=wid, steps=[step("scroll", direction="up", amount=5), step("click", element_index=bold)])
+    tree = (result.get("observation") or {}).get("tree", "")
+    changed = re.search(rf'^\+\[{bold}\] AXCheckBox "bold" value="1" \(\d+,\d+ \d+x\d+\)', tree, re.M)
+    ctx.check("a content change next to a scroll is printed with its current frame", changed, tree[:400])
+    ctx.check("and the moved elements are still summed up on the ~ line, last", MOVED_LINE.search(tree.splitlines()[-1] if tree else ""), tree[-400:])
+
+
+@scenario
+def element_limit(ctx):
+    wid = links_document(ctx, "limit.html")["id"]
+    whole = ctx.call("get_window_state", window_id=wid, full=True)
+    ctx.require("the whole window fits the default limit of 400", not whole["truncated"] and whole["element_count"] > 200,
+                {k: whole[k] for k in ("truncated", "element_count")})
+    ctx.check("an untruncated outline has no truncation footer", "truncated at" not in whole["tree"], whole["tree"][-300:])
+
+    cut = ctx.call("get_window_state", window_id=wid, full=True, max_elements=60)
+    footer = cut["tree"].splitlines()[-1]
+    ctx.check("max_elements=60 lists exactly 60 elements", cut["element_count"] == 60 and cut["truncated"],
+              {k: cut[k] for k in ("truncated", "element_count")})
+    ctx.check("the outline ends with a truncation footer", footer.startswith("… truncated at 60 elements; not shown: "), footer)
+    ctx.check('the footer names the omitted "Formatting" group', re.search(r'"Formatting" \(\d+ elements\)', footer), footer)
+    ctx.check("the footer names the text area whose links were cut", re.search(r"\[\d+\] AXTextArea \(1\d\d elements\)", footer), footer)
+    ctx.check("the footer says how to see the rest", "max_elements" in footer and "scope" in footer, footer)
+
+    low = ctx.call("get_window_state", window_id=wid, full=True, max_elements=5)
+    ctx.check("max_elements is clamped to at least 50", low["element_count"] == 50, low["element_count"])
+    sticky = ctx.call("get_window_state", window_id=wid, full=True)
+    ctx.check("later reads of the window keep the last max_elements", sticky["element_count"] == 50, sticky["element_count"])
+
+    scoped = ctx.call("get_window_state", window_id=wid, scope="Formatting")
+    lines = scoped["tree"].splitlines()
+    ctx.check("scope takes a container label", len(lines) > 1 and lines[1].startswith('AXGroup "Formatting"'), lines[:3])
+    bold = element_index(scoped["tree"], "AXCheckBox", "bold")
+    ctx.check("the labelled scope holds the group's controls at full depth",
+              bold is not None and element_index(scoped["tree"], "AXButton", "font size") is not None, scoped["tree"][:600])
+    ctx.check("the labelled scope excludes the rest of the window", "AXLink" not in scoped["tree"], scoped["tree"][:300])
+    ctx.check("an element found through a labelled scope can be acted on",
+              bold is not None and ctx.call("click", window_id=wid, element_index=bold, observe="none").get("ok"))
+    folded = ctx.call("get_window_state", window_id=wid, scope="formatting")["tree"]
+    ctx.check("label matching falls back to case-insensitive", 'AXGroup "Formatting"' in folded, folded[:200])
+    unknown = refused(ctx, "get_window_state", window_id=wid, scope="No Such Panel")
+    ctx.check("an unknown label is refused with candidate labels", unknown and '"Formatting"' in unknown, unknown)
+
+    everything = ctx.call("get_window_state", window_id=wid, full=True, max_elements=3000)
+    ctx.check("max_elements=3000 lists the whole window again",
+              not everything["truncated"] and everything["element_count"] == whole["element_count"],
+              {k: everything[k] for k in ("truncated", "element_count")})
+
+
+def png_size(image):
+    import struct
+    return struct.unpack(">II", base64.b64decode(image["data"])[16:24])
+
+
+def wide_document(ctx, name, lines):
+    """TextEdit sizes an RTF document's window from \\vieww/\\viewh (twips), so this opens a window wider than 1024 points
+    without any resize permission."""
+    path = ctx.scratch / name
+    path.write_text("{\\rtf1\\ansi{\\fonttbl\\f0\\fswiss Helvetica;}\\vieww26000\\viewh14000\\viewkind0\\pard\\f0\\fs36 "
+                    + "\\\n".join(lines) + "}")
+    launched = ctx.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True)
+    ctx.kill_on_exit(launched["app"]["pid"])
+    return ctx.wait_for_window("TextEdit", pid=launched["app"]["pid"], title=name)
+
+
+def screenshot_shape(ctx, label, shot, image, window):
+    w, h = png_size(image)
+    ctx.check(f"{label}: long edge is at most 1024 px", max(w, h) <= 1024, (w, h))
+    ctx.check(f"{label}: width/height are the PNG's", (w, h) == (shot.get("width"), shot.get("height")), (shot, (w, h)))
+    ctx.check(f"{label}: scale is image pixels per window point",
+              abs(shot.get("scale", 0) - w / window["frame"]["width"]) < 0.01, (shot.get("scale"), w, window["frame"]))
+    hint = shot.get("coordinates", "")
+    divisor = re.search(r"divide by ([\d.]+) for window points", hint)
+    ctx.check(f"{label}: says how to use its pixels", 'coordinate_space: "screenshot"' in hint and divisor
+              and abs(float(divisor.group(1)) - shot.get("scale", 0)) < 0.001, hint)
+
+
+@scenario
+def screenshot_scale(ctx):
+    lines = [f"row {i:02d}" for i in range(40)]
+    window = wide_document(ctx, "wide.rtf", lines)
+    wid = window["id"]
+    if window["frame"]["width"] <= 1024:
+        raise Skip(f"the display could not fit a window wider than 1024 points ({window['frame']})")
+
+    shot, images = ctx.mcp.call("screenshot", window_id=wid)
+    ctx.save_image("screenshot", images[0])
+    screenshot_shape(ctx, "screenshot", shot, images[0], window)
+    ctx.check("a window wider than 1024 points is scaled down", shot["scale"] < 0.8, shot)
+
+    state, images = ctx.mcp.call("get_window_state", window_id=wid, full=True, include_screenshot=True)
+    ctx.require("get_window_state attached one image", len(images) == 1 and "screenshot" in state, list(state))
+    screenshot_shape(ctx, "get_window_state", state["screenshot"], images[0], window)
+    ctx.check("a successful capture carries no screenshot_error", "screenshot_error" not in state, list(state))
+    tree = state["tree"]
+    area = element_index(tree, "AXTextArea")
+    view = element_frame(tree, element_index(tree, "AXScrollArea"))
+    ctx.require("text and scroll areas are indexed with frames", area is not None and view, tree[:400])
+
+    data, images = ctx.mcp.call("click", window_id=wid, element_index=area, observe="both")
+    seen = data.get("observation") or {}
+    ctx.check("observe=both carries no observation_error", "observation_error" not in data, data.get("observation_error"))
+    if images and "screenshot" in seen:
+        screenshot_shape(ctx, "observation", seen["screenshot"], images[0], window)
+    else:
+        ctx.check("observe=both attached a screenshot", False, list(seen))
+
+    # Far right of the visible middle: the caret lands at the end of whichever row is there, so a click scaled wrongly
+    # ends up on a different row.
+    point = (view[0] + view[2] - 60, view[1] + view[3] / 2)
+    original = "\n".join(lines)
+
+    def mark(click_args, batch=False):
+        reset = step("set_value", element_index=area, value=original)
+        if batch:
+            ctx.call("batch", window_id=wid, observe="none",
+                     steps=[reset, step("click", **click_args), step("type_text", text="Z")])
+        else:
+            ctx.call("batch", window_id=wid, observe="none", steps=[reset])
+            ctx.call("click", window_id=wid, observe="none", **click_args)
+            ctx.call("type_text", window_id=wid, text="Z", observe="none")
+        return value_of(ctx.tree(wid))
+
+    scale = state["screenshot"]["scale"]
+    pixels = {"x": point[0] * scale, "y": point[1] * scale, "coordinate_space": "screenshot"}
+    by_points = mark({"x": point[0], "y": point[1]})
+    ctx.check("the window-point click put the caret mid-document", by_points and "Z\n" in by_points
+              and not by_points.startswith("Z") and not by_points.endswith("Z"), by_points)
+    ctx.check("the same spot in screenshot pixels lands on the same row", mark(pixels) == by_points, by_points)
+    ctx.check("batch steps take coordinate_space too", mark(pixels, batch=True) == by_points, by_points)
+
+    sid = ctx.call("session", action="create")["session_id"]
+    ctx.cleanups.append(lambda: ctx.mcp.call("session", action="close", session_id=sid))
+    unseen = refused(ctx, "click", window_id=wid, session_id=sid, x=10, y=10, coordinate_space="screenshot")
+    ctx.check("screenshot coordinates without a screenshot of the window are refused", unseen and "screenshot" in unseen, unseen)
+    bad = refused(ctx, "click", window_id=wid, x=10, y=10, coordinate_space="pixels")
+    ctx.check("an unknown coordinate_space is refused", bad and "coordinate_space" in bad, bad)
+
+
+@scenario
+def perception_docs(ctx):
+    tools = {t["name"]: t for t in ctx.mcp.rpc("tools/list")["tools"]}
+    props = {name: tool["inputSchema"]["properties"] for name, tool in tools.items()}
+    ctx.check("get_window_state takes max_elements", "max_elements" in props["get_window_state"], list(props["get_window_state"]))
+    scope = props["get_window_state"]["scope"]
+    ctx.check("scope accepts an index or a label", {"integer", "string"} <= {t.get("type") for t in scope.get("anyOf", [])}, scope)
+    ctx.check("pixel tools take coordinate_space",
+              all(props[n].get("coordinate_space", {}).get("enum") == ["window", "screenshot"] for n in ["click", "drag", "scroll"]))
+    ctx.check("screenshot explains the 1024 px limit and coordinate_space",
+              "1024" in tools["screenshot"]["description"] and "coordinate_space" in tools["screenshot"]["description"])
+    ctx.check("get_window_state explains the ~ moved line", "~" in tools["get_window_state"]["description"])
+    ctx.check("press_key says what verified means", "verified" in tools["press_key"]["description"]
+              and "effect" in tools["press_key"]["description"], tools["press_key"]["description"])
 
 
 @scenario

@@ -6,8 +6,12 @@ import SCShared
 import UniformTypeIdentifiers
 
 enum Capture {
-    /// Captures only the window's own pixels at one pixel per point, so screenshot pixels equal
-    /// window-local points. Works for occluded windows and windows on other Spaces.
+    /// Clients shrink larger images before a model sees them (Cursor to about 1024 px wide), and a model reading
+    /// positions off a shrunk image would click off by the shrink factor.
+    static let maxEdge = 1024
+
+    /// Captures only the window's own pixels at one pixel per point, scaled down (never up) so the long edge is at
+    /// most `maxEdge`. `scale` is image pixels per window point. Works for occluded windows and windows on other Spaces.
     static func window(_ wid: CGWindowID) async throws -> Screenshot {
         // Always attempt the ScreenCaptureKit call: it is what makes macOS list the app under
         // Screen Recording and show the prompt; a preflight-only check never registers the app.
@@ -19,11 +23,11 @@ enum Capture {
             throw SCError.actionFailed("Could not list shareable windows: \(error.localizedDescription)")
         }
         guard let window = content.windows.first(where: { $0.windowID == wid }) else { throw SCError.windowNotFound(wid) }
-        let width = max(1, Int(window.frame.width.rounded()))
-        let height = max(1, Int(window.frame.height.rounded()))
+        let points = CGSize(width: max(1, window.frame.width.rounded()), height: max(1, window.frame.height.rounded()))
+        let factor = min(1, CGFloat(maxEdge) / max(points.width, points.height))
         let configuration = SCStreamConfiguration()
-        configuration.width = width
-        configuration.height = height
+        configuration.width = min(maxEdge, max(1, Int((points.width * factor).rounded())))
+        configuration.height = min(maxEdge, max(1, Int((points.height * factor).rounded())))
         configuration.showsCursor = false
         configuration.ignoreShadowsSingleWindow = true
         let image: CGImage
@@ -34,7 +38,8 @@ enum Capture {
         } catch {
             throw SCError.actionFailed("Could not capture window \(wid): \(error.localizedDescription)")
         }
-        return Screenshot(pngData: try png(image), width: image.width, height: image.height, scale: Double(image.width) / Double(width))
+        return Screenshot(pngData: try png(image), width: image.width, height: image.height,
+                          scale: Double(image.width) / Double(points.width))
     }
 
     static func png(_ image: CGImage) throws -> Data {

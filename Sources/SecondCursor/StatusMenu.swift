@@ -20,11 +20,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         didSet { refresh() }
     }
 
+    /// Shown so the user can tell a task is running even when the agent works on another Space.
+    var agentActivity = AgentActivityStatus() {
+        didSet { refresh() }
+    }
+
+    private static let accent = NSColor(srgbRed: 0xf5 / 255.0, green: 0x4e / 255.0, blue: 0, alpha: 1)
+
     private let config: SCConfig?
     private let actions: Actions
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let menu = NSMenu()
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let activityLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let accessibilityItem = NSMenuItem(title: "Grant Accessibility permission…", action: nil, keyEquivalent: "")
     private let screenRecordingItem = NSMenuItem(title: "Grant Screen Recording permission (then relaunch)…", action: nil, keyEquivalent: "")
     private let pauseItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -37,8 +45,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         super.init()
 
         statusLine.isEnabled = false
+        activityLine.isEnabled = false
         let items: [(NSMenuItem, Selector?)] = [
             (statusLine, nil),
+            (activityLine, nil),
             (accessibilityItem, #selector(grantAccessibility)),
             (screenRecordingItem, #selector(grantScreenRecording)),
             (.separator(), nil),
@@ -88,11 +98,19 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             statusLine.title = message
             symbol = "exclamationmark.triangle"
         }
+        let running = if case .running = serverState { true } else { false }
+        let working = running && !paused && agentActivity.active
+        activityLine.title = working ? "Agent active: \(agentActivity.app ?? "unknown app")" : "Idle"
         if let button = statusItem.button {
-            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Second Cursor")
-            image?.isTemplate = true
+            var image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Second Cursor")
+            if working {
+                image = image?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [Self.accent]))
+                image?.isTemplate = false
+            } else {
+                image?.isTemplate = true
+            }
             button.image = image
-            button.toolTip = "Second Cursor — \(statusLine.title)"
+            button.toolTip = "Second Cursor — \(statusLine.title) — \(activityLine.title)"
         }
 
         pauseItem.title = paused ? "Resume agent" : "Pause agent"

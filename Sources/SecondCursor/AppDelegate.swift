@@ -81,6 +81,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             tearDownAgentDisplay: { Task { await agentDisplay.teardown() } },
             quit: { NSApp.terminate(nil) }
         ))
+        agentCursor.onActivityChange = { [weak menu] activity in
+            MainActor.assumeIsolated { menu?.agentActivity = activity }
+        }
         self.menu = menu
         return menu
     }

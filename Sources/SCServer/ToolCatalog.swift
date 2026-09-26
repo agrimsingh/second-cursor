@@ -27,7 +27,7 @@ enum ToolCatalog {
             Tool(
                 name: "status",
                 description:
-                    "Check Second Cursor's health: macOS permissions, whether the user paused the agent, the agent display, and the Chrome extension. Call this first when other tools fail.",
+                    "Check Second Cursor's health: macOS permissions, whether the user paused the agent, whether an agent task is active (agent_activity), the agent display, and the Chrome extension. Call this first when other tools fail.",
                 inputSchema: schema([:]),
                 annotations: .init(readOnlyHint: true)
             ),
@@ -64,16 +64,24 @@ enum ToolCatalog {
             Tool(
                 name: "get_window_state",
                 description:
-                    "Read a window: an indented accessibility outline where actionable elements carry [index] markers and window-local frames, with an optional screenshot (off by default). The first read of a window returns the whole outline; later reads return only what changed since the previous read (is_diff=true): lines starting with + are new or changed, lines starting with - are gone, and \"(no changes)\" means the UI is the same. An element generally keeps its index while its label and place in the UI stay the same; use the latest observation after a label or structure change. Pass full=true to get the whole outline again, and scope=<index> to read everything inside one element at full depth when the outline is truncated or a region needs detail. The outline ends with the focused element and any selected text. Action tools already return this diff for their window, so call this for a first look, a full view, or after waiting.",
+                    "Read a window: an indented accessibility outline where actionable elements carry [index] markers and window-local frames, with an optional screenshot (off by default). The first read of a window returns the whole outline; later reads return only what changed since the previous read (is_diff=true): lines starting with + are new or changed (with current frames), lines starting with - are gone, and \"(no changes)\" means the UI is the same. Elements that only moved (a scroll or resize) are not resent; a closing line \"~ N elements moved\" counts them. An element generally keeps its index while its label and place in the UI stay the same; use the latest observation after a label or structure change. Pass full=true to get the whole outline again. The outline lists up to max_elements elements; a truncated one ends with a line naming the containers left out: raise max_elements, or pass scope=<index or container label> to read everything inside one element at full depth. Full outlines end with the focused element and any selected text. A screenshot that fails to capture is reported as screenshot_error; the outline is still returned. Action tools already return this diff for their window, so call this for a first look, a full view, or after waiting.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
-                        "include_screenshot": boolean("Attach a PNG screenshot of the window.", default: false),
+                        "include_screenshot": boolean(
+                            "Attach a PNG screenshot of the window (long edge at most 1024 px; see screenshot).",
+                            default: false),
                         "include_menu_bar": boolean("Include the app's menu bar in the outline.", default: false),
                         "full": boolean(
                             "Return the whole outline instead of a diff from the previous read.", default: false),
-                        "scope": integer(
-                            "Return only the subtree under this element index, at full depth. Not a diff."),
+                        "max_elements": integer(
+                            "Most elements to list, 50-3000. Later reads and action observations of this window keep the last value.",
+                            default: 400),
+                        "scope": .object([
+                            "anyOf": .array([["type": "integer"], ["type": "string"]]),
+                            "description": .string(
+                                "Return only one element's subtree, at full depth: its [index], or a container's label such as \"Formatting\" (exact match first, then case-insensitive). Not a diff."),
+                        ]),
                         "structured": boolean(
                             "Also return an elements JSON array on full and scoped reads, for code consumers.",
                             default: false),
@@ -83,7 +91,7 @@ enum ToolCatalog {
             Tool(
                 name: "batch",
                 description:
-                    "Run several actions on one window in a single call, strictly in order, then return one observation after the UI settles. Batch predictable sequences where you already know every step: pressing a known series of buttons, filling known fields, typing followed by a shortcut, keyboard navigation. Do not batch past a step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet): end the batch there and look at the observation, or call get_window_state. Element indexes come from get_window_state and are not refreshed between steps. Pixel steps (x/y clicks, drags, scrolls at a point) stop the batch if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the batch stops at the first failure. The observation is a diff like get_window_state unless full=true.",
+                    "Run several actions on one window in a single call, strictly in order, then return one observation after the UI settles. Batch predictable sequences where you already know every step: pressing a known series of buttons, filling known fields, typing followed by a shortcut, keyboard navigation. Do not batch past a step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet): end the batch there and look at the observation, or call get_window_state. Element indexes come from get_window_state and are not refreshed between steps. Pixel steps (x/y clicks, drags, scrolls at a point) take coordinate_space like the standalone tools, and stop the batch if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the batch stops at the first failure. The observation is a diff like get_window_state unless full=true.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
@@ -122,13 +130,13 @@ enum ToolCatalog {
             Tool(
                 name: "click",
                 description:
-                    "Click an element by element_index (preferred; uses accessibility actions), or at x,y in window-local points (= screenshot pixels). Works in place on any window, including windows on other Spaces or behind other apps; the user's cursor and focus are untouched.",
+                    "Click an element by element_index (preferred; uses accessibility actions), or at x,y: window-local points by default, or pixels of your latest screenshot of this window with coordinate_space=\"screenshot\". Works in place on any window, including windows on other Spaces or behind other apps; the user's cursor and focus are untouched.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
                         "element_index": elementIndex,
-                        "x": number("Window-local x in points. Use with y instead of element_index."),
-                        "y": number("Window-local y in points."),
+                        "x": number("x, in window points unless coordinate_space says otherwise. Use with y instead of element_index."),
+                        "y": number("y, in window points unless coordinate_space says otherwise."),
                         "button": string("Mouse button.", enumValues: ["left", "right", "middle"], default: "left"),
                         "count": integer("Click count; 2 for a double-click.", default: 1),
                     ])
@@ -136,14 +144,14 @@ enum ToolCatalog {
             Tool(
                 name: "drag",
                 description:
-                    "Press at (from_x, from_y), move, and release at (to_x, to_y), in window-local points. Use for selecting ranges, drawing, moving sliders, resizing, or drag-and-drop inside a window. Works in place like click.",
+                    "Press at (from_x, from_y), move, and release at (to_x, to_y), in window-local points (or screenshot pixels with coordinate_space=\"screenshot\"). Use for selecting ranges, drawing, moving sliders, resizing, or drag-and-drop inside a window. Works in place like click.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
-                        "from_x": number("Start x, window-local points."),
-                        "from_y": number("Start y, window-local points."),
-                        "to_x": number("End x, window-local points."),
-                        "to_y": number("End y, window-local points."),
+                        "from_x": number("Start x."),
+                        "from_y": number("Start y."),
+                        "to_x": number("End x."),
+                        "to_y": number("End y."),
                     ], required: ["from_x", "from_y", "to_x", "to_y"])
             ),
             Tool(
@@ -173,7 +181,7 @@ enum ToolCatalog {
             Tool(
                 name: "press_key",
                 description:
-                    "Send a key or chord to the window without focusing it, e.g. \"return\", \"escape\", \"tab\", \"down\", \"cmd+a\", \"cmd+shift+t\".",
+                    "Send a key or chord to the window without focusing it, e.g. \"return\", \"escape\", \"tab\", \"down\", \"cmd+a\", \"cmd+shift+t\". A cmd chord that matches a menu item presses that item (route ax_menu_shortcut); verified=true then only means the app confirmed the menu press was delivered, not that the command had an effect, so check the observation.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
@@ -182,15 +190,16 @@ enum ToolCatalog {
             ),
             Tool(
                 name: "scroll",
-                description: "Scroll the window, over element_index or at x,y when given.",
+                description:
+                    "Scroll the window, over element_index or at x,y when given (window points, or screenshot pixels with coordinate_space=\"screenshot\").",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
                         "direction": string("Scroll direction.", enumValues: ["up", "down", "left", "right"]),
                         "amount": integer("Number of scroll steps.", default: 3),
                         "element_index": elementIndex,
-                        "x": number("Window-local x in points."),
-                        "y": number("Window-local y in points."),
+                        "x": number("x, in window points unless coordinate_space says otherwise."),
+                        "y": number("y, in window points unless coordinate_space says otherwise."),
                     ], required: ["direction"])
             ),
             Tool(
@@ -207,7 +216,7 @@ enum ToolCatalog {
             Tool(
                 name: "screenshot",
                 description:
-                    "Capture a PNG of one window, even when it is covered or on another Space. Divide image pixels by scale to get window-local points.",
+                    "Capture a PNG of one window, even when it is covered or on another Space. The image is scaled down so its long edge is at most 1024 px; scale is image pixels per window point. To act at a pixel you see, pass it to click, drag or scroll with coordinate_space=\"screenshot\", or divide it by scale for window points.",
                 inputSchema: schema(["window_id": windowID]),
                 annotations: .init(readOnlyHint: true)
             ),
@@ -329,6 +338,11 @@ enum ToolCatalog {
                 if windowScopedTools.contains(tool.name) {
                     props["app"] = string(
                         "App name or bundle id, instead of window_id. Reads and screenshots use the app's main window; actions, inspect_element and scoped reads use the window of that app you observed last.")
+                }
+                if ["click", "drag", "scroll"].contains(tool.name) {
+                    props["coordinate_space"] = string(
+                        "How to read x/y: window (window-local points) or screenshot (pixels of your latest screenshot of this window; the server divides by its scale).",
+                        enumValues: ["window", "screenshot"], default: "window")
                 }
                 if observingTools.contains(tool.name) {
                     props["observe"] = string(

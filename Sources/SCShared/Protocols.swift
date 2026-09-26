@@ -69,8 +69,15 @@ public protocol DesktopControlling: AnyObject, Sendable {
     /// `stopOnLayoutChange`, a pixel step whose window changed size since it was last observed stops the batch.
     func runBatch(windowID: UInt32, steps: [BatchStep], stopOnError: Bool, stopOnLayoutChange: Bool,
                   admit: @escaping @Sendable (BatchStep) throws -> Void) async throws -> [BatchStepResult]
-    /// Returns once the window's accessibility tree has stopped changing (~300 ms), or after ~3 s.
+    /// Returns once the window's accessibility tree has stopped changing (~200 ms), or after ~3 s.
     func settle(windowID: UInt32) async
+    /// Keeps `session`'s on-screen presence (arrow and menu bar) alive; called for every admitted window or app
+    /// call, with the app it works in. With `showArrow` (keyboard actions), an arrow that is not showing yet
+    /// appears near the window's focused element, if the window is on the user's current Space.
+    func noteAgentActivity(session: String, windowID: UInt32?, app: String?, showArrow: Bool)
+    /// `session`'s task is over (turn end, session close); presence goes once no session is active.
+    func endAgentActivity(session: String)
+    func agentActivity() -> AgentActivityStatus
 }
 
 /// What the visible agent cursor should show. Points are global screen points, top-left origin.
@@ -78,12 +85,38 @@ public enum AgentCursorEvent: Sendable, Equatable {
     case click(at: Point, count: Int)
     case drag(from: Point, to: Point)
     case scroll(at: Point)
+    /// A call that moves nothing (a read or a keyboard action) keeps `session` active without moving the
+    /// arrow. `near` shows a hidden arrow there; nil leaves it as it is.
+    case activity(session: String, app: String?, near: Point?)
+    case end(session: String)
 }
 
-/// Draws the agent's own on-screen cursor (never the user's). `present` returns once the cursor
-/// has arrived at the target, so the action it announces happens where the user sees it.
+/// Whether an agent task is showing on screen, as the menu bar and the `status` tool report it.
+public struct AgentActivityStatus: Sendable, Equatable {
+    public var active: Bool
+    /// The app of the latest call.
+    public var app: String?
+    public var sessions: [String]
+    /// Where the arrow's tip rests; nil while it is hidden.
+    public var arrow: Point?
+    public var idleSeconds: Double?
+
+    public init(active: Bool = false, app: String? = nil, sessions: [String] = [], arrow: Point? = nil,
+                idleSeconds: Double? = nil) {
+        self.active = active
+        self.app = app
+        self.sessions = sessions
+        self.arrow = arrow
+        self.idleSeconds = idleSeconds
+    }
+}
+
+/// Draws the agent's own on-screen cursor (never the user's) and keeps it up while a task runs. Pointer
+/// events return once the cursor has arrived (bounded to ~0.25 s), so the action they announce happens
+/// where the user sees it; `activity` and `end` return at once.
 public protocol AgentCursorPresenting: AnyObject, Sendable {
     func present(_ event: AgentCursorEvent)
+    func activity() -> AgentActivityStatus
 }
 
 /// The agent-owned virtual display. Windows hosted there are on an always-active Space
