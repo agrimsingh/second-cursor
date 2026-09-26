@@ -23,8 +23,9 @@ extension ToolRouter {
         else { return raw }
         // A label scope is looked up afresh like a plain read; an index scope refers to what the session saw.
         let indexScoped = try args.scope().index != nil
+        let waitsOnIndex = try name == "wait_for" && args.optionalInt("element_index") != nil
         var resolved = raw
-        if Self.observedWindowTools.contains(name) || (name == "get_window_state" && indexScoped) {
+        if Self.observedWindowTools.contains(name) || (name == "get_window_state" && indexScoped) || waitsOnIndex {
             let session = try args.optionalString("session_id") ?? "legacy"
             resolved["window_id"] = .int(Int(try observedWindow(app, session: session)))
         } else if name == "find_elements",
@@ -82,6 +83,7 @@ extension ToolRouter {
             let permissions = desktop.permissionStatus()
             var runtime = sessions.statistics()
             runtime["http_connections"] = connectionCount()
+            runtime["observed_apps"] = desktop.observedApps()
             return ToolOutput(json: [
                 "permissions": [
                     "accessibility": permissions.accessibility, "screen_recording": permissions.screenRecording,
@@ -228,6 +230,16 @@ extension ToolRouter {
             let text = try args.string("text")
             let format = try args.optionalString("format") ?? "text"
             return try await act(args) { try await desktop.paste(windowID: $0, text: text, format: format) }
+        case "wait_for":
+            let windowID = try args.windowID()
+            let (condition, timeout) = try Self.condition(args, field: nil)
+            let outcome = try await desktop.waitFor(windowID: windowID, condition: condition, timeout: timeout)
+            var json: [String: Any] = [
+                "status": outcome.met ? "verified" : "failed", "waited_ms": Self.milliseconds(outcome.waited),
+                "detail": outcome.detail, "window_id": windowID,
+            ]
+            _ = await attachObservation(windowID, mode: "tree", full: false, to: &json)
+            return ToolOutput(json: json)
         case "screenshot":
             let windowID = try args.windowID()
             let shot = try await desktop.screenshot(windowID: windowID)
@@ -262,16 +274,93 @@ extension ToolRouter {
         }
     }
 
-    /// Runs a native action on the target window, then reports what it changed. `observe` is checked
+    /// Runs a native action on the target window, then reports what it changed. `observe` and `expect` are checked
     /// before anything is sent to the app.
     private func act(_ args: Arguments, _ perform: (UInt32) async throws -> ActionResult) async throws -> ToolOutput {
         let windowID = try args.windowID()
         let mode = try Self.observeMode(args)
+        let expectation = try Self.expectation(args)
+        let before = try await checkBefore(windowID, expectation)
         var json = Shape.action(try await perform(windowID))
         json["window_id"] = windowID
+        if let expectation {
+            json["expect"] = await expectResult(windowID, expectation, before: before, timeout: expectation.timeout)
+        }
         let images = await attachObservation(windowID, mode: mode, full: false, to: &json)
         return ToolOutput(json: json, images: images)
     }
+
+    private struct Expectation {
+        let condition: WaitCondition
+        let timeout: TimeInterval
+    }
+
+    /// `expect` may arrive as a JSON string (Gemini through Cursor stringifies nested objects). Unknown fields are
+    /// refused by name, since a garbled key would otherwise leave the check silently weaker.
+    private static func expectation(_ args: Arguments) throws -> Expectation? {
+        guard let value = args.raw["expect"], !value.isNull else { return nil }
+        guard let object = Arguments.nestedObject(value) else {
+            let got = value.stringValue.map { ", not the string \"\($0.prefix(60))\"" } ?? ""
+            throw SCError.invalidArgument("expect must be an object such as {\"text\": \"Saved\"}\(got)")
+        }
+        let unknown = object.keys.filter { !["text", "element_index", "value", "gone", "timeout_ms"].contains($0) }.sorted()
+        guard unknown.isEmpty else {
+            throw SCError.invalidArgument(
+                "expect: unrecognized fields \(unknown.joined(separator: ", ")); it takes text, element_index with value, gone and timeout_ms")
+        }
+        let (condition, timeout) = try condition(Arguments(object), field: "expect")
+        return Expectation(condition: condition, timeout: timeout)
+    }
+
+    /// The condition fields shared by `expect` and `wait_for`; errors name `field` when given.
+    private static func condition(_ args: Arguments, field: String?) throws -> (WaitCondition, TimeInterval) {
+        do {
+            let text = try args.optionalString("text")
+            let index = try args.optionalInt("element_index")
+            let value = try args.optionalString("value")
+            guard text != nil || index != nil || value != nil else {
+                throw SCError.invalidArgument("pass text, or element_index with value, e.g. {\"text\": \"Saved\"}")
+            }
+            if text?.isEmpty == true { throw SCError.invalidArgument("text must not be empty") }
+            guard (index == nil) == (value == nil) else {
+                throw SCError.invalidArgument("element_index and value go together: the element must have exactly that value")
+            }
+            let condition = WaitCondition(text: text, elementIndex: index, value: value, gone: try args.bool("gone", default: false))
+            return (condition, Double(min(max(try args.int("timeout_ms", default: 2000), 0), 10_000)) / 1000)
+        } catch SCError.invalidArgument(let reason) {
+            throw SCError.invalidArgument(field.map { "\($0): \(reason)" } ?? reason)
+        }
+    }
+
+    /// A bad element_index is refused here, before anything is sent to the app.
+    private func checkBefore(_ windowID: UInt32, _ expectation: Expectation?) async throws -> ConditionResult? {
+        guard let expectation else { return nil }
+        do {
+            return try await desktop.checkCondition(windowID: windowID, condition: expectation.condition)
+        } catch let error as SCError {
+            switch error {
+            case .elementNotFound, .staleSnapshot: throw SCError.invalidArgument("expect: \(Self.message(for: error))")
+            default: throw error
+            }
+        }
+    }
+
+    /// Waits for the expectation after the action and reports it. The action already happened, so a failed wait is
+    /// reported in the result, never thrown.
+    private func expectResult(_ windowID: UInt32, _ expectation: Expectation, before: ConditionResult?,
+                              timeout: TimeInterval) async -> [String: Any] {
+        let started = Date()
+        do {
+            let after = try await desktop.waitFor(windowID: windowID, condition: expectation.condition, timeout: timeout)
+            let status = !after.met ? "failed" : before?.met == true ? "preexisting" : "verified"
+            return ["status": status, "waited_ms": Self.milliseconds(after.waited), "detail": after.detail]
+        } catch {
+            return ["status": "failed", "waited_ms": Self.milliseconds(Date().timeIntervalSince(started)),
+                    "detail": Self.message(for: error)]
+        }
+    }
+
+    private static func milliseconds(_ seconds: TimeInterval) -> Int { Int((seconds * 1000).rounded()) }
 
     private static func observeMode(_ args: Arguments) throws -> String {
         let mode = try args.optionalString("observe")?.lowercased() ?? "tree"
@@ -400,6 +489,8 @@ extension ToolRouter {
             try Self.batchStep($0.element, index: $0.offset, defaultWindow: windowID)
         }
         let observe = try Self.observeMode(args)
+        let expectation = try Self.expectation(args)
+        let before = try await checkBefore(windowID, expectation)
 
         // Each step passes the same gates as a standalone call and gets its own log line, refusals included.
         let full = try args.bool("full", default: false)
@@ -440,6 +531,12 @@ extension ToolRouter {
             "window_id": windowID,
             "observation": NSNull(),
         ]
+        if let expectation {
+            // A batch that stopped early did not do what the expectation describes, so it is checked once, not waited for.
+            json["expect"] = await expectResult(
+                windowID, expectation, before: before,
+                timeout: results.contains(where: \.skipped) ? 0 : expectation.timeout)
+        }
         let images = await attachObservation(windowID, mode: observe, full: full, to: &json)
         return ToolOutput(json: json, images: images)
     }
