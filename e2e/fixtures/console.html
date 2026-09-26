@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Northwind Admin</title>
+<style>
+  body { font: 14px/1.45 -apple-system, system-ui, sans-serif; margin: 0; }
+  header, footer { padding: 8px 16px; border-bottom: 1px solid #ddd; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  footer { border-top: 1px solid #ddd; border-bottom: 0; }
+  .layout { display: grid; grid-template-columns: 220px 1fr 300px; }
+  #sidebar, aside { padding: 8px; border-right: 1px solid #eee; }
+  #sidebar button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 3px 6px; font: inherit; }
+  #sidebar button[aria-current="page"] { background: #eef3ff; }
+  main { padding: 12px 20px; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { border-bottom: 1px solid #eee; padding: 4px 6px; text-align: left; }
+  aside li { margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <strong>Northwind Admin</strong>
+  <input type="search" aria-label="Search the console" placeholder="Search">
+  <nav aria-label="Product" id="product"></nav>
+  <button>Account menu</button>
+</header>
+<div class="layout">
+  <nav id="sidebar" aria-label="Settings"></nav>
+  <main id="main"></main>
+  <aside aria-label="Recent activity"><h2>Recent activity</h2><ul id="activity"></ul></aside>
+</div>
+<footer id="footer"></footer>
+<script>
+const FIRST = ["Ava", "Liam", "Noah", "Emma", "Olivia", "Lucas", "Mia", "Ethan", "Sofia", "Mateo", "Isla", "Leo",
+  "Zara", "Omar", "Hana", "Ivan", "Nora", "Kai", "Lena", "Arjun"];
+const LAST = ["Chen", "Patel", "Garcia", "Kim", "Nguyen", "Okafor", "Rossi", "Schmidt", "Silva", "Tanaka", "Walsh",
+  "Haddad", "Novak", "Berg", "Costa", "Dubois", "Ali", "Moreau", "Park", "Singh"];
+const ROLES = ["Owner", "Admin", "Member", "Viewer"];
+const MEMBERS = Array.from({ length: 80 }, (_, i) => {
+  const name = i === 47 ? "Maya Chen" : i === 12 ? "Maya Cheng" : `${FIRST[i % 20]} ${LAST[(i * 3 + Math.floor(i / 20)) % 20]}`;
+  const role = i === 0 ? "Owner" : i === 12 ? "Member" : ["Member", "Member", "Member", "Viewer", "Admin", "Member", "Member", "Viewer"][i % 8];
+  return { name, email: `${name.toLowerCase().replace(" ", ".")}@northwind.io`, role };
+});
+const NOTIFICATIONS = {
+  "Email notifications": ["Weekly digest", "Mentions", "Direct messages", "Comments on my tasks", "Task assigned to me",
+    "Due date reminders", "Project updates", "New sign-ins", "Billing receipts", "Product news", "Team invitations",
+    "Export ready", "Integration errors", "Security alerts", "Monthly report"],
+  "Push notifications": ["Weekly digest", "Mentions", "Direct messages", "Comments on my tasks", "Task assigned to me",
+    "Due date reminders", "Project updates", "New sign-ins", "Security alerts", "Calendar events", "Status changes",
+    "Approvals", "Reactions", "Followers", "Reminders"],
+  "Slack notifications": ["Mentions", "Direct messages", "Project updates", "Deploys", "Incidents", "Approvals",
+    "Weekly digest summary", "Status changes", "New sign-ins", "Billing receipts"],
+};
+const NOTIFY_OFF = new Set(["Email notifications:Product news", "Push notifications:Reactions", "Push notifications:Followers",
+  "Slack notifications:Billing receipts"]);
+const TIMEOUTS = ["15 minutes", "30 minutes", "1 hour", "4 hours", "8 hours", "24 hours"];
+const POLICIES = ["Standard", "Strong", "Very strong"];
+const INTEGRATIONS = [
+  ["Slack", "Send notifications and approvals to channels.", true],
+  ["Microsoft Teams", "Post updates to Teams channels.", false],
+  ["Google Drive", "Attach and preview Drive files.", true],
+  ["Dropbox", "Attach and preview Dropbox files.", false],
+  ["Jira Software", "Link issues and sync sprint status.", true],
+  ["Jira Service Management", "Create service requests from tickets.", true],
+  ["Confluence", "Embed and link Confluence pages.", true],
+  ["GitHub", "Link pull requests and commits.", true],
+  ["GitLab", "Link merge requests and pipelines.", false],
+  ["Bitbucket", "Link pull requests and builds.", false],
+  ["Zendesk", "Turn tickets into tasks.", true],
+  ["Intercom", "Turn conversations into tasks.", false],
+  ["Salesforce", "Sync accounts and opportunities.", true],
+  ["HubSpot", "Sync contacts and deals.", false],
+  ["Figma", "Embed live Figma frames.", true],
+  ["Miro", "Embed Miro boards.", false],
+  ["Zoom", "Start meetings from tasks.", true],
+  ["Google Calendar", "Show due dates on your calendar.", true],
+  ["Outlook Calendar", "Show due dates in Outlook.", false],
+  ["Okta", "Provision users with SCIM.", true],
+  ["PagerDuty", "Open incidents from alerts.", false],
+  ["Datadog", "Attach monitors to projects.", true],
+  ["Sentry", "Link errors to tasks.", true],
+  ["Linear", "Import Linear issues.", false],
+];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const INVOICES = Array.from({ length: 36 }, (_, i) => {
+  const year = 2023 + Math.floor((i + 9) / 12), month = (i + 9) % 12;
+  const number = `INV-${year}-${String(month + 1).padStart(2, "0")}`;
+  const cents = number === "INV-2026-03" ? 128450 : 110000 + ((i * 3719) % 24000) + ((i * 17) % 4) * 25;
+  return { number, date: `${MONTHS[month]} 1, ${year}`, amount: `$${(cents / 100).toLocaleString("en-US", { minimumFractionDigits: 2 })}` };
+}).reverse();
+const SECTIONS = {
+  General: ["Overview", "Workspace profile", "Branding", "Localization", "Domains"],
+  People: ["Team", "Groups", "Invitations", "Guests"],
+  Communication: ["Notifications", "Email templates", "Announcements"],
+  Protection: ["Security", "Audit log", "API keys", "Data retention", "Compliance"],
+  Connections: ["Integrations", "Webhooks", "OAuth apps", "Marketplace"],
+  Money: ["Billing", "Plans", "Payment methods", "Tax settings", "Usage"],
+  Advanced: ["Feature flags", "Sandbox", "Export data", "Delete workspace"],
+};
+const VERBS = ["updated", "commented on", "archived", "created", "moved", "shared", "renamed", "closed"];
+const OBJECTS = ["the Q3 roadmap", "Onboarding checklist", "Invoice approvals", "the mobile release plan",
+  "Brand refresh", "Customer interviews", "the pricing page", "Sprint 42 board", "the hiring tracker", "API docs"];
+
+// Like a web app with a backend: the fixture server keeps every change, so work survives a reload, and the harness
+// scores what the server holds. `was` is the value before the change, so the server knows each setting's original.
+const saved = {};
+let section = "Overview";
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(document.createElement(tag), props);
+  node.append(...kids);
+  return node;
+};
+
+const current = (key, fallback) => (key in saved ? saved[key] : fallback);
+function change(key, value, was) {
+  saved[key] = value;
+  fetch("action", { method: "POST", body: JSON.stringify({ key, value, was }) });
+  render();
+}
+
+function chrome() {
+  for (const name of ["Dashboard", "Projects", "Reports", "Docs", "Status", "Changelog", "Support", "Community"])
+    $("product").append(el("a", { href: "#", textContent: name }));
+  for (const [group, items] of Object.entries(SECTIONS)) {
+    $("sidebar").append(el("h3", { textContent: group }));
+    for (const item of items) {
+      const button = el("button", { textContent: item });
+      button.addEventListener("click", () => { section = item; render(); });
+      $("sidebar").append(button);
+    }
+  }
+  for (let i = 0; i < 120; i++) {
+    const who = MEMBERS[(i * 7) % 80].name;
+    const text = `${who} ${VERBS[i % 8]} ${OBJECTS[(i * 3) % 10]} · ${1 + (i % 23)}h ago`;
+    $("activity").append(el("li", {}, el("span", { textContent: text }), " ", el("button", { textContent: "View" })));
+  }
+  for (const name of ["About", "Careers", "Blog", "Press", "Security", "Privacy", "Terms", "Cookies", "Accessibility",
+    "Status", "Docs", "API", "SDKs", "Integrations", "Partners", "Customers", "Pricing", "Enterprise", "Startups",
+    "Nonprofits", "Education", "Events", "Webinars", "Community", "Forum", "Support", "Contact", "Sitemap", "Legal", "Trust"])
+    $("footer").append(el("a", { href: "#", textContent: name }));
+}
+
+function team(main) {
+  main.append(el("h1", { textContent: "Team members" }),
+    el("p", { textContent: `${MEMBERS.filter((m) => !current(`removed:${m.name}`, false)).length} members` }));
+  const table = el("table", { ariaLabel: "Team members" });
+  table.append(el("tr", {}, ...["Name", "Email", "Role", "Actions"].map((h) => el("th", { textContent: h }))));
+  for (const m of MEMBERS) {
+    if (current(`removed:${m.name}`, false)) continue;
+    const role = current(`role:${m.name}`, m.role);
+    const actions = el("td");
+    if (openMenu === m.name) {
+      for (const r of ROLES) {
+        const b = el("button", { textContent: `Make ${m.name} ${r}` });
+        b.addEventListener("click", () => { openMenu = null; change(`role:${m.name}`, r, role); });
+        actions.append(b);
+      }
+      const cancel = el("button", { textContent: "Cancel" });
+      cancel.addEventListener("click", () => { openMenu = null; render(); });
+      actions.append(cancel);
+    } else {
+      const edit = el("button", { textContent: `Change role for ${m.name}` });
+      edit.addEventListener("click", () => { openMenu = m.name; render(); });
+      const remove = el("button", { textContent: `Remove ${m.name}` });
+      remove.addEventListener("click", () => change(`removed:${m.name}`, true, false));
+      actions.append(edit, " ", remove);
+    }
+    table.append(el("tr", {}, el("td", { textContent: m.name }), el("td", { textContent: m.email }),
+      el("td", { textContent: role }), actions));
+  }
+  main.append(table);
+}
+let openMenu = null;
+
+function notifications(main) {
+  main.append(el("h1", { textContent: "Notifications" }));
+  for (const [group, items] of Object.entries(NOTIFICATIONS)) {
+    const set = el("fieldset", {}, el("legend", { textContent: group }));
+    for (const item of items) {
+      const key = `notify:${group}:${item}`;
+      const on = current(key, !NOTIFY_OFF.has(`${group}:${item}`));
+      const box = el("input", { type: "checkbox", checked: on });
+      box.addEventListener("change", () => change(key, box.checked, on));
+      set.append(el("label", {}, box, ` ${item}`), el("br"));
+    }
+    main.append(set);
+  }
+}
+
+function radios(main, legend, key, options, fallback) {
+  const chosen = current(key, fallback);
+  const set = el("fieldset", {}, el("legend", { textContent: legend }));
+  for (const option of options) {
+    const radio = el("input", { type: "radio", name: key, checked: option === chosen });
+    radio.addEventListener("change", () => change(key, option, chosen));
+    set.append(el("label", {}, radio, ` ${option}`), el("br"));
+  }
+  main.append(set);
+}
+
+function security(main) {
+  main.append(el("h1", { textContent: "Security" }));
+  radios(main, "Session timeout", "security:Session timeout", TIMEOUTS, "8 hours");
+  radios(main, "Password policy", "security:Password policy", POLICIES, "Standard");
+  for (const [item, fallback] of [["Require two-factor authentication", true], ["Allow SSO sign-in only", false],
+    ["Block sign-ins from new countries", false]]) {
+    const key = `security:${item}`;
+    const on = current(key, fallback);
+    const box = el("input", { type: "checkbox", checked: on });
+    box.addEventListener("change", () => change(key, box.checked, on));
+    main.append(el("label", {}, box, ` ${item}`), el("br"));
+  }
+  main.append(el("h2", { textContent: "Allowed IP ranges" }),
+    el("ul", {}, ...Array.from({ length: 12 }, (_, i) => el("li", { textContent: `10.${i * 7}.0.0/16 · Office ${i + 1}` }))));
+}
+
+function integrations(main) {
+  main.append(el("h1", { textContent: "Integrations" }));
+  for (const [name, description, fallback] of INTEGRATIONS) {
+    const key = `integration:${name}`;
+    const on = current(key, fallback);
+    const button = el("button", { textContent: `${on ? "Disconnect" : "Connect"} ${name}` });
+    button.addEventListener("click", () => change(key, !on, on));
+    main.append(el("article", {}, el("h3", { textContent: name }), el("p", { textContent: description }),
+      el("p", { textContent: on ? "Connected" : "Not connected" }), button));
+  }
+}
+
+function billing(main) {
+  main.append(el("h1", { textContent: "Billing" }), el("p", { textContent: "Plan: Business · 80 seats · billed monthly" }));
+  const table = el("table", { ariaLabel: "Invoices" });
+  table.append(el("tr", {}, ...["Invoice", "Date", "Amount", "Status", ""].map((h) => el("th", { textContent: h }))));
+  for (const inv of INVOICES)
+    table.append(el("tr", {}, el("td", { textContent: inv.number }), el("td", { textContent: inv.date }),
+      el("td", { textContent: inv.amount }), el("td", { textContent: "Paid" }),
+      el("td", {}, el("button", { textContent: `Download ${inv.number}` }))));
+  main.append(table);
+}
+
+const VIEWS = { Team: team, Notifications: notifications, Security: security, Integrations: integrations, Billing: billing };
+function render() {
+  for (const b of $("sidebar").querySelectorAll("button")) b.setAttribute("aria-current", b.textContent === section ? "page" : "false");
+  const main = $("main");
+  main.replaceChildren();
+  if (VIEWS[section]) VIEWS[section](main);
+  else if (section === "Overview") main.append(el("h1", { textContent: "Overview" }),
+    el("p", { textContent: "Northwind · Business plan · 80 members · 24 integrations available" }));
+  else main.append(el("h1", { textContent: section }), el("p", { textContent: "Nothing to configure here yet." }));
+}
+
+chrome();
+fetch("state").then((response) => response.json()).then((state) => { Object.assign(saved, state.saved); render(); });
+</script>
+</body>
+</html>
