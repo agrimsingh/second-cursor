@@ -551,7 +551,8 @@ def late_session_grant_after_turn_end(ctx):
     if outcome != ["allowed"]:
         raise Skip(f"nobody clicked Allow for this session; late-grant path not exercised ({outcome})")
     ctx.check("the late answer let the waiting call through once", True)
-    error = refused(lambda: client.call("get_window_state", window_id=wid, timeout_ms=1500))
+    # Too short for a person to answer, so a pass can't come from someone clicking this check's own prompt.
+    error = refused(lambda: client.call("get_window_state", window_id=wid, timeout_ms=400))
     ctx.check(
         "the next turn asks again: the late grant was not recorded",
         error is not None and "approval" in error.lower(),
