@@ -118,10 +118,12 @@ class FocusProbe:
         except (FileNotFoundError, json.JSONDecodeError):
             return None
 
-    def start(self):
+    def start(self, avoid=None):
+        """Covers the main screen, or with `avoid` (a global frame dict), sits small in a screen corner clear of it."""
         app = build_probe_app()
         self.state_path.unlink(missing_ok=True)
-        subprocess.run(["open", "-n", str(app), "--args", "--state", str(self.state_path)],
+        extra = ["--avoid", f"{avoid['x']},{avoid['y']},{avoid['width']},{avoid['height']}"] if avoid else []
+        subprocess.run(["open", "-n", str(app), "--args", "--state", str(self.state_path), *extra],
                        check=True, capture_output=True, timeout=30)
         deadline, state = time.time() + 15, None
         while time.time() < deadline:
@@ -165,6 +167,7 @@ class FocusProbe:
             if final:
                 (self.ctx.run.dir / f"{self.ctx.name}-probe.json").write_text(json.dumps(final, indent=2))
             stop_process(self.pid)
+            self.pid = None
             time.sleep(0.5)
         # The harness requires the frontmost app to be unchanged by the scenario.
         if self.previous.get("bundle_id") and observe()["frontmost"]["pid"] != self.previous["pid"]:

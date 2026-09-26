@@ -1,12 +1,15 @@
 import AppKit
 import QuartzCore
+import SCCore
 import SCShared
 
 /// A borderless, click-through overlay that draws the agent's own cursor and moves it to each action, so the user
 /// can watch the agent work. It never touches the real cursor; it only paints one. Between actions the cursor rests
 /// where it last pointed for as long as the task is active: from any agent call until every active session's turn
-/// has ended or it closed, the user pauses, or no call came for `idleTimeout`. The extension draws the same cursor
-/// inside agent Chrome tabs (extension/cursor.js); keep the two designs in step.
+/// has ended or it closed, the user pauses, or no call came for `idleTimeout`. The cursor belongs to its window:
+/// the overlay sits directly above that window, so whatever covers the window covers the cursor, and it fades out
+/// while the point is covered or the window is on another Space. The extension draws the same cursor inside agent
+/// Chrome tabs (extension/cursor.js); keep the two designs in step.
 final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Sendable {
     /// For hosts without a turn-end hook, which never say that a task is over.
     static let idleTimeout: TimeInterval = 60
@@ -16,6 +19,8 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
 
     private let window: NSWindow
     private let root = CALayer()
+    /// Fades the whole cursor while the user cannot see its point, independently of the task's own appear and hide.
+    private let stage = CALayer()
     /// Sits exactly on the tip; everything below is positioned relative to it.
     private let cursor = CALayer()
     /// The arrow and its glow, rotated and pressed around the tip without moving the caption.
@@ -38,6 +43,9 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
     private var caption: String?
     private var typing: Timer?
     private var watchdog: Timer?
+    /// The window the cursor sits above, its app, and whether the user can see the cursor's point.
+    private var anchor: (window: UInt32, layer: Int, pid: Int32)?
+    private var visible = false
 
     private let lock = NSLock()
     private var published = AgentActivityStatus()
@@ -52,7 +60,6 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         window.backgroundColor = .clear
         window.hasShadow = false
         window.ignoresMouseEvents = true
-        window.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
 
         root.frame = CGRect(origin: .zero, size: frame.size)
@@ -62,6 +69,12 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         window.contentView = host
         buildLayers()
         window.orderFrontRegardless()
+
+        // Raising the target app, or switching Spaces, changes what the user can see before the next poll.
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification] {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.refreshAnchor() }
+        }
     }
 
     func present(_ event: AgentCursorEvent) {
@@ -70,6 +83,8 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
             DispatchQueue.main.async { self.noteActivity(session: session, app: app, near: near, caption: caption) }
         case let .end(session):
             DispatchQueue.main.async { self.end([session]) }
+        case let .target(window, layer, pid, visible):
+            DispatchQueue.main.async { self.setAnchor((window, layer, pid), visible: visible) }
         case .click, .drag, .scroll:
             let arrived = DispatchSemaphore(value: 0)
             DispatchQueue.main.async { self.point(event) { arrived.signal() } }
@@ -113,6 +128,7 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         watchdog = nil
         setCaption(nil)
         releaseArrival()
+        anchor = nil
         if restingAt != nil {
             restingAt = nil
             generation += 1
@@ -142,13 +158,41 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         let cutoff = Date().addingTimeInterval(-Self.idleTimeout)
         let stale = sessions.filter { $0.value < cutoff }.map(\.key)
         if !stale.isEmpty || sessions.isEmpty { end(stale) }
+        refreshAnchor()
+    }
+
+    /// Windows move, get covered, and change Spaces without telling us, so the anchor is checked again while resting.
+    private func refreshAnchor() {
+        guard let restingAt, let anchor else { return }
+        if let found = Desktop.cursorAnchor(at: restingAt, pid: anchor.pid) {
+            setAnchor((found.window, found.layer, anchor.pid), visible: found.visible)
+        } else {
+            setAnchor(anchor, visible: false)
+        }
+    }
+
+    /// Orders the overlay directly above the anchor window, at its layer, so windows in front of that window are in
+    /// front of the cursor too; an app's own menus are anchors themselves and stay beneath it.
+    private func setAnchor(_ new: (window: UInt32, layer: Int, pid: Int32), visible: Bool) {
+        anchor = new
+        if visible {
+            window.level = NSWindow.Level(rawValue: new.layer)
+            window.order(.above, relativeTo: Int(new.window))
+        }
+        guard visible != self.visible else { return }
+        self.visible = visible
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.15)
+        stage.opacity = visible ? 1 : 0
+        CATransaction.commit()
+        publish()
     }
 
     private func publish() {
         let active = !sessions.isEmpty
         let status = AgentActivityStatus(
             active: active, app: active ? app : nil, sessions: sessions.keys.sorted(), arrow: restingAt,
-            caption: active ? caption : nil)
+            arrowVisible: restingAt != nil && visible, caption: active ? caption : nil)
         lock.lock()
         let changed = published.active != status.active || published.app != status.app
         published = status
@@ -173,7 +217,7 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
             move(to: from, arrived: arrived) { self.slide(to: to) }
         case let .scroll(at):
             move(to: at, arrived: arrived) { self.rest() }
-        case .activity, .end:
+        case .activity, .end, .target:
             arrived()
         }
         watch()
@@ -182,13 +226,13 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
 
     /// Short moves spring straight to the target; long ones travel an arc that bows away from the straight line,
     /// leaning toward the direction of travel. A cursor that is not showing appears at the target. Arrival is when
-    /// the cursor reaches the target, not when its spring stops settling.
+    /// the cursor reaches the target, not when its spring stops settling. A cursor the user cannot see jumps there
+    /// and arrives at once, so it is in place when its window comes back into view.
     private func move(to global: Point, arrived: @escaping () -> Void, then landed: @escaping () -> Void) {
         let target = layerPoint(global)
         generation += 1
         let move = generation
         releaseArrival()
-        pendingArrival = arrived
         stopResting()
         let appearing = restingAt == nil
         let start = cursor.presentation()?.position ?? cursor.position
@@ -198,8 +242,20 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         CATransaction.setDisableActions(true)
         cursor.position = target
         placePill(at: target)
+        if !visible {
+            cursor.removeAnimation(forKey: "move")
+            cursor.opacity = 1
+            cursor.transform = CATransform3DIdentity
+        }
         CATransaction.commit()
 
+        guard visible else {
+            if appearing, let caption { showPill(caption) }
+            arrived()
+            landed()
+            return
+        }
+        pendingArrival = arrived
         let arrival: TimeInterval
         if appearing {
             appear()
@@ -457,9 +513,12 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
 
     private func buildLayers() {
         let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
+        stage.frame = root.bounds
+        stage.opacity = 0
+        root.addSublayer(stage)
         cursor.bounds = .zero
         cursor.opacity = 0
-        root.addSublayer(cursor)
+        stage.addSublayer(cursor)
 
         breath.type = .radial
         breath.colors = [Self.accent.withAlphaComponent(0.5).cgColor, Self.accent.withAlphaComponent(0).cgColor]

@@ -20,7 +20,8 @@ If tools fail with "not running" or permission errors, run `SecondCursor doctor`
 5. Pass `app: "TextEdit"` instead of `window_id` when the app has a single obvious window; use `window_id` from `list_windows` when it has several. Read the app with `get_window_state` first: actions by `app` go to the window you observed last, and are refused if you haven't observed one.
 6. For a sequence whose steps you already know (buttons to press, fields to fill), send one `batch` instead of many calls. End the batch before any step whose outcome you need to see (a menu, dialog, search results).
 7. After the task, observe once more and confirm the result before you say it is done.
-8. Give actions a short `caption` ("Opening the Export menu", "Searching for flights"): the user sees it beside your cursor while you work. Keep it under 60 characters; an action without one clears it.
+8. To confirm an action worked, attach `expect` (`{"text": "Saved"}` or `{"element_index": 4, "value": "42"}`) instead of reading the window again; the result says `verified`, `preexisting` or `failed`. To wait for something that happens later, use `wait_for` instead of sleeping.
+9. Give actions a short `caption` ("Opening the Export menu", "Searching for flights"): the user sees it beside your cursor while you work. Keep it under 60 characters; an action without one clears it.
 
 To find one element in a big window (a button, field or row), call `find_elements` with `text` and/or `role` instead of reading the whole outline again: it searches your latest observation, including elements a truncated outline left out, and returns their `[index]` lines.
 

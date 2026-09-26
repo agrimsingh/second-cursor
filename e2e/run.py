@@ -833,9 +833,15 @@ def agent_cursor_visible(ctx):
 
     screen_x, screen_y = window["frame"]["x"] + local[0], window["frame"]["y"] + local[1]
     region = ctx.run.dir / "screenshots" / f"{ctx.name}-around-click.png"
+    time.sleep(0.3)
     subprocess.run(["screencapture", "-x", "-R", f"{int(screen_x) - 10},{int(screen_y) - 10},48,48", str(region)], check=True)
     ctx.screenshots.append(region.relative_to(ctx.run.dir).as_posix())
-    ctx.check("the agent's cursor is drawn on screen at the click point", glow_pixels(png_pixels(region.read_bytes())) >= 20)
+    drawn = glow_pixels(png_pixels(region.read_bytes()))
+    # The cursor belongs to its window: whether the user's own windows cover the click point decides if it shows.
+    if ctx.call("status")["agent_activity"]["arrow_visible"]:
+        ctx.check("the agent's cursor is drawn on screen at the click point", drawn >= 20, drawn)
+    else:
+        ctx.check("the click point is covered, and the cursor is not drawn over the covering window", drawn < 5, drawn)
 
     shot = ctx.mcp.call("screenshot", window_id=wid)[1][0]
     ctx.check("the agent's own window screenshot does not include its cursor",
@@ -1140,13 +1146,14 @@ def scope_reads(ctx):
     ctx.check("the scoped element index still acts", ctx.call("set_value", window_id=wid, element_index=area, value="ok").get("ok"))
 
 
-def links_document(ctx, name, count=200):
+def links_document(ctx, name, count=200, on_agent_display=False):
     """A TextEdit window whose text area holds `count` links: that many indexed elements, all of which move on a scroll."""
     path = ctx.scratch / name
     path.write_text("<html><body>" + "".join(
         f'<p>Paragraph {i} <a href="https://example.com/{i}">link {i}</a> trailing text</p>' for i in range(count))
         + "</body></html>")
-    launched = ctx.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True)
+    launched = ctx.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True,
+                        on_agent_display=on_agent_display)
     ctx.kill_on_exit(launched["app"]["pid"])
     return ctx.wait_for_window("TextEdit", pid=launched["app"]["pid"], title=name)
 

@@ -103,6 +103,10 @@ public enum AgentCursorEvent: Sendable, Equatable {
     /// the arrow: nil leaves it, an empty string clears it.
     case activity(session: String, app: String?, near: Point?, caption: String?)
     case end(session: String)
+    /// Sent before an event that places the cursor: the window it belongs above (the target app's frontmost window
+    /// under the point, so the app's own menus stay beneath it), that window's layer, and whether the user can see
+    /// the point. A cursor the user cannot see moves without animating and does not hold the action up.
+    case target(window: UInt32, layer: Int, pid: Int32, visible: Bool)
 }
 
 /// Whether an agent task is showing on screen, as the menu bar and the `status` tool report it.
@@ -113,24 +117,29 @@ public struct AgentActivityStatus: Sendable, Equatable {
     public var sessions: [String]
     /// Where the arrow's tip rests; nil while it is hidden.
     public var arrow: Point?
+    /// Whether the user can see the arrow: false while another window covers it or its window is on another Space.
+    public var arrowVisible: Bool
     /// The text beside the arrow, if any.
     public var caption: String?
     public var idleSeconds: Double?
 
     public init(active: Bool = false, app: String? = nil, sessions: [String] = [], arrow: Point? = nil,
-                caption: String? = nil, idleSeconds: Double? = nil) {
+                arrowVisible: Bool = false, caption: String? = nil, idleSeconds: Double? = nil) {
         self.active = active
         self.app = app
         self.sessions = sessions
         self.arrow = arrow
+        self.arrowVisible = arrowVisible
         self.caption = caption
         self.idleSeconds = idleSeconds
     }
 }
 
-/// Draws the agent's own on-screen cursor (never the user's) and keeps it up while a task runs. Pointer
-/// events return once the cursor has reached its target (bounded to 1.5 s), so the user sees where the action
-/// lands before it happens; `activity` and `end` return at once.
+/// Draws the agent's own on-screen cursor (never the user's) and keeps it up while a task runs. The cursor
+/// belongs to its window: it shows where the user can see that window and hides while another window covers it or
+/// the window is on another Space; the agent keeps working either way. Pointer events on a visible cursor return
+/// once it has reached its target (bounded to 1.5 s), so the user sees where the action lands before it happens;
+/// everything else returns at once.
 public protocol AgentCursorPresenting: AnyObject, Sendable {
     func present(_ event: AgentCursorEvent)
     func activity() -> AgentActivityStatus

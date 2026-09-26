@@ -274,6 +274,7 @@ final class ToolRouter: Sendable {
             "app": activity.app ?? NSNull(),
             "sessions": activity.sessions,
             "arrow": activity.arrow.map { ["x": $0.x, "y": $0.y] } ?? NSNull(),
+            "arrow_visible": activity.arrowVisible,
             "caption": activity.caption ?? NSNull(),
             "idle_seconds": activity.idleSeconds.map { ($0 * 10).rounded() / 10 } ?? NSNull(),
         ]

@@ -29,8 +29,9 @@ def latency(ctx):
         samples.setdefault(label, []).append(round((time.perf_counter() - started) * 1000, 1))
         return data
 
-    wid = links_document(ctx, "latency.html")["id"]
-    calc = ctx.call("launch_app", app="Calculator", new_instance=True)
+    # Off the user's screen, so no call waits for the agent cursor to land: this measures the server.
+    wid = links_document(ctx, "latency.html", on_agent_display=True)["id"]
+    calc = ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(calc["app"]["pid"])
     # Calculator can replace its first window right after launch.
     seven = None

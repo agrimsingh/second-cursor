@@ -72,6 +72,13 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// Only for windows on the user's current Space: an arrow aimed at a window they cannot see would mislead.
     private func showCursor(_ record: CGWindowRecord, _ event: AgentCursorEvent) {
         guard record.isOnScreen, let cursor else { return }
+        let point: Point
+        switch event {
+        case let .click(at, _), let .scroll(at): point = at
+        case let .drag(from, _): point = from
+        default: return cursor.present(event)
+        }
+        cursor.present(Self.target(for: point, in: record))
         cursor.present(event)
     }
 
