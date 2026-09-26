@@ -18,8 +18,8 @@ Ways this can fail, and the scenarios that catch them:
 - ocr_ms or ocr_count missing, or ocr_count disagreeing with what was merged (canvas_words, textedit_not_duplicated).
 - `scope` with `ocr` shows text from outside the scope (canvas_words).
 - Recognition is too slow on a large window to be worth calling (large_textedit_timing records ocr_ms).
-- The fixture takes focus or covers the user's screen: it is a background accessory window opened behind the others and
-  moved to the agent display; the harness checks the frontmost app, Space and cursor after every scenario.
+- The fixture takes focus or shows on the user's screen: it is a background accessory window that opens on the agent
+  display (checked when it starts); the harness checks the frontmost app, Space and cursor after every scenario.
 - The first recognition on a Mac waits minutes for Vision to compile its model: the read must still come back within
   its deadline, with the outline and ocr_error (wait_for_recognizer checks this whenever the model is not ready yet;
   on a Mac where it is, a failed recognition cannot be forced without revoking Screen Recording).
@@ -36,7 +36,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from run import Run, SCENARIOS, ToolError, element_index, scenario
+from run import Run, SCENARIOS, agent_origin, element_index, inside, scenario
 
 SCENARIOS.clear()
 
@@ -45,6 +45,17 @@ TEXT_LINE = re.compile(r'^([+-]?)( *)text "((?:[^"\\]|\\.)*)" \((-?\d+),(-?\d+) 
 OCR_ATTR = re.compile(r' ocr="((?:[^"\\]|\\.)*)"')
 TIMINGS = {}
 _probe = None
+
+
+def require_on_agent_display(ctx, wid, what):
+    """AppKit can give a fixture process other, helper windows; waits for the one it reported."""
+    display = ctx.call("agent_display", action="create")["bounds"]
+    deadline, window = time.time() + 15, None
+    while window is None and time.time() < deadline:
+        window = next((w for w in ctx.call("list_windows")["windows"] if w["id"] == wid), None)
+        time.sleep(0.2)
+    ctx.require(f"{what} opened on the agent display, not on the user's screen",
+                window and inside(window["frame"], display), (window, display))
 
 
 def probe_binary():
@@ -124,12 +135,13 @@ def wait_for_recognizer(ctx, wid, minutes=8):
 
 
 class Canvas:
-    """The custom-drawn fixture (sc-focus-probe --canvas): opened in the background, behind every window, and moved to
-    the agent display so it never shows on the user's screen for long."""
+    """The custom-drawn fixture (sc-focus-probe --canvas): a background window that opens on the agent display, so it
+    never shows on the user's screen."""
 
     def __init__(self, ctx, word="Hello Canvas"):
         self.state_path = ctx.scratch / "canvas-state.json"
-        self.process = subprocess.Popen([str(probe_binary()), "--canvas", word, "--state", str(self.state_path)],
+        self.process = subprocess.Popen([str(probe_binary()), "--canvas", word, "--state", str(self.state_path),
+                                         "--origin", agent_origin(ctx)],
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         ctx.cleanups.append(self.stop)
         deadline = time.time() + 15
@@ -138,12 +150,7 @@ class Canvas:
         state = self.read()
         ctx.require("the canvas fixture started and wrote its state", state is not None)
         self.wid = state["window"]
-        listed = ctx.wait_for_window("", pid=self.process.pid)
-        ctx.require("the canvas window is listed", listed["id"] == self.wid, listed)
-        try:
-            ctx.call("move_to_agent_display", window_id=self.wid)
-        except ToolError as e:
-            ctx.run.notes.append(f"{ctx.name}: canvas left behind other windows, not on the agent display: {e}")
+        require_on_agent_display(ctx, self.wid, "the canvas")
         wait_for_recognizer(ctx, self.wid)
 
     def read(self):
@@ -231,9 +238,8 @@ def canvas_click(ctx):
               {"clicked": (x, y), "received": clicks, "word": target})
     ctx.check("the click went through the pixel path", result.get("route") == "skylight_pointer", result)
     time.sleep(0.5)
-    if len(canvas.read()["clicks"]) > 1:
-        ctx.run.notes.append(f"{ctx.name}: one pixel click reached the canvas view {len(canvas.read()['clicks'])} times "
-                             "(Pointer posts each event through SkyLight and postToPid; an AppKit view gets both)")
+    ctx.check("one pixel click reached the canvas view exactly once (a second copy would flip a toggle back)",
+              len(canvas.read()["clicks"]) == 1, canvas.read()["clicks"])
 
 
 @scenario

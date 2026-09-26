@@ -658,7 +658,7 @@ extension ToolRouter {
             var failures: [String] = []
             for window in fresh {
                 do {
-                    _ = try await agentDisplay.moveToAgentDisplay(windowID: window.id, pid: pid)
+                    _ = try await agentDisplay.hostLaunched(windowID: window.id, pid: pid)
                 } catch {
                     failures.append("window \(window.id): \(Self.message(for: error))")
                 }

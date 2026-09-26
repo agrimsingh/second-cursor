@@ -34,7 +34,7 @@ final class WindowResolver: @unchecked Sendable {
         let window = listedWindows(app)[wid]
             ?? [kAXMainWindowAttribute, kAXFocusedWindowAttribute].lazy.compactMap { app.element($0) }.first { $0.windowID == wid }
             ?? scanRemoteTokens(pid: pid, target: wid)[wid]
-        guard let window else { throw SCError.windowNotFound(wid) }
+        guard let window else { throw Spaces.isHidden(wid) ? SCError.windowOnHiddenSpace(wid) : SCError.windowNotFound(wid) }
         locked { cache[Key(pid: pid, wid: wid)] = window }
         return window
     }

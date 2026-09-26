@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Cursor-presence suite: while an agent task runs, its arrow and menu bar state say so; when it ends, they go.
 
-Opt-in: the arrow is only drawn over windows on the Space the user is viewing, so every scenario makes the
-`sc-focus-probe` app frontmost (covering the main screen, as in e2e/focus.py) with a scratch TextEdit behind it,
-then reads screen pixels around the arrow. Do not run it while you are using the Mac.
+Everything happens on the agent display, so the suite never touches the user's screen, focus or Space. The product
+never draws the arrow there (nobody looks at it), so this suite's test instance sets `cursorOnAgentDisplay`, which
+only test instances honor, and the scenarios read screen pixels around the arrow on that display. The covering window
+is the canvas fixture (sc-focus-probe --canvas --front), opened there without activating.
 
 Ways this can fail, each caught below:
 - The arrow hides a moment after each action, so the user cannot tell whether a task is still running
@@ -18,16 +19,20 @@ Ways this can fail, each caught below:
 - A pointer action waits longer than the arrow's travel: arrival never fires, so every action sits out the 1.5 s
   timeout; a drag waits for its own animation; a click re-runs the appear animation while the arrow rests on screen;
   or a keyboard action waits at all.
-- The arrow shows where the user cannot see its window: over the user's frontmost window covering the target, or
-  on another Space; or it stays hidden once the window is uncovered; or a covered action still waits for the arrow;
-  or covering the window also hides presence (status and the menu bar must still say the agent is active).
+- The arrow shows where the user cannot see its window: over another app's window covering the target; or it stays
+  hidden once the window is uncovered; or a covered action still waits for the arrow; or covering the window also
+  hides presence (status and the menu bar must still say the agent is active).
+- The arrow is drawn on a display other than its window's (the overlay must follow the window's display), or it
+  shows up in the agent's own screenshot of the window.
 - The caption beside the arrow is missing, stale or wrong: an action's caption never shows or does not reach
   `status`; a read (which has no caption) clears it; an action without a caption leaves the previous one up; a
   batch step's caption is ignored; the caption outlives the turn.
 
-Usage:  e2e/cursor.py [scenario ...]   (same targeting flags as e2e/run.py, e.g. SC_E2E_APP=build/SecondCursor.app)
+Usage:  e2e/cursor.py [scenario ...]   (same targeting flags as e2e/run.py, e.g. SC_E2E_APP=build/SecondCursor.app;
+        not --installed, which cannot draw on the agent display)
 Output: e2e/artifacts/<run-id>/ (report.md, results.json, transcript.jsonl, screenshots/ with every pixel region read)
 """
+import base64
 import json
 import pathlib
 import statistics
@@ -38,10 +43,10 @@ import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import run
-from run import ROOT, Run, SCENARIOS, Skip, accent_pixels, glow_pixels, png_pixels, scenario, step
-from focus import FocusProbe, text_area
+from run import ROOT, Run, SCENARIOS, accent_pixels, glow_pixels, inside, png_pixels, scenario, step, text_area
+from ocr import probe_binary, require_on_agent_display
 
-# Importing focus registers its scenarios; this suite runs only its own.
+# Importing ocr registers its scenarios; this suite runs only its own.
 SCENARIOS.clear()
 
 ARROW_MIN = 20
@@ -60,6 +65,17 @@ def turn_ended(ctx, session=None):
 
 def activity(ctx):
     return ctx.call("status").get("agent_activity") or {}
+
+
+def settled_activity(ctx, ok, seconds=1.0):
+    """Presence is published on the main thread, which can be ~0.1 s behind a call while AppKit commits a menu bar
+    item change, so a check right after a call waits for it briefly."""
+    deadline = time.time() + seconds
+    state = activity(ctx)
+    while not ok(state) and time.time() < deadline:
+        time.sleep(0.1)
+        state = activity(ctx)
+    return state
 
 
 def capture(ctx, stem, x, y, width, height):
@@ -139,19 +155,53 @@ def item_pixels(ctx, item, stem):
     return capture(ctx, stem, frame["x"], frame["y"], frame["width"], frame["height"])
 
 
+class Cover:
+    """Another app's window over `point` on the agent display: the canvas fixture, ordered front without activating."""
+
+    def __init__(self, ctx, point):
+        self.state_path = ctx.scratch / "cover-state.json"
+        # Content 20 pt left of and 10 pt above the point keeps the title bar clear of the display's menu bar.
+        origin = f"{int(point[0] - 20)},{int(point[1] - 10)}"
+        self.process = subprocess.Popen([str(probe_binary()), "--canvas", "Cover", "--state", str(self.state_path),
+                                         "--origin", origin, "--front"],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ctx.cleanups.append(self.stop)
+        deadline = time.time() + 15
+        while self.wid() is None and time.time() < deadline:
+            time.sleep(0.2)
+        ctx.require("the covering window started", self.wid() is not None)
+        require_on_agent_display(ctx, self.wid(), "the covering window")
+        frame = next(w["frame"] for w in ctx.call("list_windows")["windows"] if w["id"] == self.wid())
+        ctx.require("the covering window sits over the click point",
+                    frame["x"] < point[0] < frame["x"] + frame["width"]
+                    and frame["y"] < point[1] < frame["y"] + frame["height"], (frame, point))
+
+    def wid(self):
+        try:
+            return json.loads(self.state_path.read_text())["window"]
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def stop(self):
+        self.process.terminate()
+        try:
+            self.process.wait(5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+
+
 def start(ctx, filename="cursor.txt", covered=False):
-    """A scratch TextEdit on the current Space in the background: beside the frontmost probe, so the user can see
-    it, or with `covered`, behind a probe that covers the main screen. Returns the probe, the window, its text area's
-    index, and a point near the text area's top-left corner as (window-local, global)."""
-    probe = FocusProbe(ctx)
+    """A scratch TextEdit on the agent display, with `covered` another app's window over its text area's top-left
+    corner. Returns the cover (or None), the window, its text area's index and frame, and a point near the text
+    area's top-left corner as (window-local, global)."""
     window = ctx.launch_scratch_textedit(filename, "line one\nline two")
-    if not window["is_on_screen"]:
-        raise Skip("scratch window opened on a Space the user is not viewing; the arrow only shows on the current Space")
+    display = ctx.call("agent_display", action="create")["bounds"]
+    ctx.require("the scratch window is on the agent display", inside(window["frame"], display), (window, display))
     ctx.cleanups.append(lambda: turn_ended(ctx))
-    probe.start(avoid=None if covered else window["frame"])
     area, frame = text_area(ctx, window["id"])
     local = (frame[0] + 3, frame[1] + 6)
-    return probe, window, area, frame, local, to_global(window, local)
+    point = to_global(window, local)
+    return Cover(ctx, point) if covered else None, window, area, frame, local, point
 
 
 def to_global(window, local):
@@ -166,11 +216,11 @@ def wait_until(start_time, seconds):
     time.sleep(max(0.0, start_time + seconds - time.time()))
 
 
-def visible_or_skip(ctx, what="the click point"):
-    """The probe stays clear of the scratch window, but one of the user's own windows may still cover it."""
+def require_visible(ctx, what="the click point"):
+    """Nothing but the suite's own windows is on the agent display, so an uncovered point must show the arrow."""
     time.sleep(0.3)
-    if activity(ctx).get("arrow_visible") is not True:
-        raise Skip(f"{what} is covered by another app's window, so the arrow is rightly hidden there")
+    state = activity(ctx)
+    ctx.require(f"status: the arrow is visible at {what}", state.get("arrow_visible") is True, state)
 
 
 @scenario
@@ -179,7 +229,7 @@ def cursor_stays_for_the_task(ctx):
     wid = window["id"]
     ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none")
     clicked = time.time()
-    visible_or_skip(ctx)
+    require_visible(ctx)
 
     state = activity(ctx)
     ctx.check("status: agent active in TextEdit right after the click", state.get("active") is True
@@ -193,6 +243,9 @@ def cursor_stays_for_the_task(ctx):
         count = arrow_pixels(ctx, point, f"after-{seconds}s")
         ctx.check(f"the arrow is still drawn at the click point {seconds} s after the action", count >= ARROW_MIN, count)
     ctx.check("status still active 10 s later, with no agent calls in between", activity(ctx).get("active") is True)
+    shot = ctx.mcp.call("screenshot", window_id=wid)[1][0]
+    ctx.check("the agent's own screenshot of the window does not include the arrow",
+              glow_pixels(png_pixels(base64.b64decode(shot["data"]))) < 5)
 
     ended = turn_ended(ctx)
     ctx.check("POST /turn-ended answered ok", ended.get("ok") is True, ended)
@@ -211,7 +264,7 @@ def cursor_stays_through_keyboard_actions(ctx):
     _, window, area, _, local, point = start(ctx, "keyboard.txt")
     wid = window["id"]
     ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none")
-    visible_or_skip(ctx)
+    require_visible(ctx)
     ctx.call("type_text", window_id=wid, text="Z", observe="none")
     ctx.call("press_key", window_id=wid, keys="right", observe="none")
     ctx.call("set_value", window_id=wid, element_index=area, value="line one\nline two", observe="none")
@@ -231,7 +284,7 @@ def cursor_appears_for_keyboard_first(ctx):
     wid = window["id"]
     turn_ended(ctx)
     ctx.call("get_window_state", window_id=wid, full=True)
-    state = activity(ctx)
+    state = settled_activity(ctx, lambda s: s.get("active") is True)
     ctx.check("status: a read alone marks the agent active", state.get("active") is True, state)
     ctx.require("baseline: no arrow before the first pointer or keyboard action", not state.get("arrow"), state)
 
@@ -242,7 +295,7 @@ def cursor_appears_for_keyboard_first(ctx):
     inside = bool(arrow) and frame["x"] <= arrow["x"] < frame["x"] + frame["width"] \
         and frame["y"] <= arrow["y"] < frame["y"] + frame["height"]
     ctx.require("a first keyboard action shows the arrow inside the target window", inside, (arrow, frame))
-    visible_or_skip(ctx, "the focused element")
+    require_visible(ctx, "the focused element")
     count = arrow_pixels(ctx, (arrow["x"], arrow["y"]), "keyboard-first")
     ctx.check("the arrow is drawn where status says it is", count >= ARROW_MIN, count)
     time.sleep(3)
@@ -254,7 +307,7 @@ def cursor_appears_for_keyboard_first(ctx):
 def cursor_ends_on_pause(ctx):
     _, window, _, _, local, point = start(ctx, "pause.txt")
     ctx.call("click", window_id=window["id"], x=local[0], y=local[1], observe="none")
-    visible_or_skip(ctx)
+    require_visible(ctx)
     ctx.require("the arrow is drawn after the click", arrow_pixels(ctx, point, "before-pause") >= ARROW_MIN)
 
     subprocess.run([str(run.APP_BINARY), "--pause"], check=True, capture_output=True, timeout=10)
@@ -277,7 +330,7 @@ def cursor_idle_timeout(ctx):
     _, window, _, _, local, point = start(ctx, "idle.txt")
     ctx.call("click", window_id=window["id"], x=local[0], y=local[1], observe="none")
     clicked = time.time()
-    visible_or_skip(ctx)
+    require_visible(ctx)
 
     # Only `status` from here on: it is not a window or app call, so it does not count as agent activity.
     wait_until(clicked, IDLE_TIMEOUT - 15)
@@ -309,7 +362,7 @@ def cursor_turn_end_is_per_session(ctx):
     ctx.cleanups.append(lambda: closed or ctx.mcp.call("session", action="close", session_id=session))
 
     ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none", session_id=session)
-    visible_or_skip(ctx)
+    require_visible(ctx)
     turn_ended(ctx, "legacy")
     time.sleep(1.0)
     count = arrow_pixels(ctx, point, "after-other-turn-end")
@@ -344,9 +397,9 @@ def cursor_arrival_timing(ctx):
         return time.time() - started
 
     appearing = timed("click", x=local[0], y=local[1])
-    visible_or_skip(ctx)
+    require_visible(ctx)
     ctx.call("click", window_id=wid, x=far[0], y=far[1], observe="none")
-    visible_or_skip(ctx, "the far corner of the text area")
+    require_visible(ctx, "the far corner of the text area")
     resting = [timed("click", x=p[0], y=p[1]) for p in (far, local, far, local, far, local)]
     drag = timed("drag", from_x=local[0], from_y=local[1], to_x=far[0], to_y=far[1])
     typing = timed("type_text", text="Z")
@@ -363,7 +416,7 @@ def cursor_arrival_timing(ctx):
 
 @scenario
 def cursor_hidden_when_covered(ctx):
-    probe, window, _, _, local, point = start(ctx, "covered.txt", covered=True)
+    cover, window, _, _, local, point = start(ctx, "covered.txt", covered=True)
     wid = window["id"]
     started = time.time()
     ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none", caption="Working out of sight")
@@ -380,13 +433,11 @@ def cursor_hidden_when_covered(ctx):
     ctx.call("type_text", window_id=wid, text="Z", observe="none")
     ctx.check("the agent keeps working on the covered window", "Zline one" in ctx.tree(wid, include_screenshot=False))
 
-    # Quitting the probe re-activates the app that was frontmost before; its windows may cover TextEdit again.
-    probe.stop()
+    cover.stop()
     time.sleep(1.2)
     state = activity(ctx)
-    if state.get("arrow_visible") is not True:
-        inconclusive(ctx, "uncovering the window brings the arrow back", f"still covered by the user's windows: {state}")
-        return
+    ctx.check("uncovered: status says the arrow is visible again without a new action", state.get("arrow_visible") is True,
+              state)
     count = arrow_pixels(ctx, point, "uncovered")
     ctx.check("uncovered: the arrow is drawn at its last point without a new action", count >= ARROW_MIN, count)
 
@@ -396,7 +447,7 @@ def cursor_caption(ctx):
     _, window, _, _, local, point = start(ctx, "caption.txt")
     wid = window["id"]
     ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none")
-    visible_or_skip(ctx)
+    require_visible(ctx)
     time.sleep(0.8)
     bare = pill_region(ctx, point, "no-caption")
     ctx.require("pill region captured", bare is not None)
@@ -436,4 +487,4 @@ def cursor_caption(ctx):
 
 
 if __name__ == "__main__":
-    sys.exit(0 if Run().run(set(sys.argv[1:])) else 1)
+    sys.exit(0 if Run({"cursorOnAgentDisplay": True}).run(set(sys.argv[1:])) else 1)

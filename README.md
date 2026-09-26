@@ -26,7 +26,7 @@ flowchart LR
 - **Visible presence.** While an agent works, its cursor (a black arrowhead with an orange glow) rests at its last position on the window it is working in, with an optional caption saying what it is doing, and the menu bar icon turns orange. You see the cursor whenever you can see that window; when another window covers it or you switch Spaces, the cursor hides and the agent keeps working. In Chrome the same cursor is drawn inside the agent's tab. Everything clears when the agent's turn ends (with the Cursor stop hook), when you pause, or after a minute without agent calls. A click waits until you can see the cursor land (at most half a second for long moves), and only when you can see it.
 - **Batching.** `batch` runs a predictable sequence of steps on one window as a single uninterrupted block, then returns one observation once the UI has settled, so a model spends one round trip instead of one per action. A pixel step stops the batch if the window changed size since the model last looked at it, because its coordinates would point at the old layout.
 - **Browser.** A Chrome extension drives only the tabs it opens itself, in a "Second Cursor" tab group, over Chrome's debugger API. Existing user tabs are available only through local approval for discovery and claim operations; session cleanup leaves them open.
-- **Optional agent display.** An invisible virtual monitor is available as a private workspace (`agent_display`, `move_to_agent_display`). It is never used unless asked for.
+- **Optional agent display.** An invisible virtual monitor is available as a private workspace (`agent_display`, `move_to_agent_display`). It is never used unless asked for. One case it cannot cover: while you are in a full-screen app, an app launched with `on_agent_display` may open its window on a desktop you are not viewing, where macOS hides it from Accessibility and lets no other app move it. `launch_app` says so, and the window moves to the agent display once you show that desktop.
 
 ## Install
 
@@ -117,14 +117,17 @@ Testing is end to end only. Every suite runs against a disposable test instance,
 python3 e2e/run.py            # or name scenarios: python3 e2e/run.py textedit_background calculator
 python3 e2e/parity.py         # sessions, editing, browser
 python3 e2e/review.py         # review regressions (--short-retention for lease/retention expiry)
-python3 e2e/setup.py          # mcp stdio proxy, doctor, --turn-ended, install-mcp, onboarding gating
+python3 e2e/setup.py          # mcp stdio proxy, doctor, --turn-ended, install-mcp (--ui adds the onboarding panel)
 python3 e2e/policy.py         # approvals in deny mode (no UI), turn end, action log
 python3 e2e/instance.py       # test-instance isolation
-python3 e2e/focus.py          # focus safety; puts a probe window in front and takes focus while it runs
-python3 e2e/cursor.py         # arrow and menu-bar presence; also takes over the screen while it runs
+python3 e2e/cursor.py         # arrow and menu-bar presence, drawn on the agent display
+python3 e2e/clicks.py         # every pixel click, double-click and drag acts exactly once
 python3 e2e/latency.py        # per-call timings, written to latency.json
 python3 e2e/find.py           # find_elements, act, the compact tool surface
+python3 e2e/focus.py --takeover   # focus safety; takes focus and covers the screen, so run it while you are away
 ```
+
+Apart from `focus.py --takeover` and `setup.py --ui`, the suites put their windows on the agent display, so they run from whatever Space you are on without covering your screen or taking focus.
 
 `SC_E2E_APP=build/SecondCursor.app` tests another bundle, and `--installed` targets your running app instead (opt-in). `python3 e2e/setup.py` runs `install-mcp` against a temporary `HOME` and checks that your real client configs are unchanged.
 

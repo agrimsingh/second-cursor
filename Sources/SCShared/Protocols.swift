@@ -5,6 +5,9 @@ public enum SCError: Error, LocalizedError, Equatable {
     case permissionDenied(String)
     case appNotFound(String)
     case windowNotFound(UInt32)
+    /// On a desktop Space no display is showing, typically behind a full-screen app. macOS hides a window there from
+    /// Accessibility until some client has seen it, and refuses to let any other process move it.
+    case windowOnHiddenSpace(UInt32)
     case elementNotFound(Int)
     case staleSnapshot(UInt32)
     case actionFailed(String)
@@ -19,6 +22,10 @@ public enum SCError: Error, LocalizedError, Equatable {
         case .permissionDenied(let what): return "Permission missing: \(what)"
         case .appNotFound(let query): return "No app matches \"\(query)\""
         case .windowNotFound(let id): return "Window \(id) not found; call list_windows again"
+        case .windowOnHiddenSpace(let id):
+            return "Window \(id) is on a desktop Space the user is not viewing (a full-screen app is in front of it), "
+                + "where macOS hides it from Accessibility and lets no other app move it. It becomes reachable once "
+                + "the user shows that desktop; a window launch_app opened moves to the agent display then."
         case .elementNotFound(let index): return "Element \(index) not found in the latest snapshot"
         case .staleSnapshot(let id): return "No current snapshot for window \(id); call get_window_state first"
         case .actionFailed(let reason): return reason
@@ -151,6 +158,9 @@ public protocol AgentDisplayControlling: AnyObject, Sendable {
     func status() async -> AgentDisplayStatus
     func ensureDisplay() async throws -> AgentDisplayStatus
     func moveToAgentDisplay(windowID: UInt32, pid: Int32) async throws -> WindowPlacement
+    /// Moves a window launch_app just opened. One on a hidden Space (behind a full-screen app) throws
+    /// `windowOnHiddenSpace` and is moved once the user shows its desktop.
+    func hostLaunched(windowID: UInt32, pid: Int32) async throws -> WindowPlacement
     /// Moves a hosted window back to where it was before `moveToAgentDisplay`.
     func returnWindow(windowID: UInt32) async throws
     /// Returns every hosted window, then removes the display.

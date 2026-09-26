@@ -3,6 +3,22 @@ import AppKit
 
 @_silgen_name("CGSMainConnectionID") func CGSMainConnectionID() -> Int32
 @_silgen_name("CGSGetActiveSpace") func CGSGetActiveSpace(_ cid: Int32) -> UInt64
+@_silgen_name("CGSCopyManagedDisplaySpaces") func CGSCopyManagedDisplaySpaces(_ cid: Int32) -> Unmanaged<CFArray>?
+
+/// Whether the main display shows a full-screen app's Space (type 4), which puts other apps' new windows on a desktop
+/// Space nobody is viewing.
+func mainSpaceIsFullScreen() -> Bool {
+    guard let uuid = CGDisplayCreateUUIDFromDisplayID(CGMainDisplayID())?.takeRetainedValue(),
+          let identifier = CFUUIDCreateString(nil, uuid) as String?,
+          let managed = CGSCopyManagedDisplaySpaces(CGSMainConnectionID())?.takeRetainedValue() as? [[String: Any]],
+          let entry = managed.first(where: {
+              let name = $0["Display Identifier"] as? String
+              return name == "Main" || name?.caseInsensitiveCompare(identifier) == .orderedSame
+          }),
+          let current = entry["Current Space"] as? [String: Any]
+    else { return false }
+    return (current["type"] as? NSNumber)?.intValue == 4
+}
 
 let cursor = CGEvent(source: nil)!.location
 let front = NSWorkspace.shared.frontmostApplication
@@ -30,6 +46,7 @@ let state: [String: Any] = [
     "cursor": ["x": cursor.x, "y": cursor.y],
     "frontmost": ["name": front?.localizedName ?? "", "bundle_id": front?.bundleIdentifier ?? "", "pid": front?.processIdentifier ?? 0],
     "active_space": CGSGetActiveSpace(CGSMainConnectionID()),
+    "main_space_full_screen": mainSpaceIsFullScreen(),
     "seconds_since_user_mouse": CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .mouseMoved),
     "seconds_since_user_key": CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown),
     // kCGAnyInputEventType (~0) also covers clicks and trackpad gestures such as Space swipes.

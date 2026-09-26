@@ -29,6 +29,9 @@ public actor AgentDisplay: AgentDisplayControlling {
     private var display: SCVirtualDisplay?
     private var clamp: CursorClamp?
     private var hosted: [CGWindowID: Hosted] = [:]
+    /// Windows launch_app opened on a hidden Space, moved here once the user shows their desktop.
+    private var pending: [CGWindowID: pid_t] = [:]
+    private var watchingPending = false
 
     public init() {}
 
@@ -72,6 +75,7 @@ public actor AgentDisplay: AgentDisplayControlling {
             return WindowPlacement(windowID: windowID, originalFrame: Rect(entry.originalFrame), agentFrame: Rect(current.frame))
         }
         guard let element = AXWindow.find(pid: pid, windowID: windowID) else {
+            if WindowServer.isOnHiddenSpace(windowID) { throw SCError.windowOnHiddenSpace(windowID) }
             throw SCError.actionFailed("Window \(windowID) is not reachable through Accessibility")
         }
         if AXWindow.flag(element, kAXMinimizedAttribute) {
@@ -118,6 +122,34 @@ public actor AgentDisplay: AgentDisplayControlling {
         return WindowPlacement(windowID: windowID, originalFrame: Rect(original), agentFrame: Rect(placed.frame))
     }
 
+    public func hostLaunched(windowID: UInt32, pid: Int32) throws -> WindowPlacement {
+        guard WindowServer.isOnHiddenSpace(windowID) else { return try moveToAgentDisplay(windowID: windowID, pid: pid) }
+        pending[windowID] = pid
+        if !watchingPending {
+            watchingPending = true
+            // Detached: the launch call's context (its deadline included) must not govern the later move.
+            Task.detached { await self.hostPending() }
+        }
+        throw SCError.windowOnHiddenSpace(windowID)
+    }
+
+    /// Nothing tells this process that a hidden desktop was shown, so pending windows are checked twice a second.
+    private func hostPending() async {
+        while !pending.isEmpty {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            for (windowID, pid) in pending {
+                guard WindowServer.window(windowID)?.pid == pid else {
+                    pending[windowID] = nil
+                    continue
+                }
+                guard !PauseState.isPaused, !WindowServer.isOnHiddenSpace(windowID) else { continue }
+                pending[windowID] = nil
+                _ = try? moveToAgentDisplay(windowID: windowID, pid: pid)
+            }
+        }
+        watchingPending = false
+    }
+
     public func returnWindow(windowID: UInt32) throws {
         try Execution.context.beforeDispatch()
         guard let entry = hosted[windowID] else {
@@ -146,6 +178,7 @@ public actor AgentDisplay: AgentDisplayControlling {
     }
 
     public func teardown() {
+        pending.removeAll()
         for id in hosted.keys.sorted() {
             try? returnWindow(windowID: id)
         }

@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let menu = makeMenu(config: config)
+        Desktop.cursorOnAgentDisplay = SCPaths.customHome != nil && config.cursorOnAgentDisplay == true
 
         startBrowserBridge()
 

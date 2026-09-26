@@ -136,9 +136,10 @@ python3 e2e/policy.py     # approvals (deny mode, no UI), turn end, action log
 python3 e2e/parity.py     # sessions, editing, browser
 python3 e2e/review.py     # observation size, leases, bookkeeping (add --short-retention for expiry)
 python3 e2e/instance.py   # test-instance isolation
-python3 e2e/setup.py      # stdio proxy, doctor, turn end, install-mcp
-python3 e2e/focus.py      # focus safety; puts a probe window in front and takes focus while it runs
-python3 e2e/cursor.py     # arrow and menu-bar presence; also takes over the screen while it runs
+python3 e2e/setup.py      # stdio proxy, doctor, turn end, install-mcp (--ui adds the onboarding panel)
+python3 e2e/cursor.py     # arrow and menu-bar presence, drawn on the agent display (cursorOnAgentDisplay)
+python3 e2e/clicks.py     # every pixel click, double-click and drag acts exactly once
+python3 e2e/focus.py --takeover   # focus safety; takes focus and covers the screen while it runs
 python3 e2e/latency.py    # per-call timings, written to latency.json
 python3 e2e/expect.py     # expect postconditions, wait_for, notification-driven settling
 python3 e2e/find.py       # find_elements, act, the compact tool surface

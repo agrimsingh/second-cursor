@@ -25,6 +25,7 @@ import inspect
 import json
 import os
 import pathlib
+import plistlib
 import re
 import secrets
 import shutil
@@ -445,7 +446,8 @@ class Context:
             time.sleep(0.5)
         raise AssertionError(f"no {app} window (pid={pid}, title={title}) within {timeout}s")
 
-    def launch_scratch_textedit(self, filename, text, on_agent_display=False):
+    def launch_scratch_textedit(self, filename, text, on_agent_display=True):
+        """On the agent display by default: reachable from whatever Space the user is on, and never on their screen."""
         path = self.scratch / filename
         path.write_text(text)
         launched = self.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True,
@@ -527,8 +529,11 @@ def blocked_apps(ctx):
 
 @scenario
 def textedit_background(ctx):
-    window = ctx.launch_scratch_textedit("notes.txt", "alpha")
+    window = ctx.launch_scratch_textedit("notes.txt", "alpha", on_agent_display=False)
     ctx.check("new window stays where the app put it", not window.get("on_agent_display"), window)
+    if not window["is_on_screen"]:
+        # The app put it on a Space the user is not viewing; the editing checks run where every Space can reach them.
+        window = ctx.launch_scratch_textedit("notes-hosted.txt", "alpha")
     wid = window["id"]
 
     tree = ctx.tree(wid)
@@ -556,7 +561,7 @@ def textedit_background(ctx):
 
 @scenario
 def calculator(ctx):
-    launched = ctx.call("launch_app", app="Calculator", new_instance=True)
+    launched = ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
     pid = launched["app"]["pid"]
     ctx.kill_on_exit(pid)
     wid = ctx.wait_for_window("Calculator", pid=pid)["id"]
@@ -579,17 +584,13 @@ def text_area(ctx, wid):
     return area, frame
 
 
-def placement(ctx, window):
-    where = "on the user's active Space" if window["is_on_screen"] else f"off-Space (spaces {window['space_ids']})"
-    ctx.check(f"window left in place, {where}", not window.get("on_agent_display"), window["frame"])
-
-
 @scenario
 def pixel_click_in_place(ctx):
     window = ctx.launch_scratch_textedit("pixels.txt", "line one\nline two")
     wid = window["id"]
-    placement(ctx, window)
     _, frame = text_area(ctx, wid)
+    # The caret starts at the beginning; park it at the end so a click that does nothing cannot pass.
+    ctx.call("press_key", window_id=wid, keys="cmd+down")
     ctx.call("click", window_id=wid, x=frame[0] + 3, y=frame[1] + 6)
     ctx.call("type_text", window_id=wid, text="Z")
     tree = ctx.tree(wid)
@@ -597,10 +598,22 @@ def pixel_click_in_place(ctx):
 
 
 @scenario
+def pixel_double_click_selects_word(ctx):
+    """One click delivered twice (or a double-click whose presses arrive out of step) never selects the word."""
+    window = ctx.launch_scratch_textedit("double.txt", "beta gamma\nline two")
+    wid = window["id"]
+    _, frame = text_area(ctx, wid)
+    ctx.call("click", window_id=wid, x=frame[0] + 14, y=frame[1] + 7, count=2)
+    ctx.call("type_text", window_id=wid, text="Z")
+    tree = ctx.tree(wid)
+    ctx.check("a pixel double-click inside \"beta\" selected the word, and typing replaced it",
+              'value="Z gamma\\nline two"' in tree, tree[:400])
+
+
+@scenario
 def drag_select(ctx):
     window = ctx.launch_scratch_textedit("drag.txt", "line one\nline two")
     wid = window["id"]
-    placement(ctx, window)
     _, frame = text_area(ctx, wid)
     y = frame[1] + 6
     ctx.call("drag", window_id=wid, from_x=frame[0] + 3, from_y=y, to_x=min(frame[0] + frame[2] - 10, 400), to_y=y)
@@ -612,7 +625,7 @@ def drag_select(ctx):
 @scenario
 def parallel_apps(ctx):
     notes = ctx.launch_scratch_textedit("parallel.txt", "")
-    calc = ctx.call("launch_app", app="Calculator", new_instance=True)
+    calc = ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(calc["app"]["pid"])
     calc_wid = ctx.wait_for_window("Calculator", pid=calc["app"]["pid"])["id"]
     area, _ = text_area(ctx, notes["id"])
@@ -672,7 +685,7 @@ def clear_calculator(ctx, wid):
 
 @scenario
 def batch_calculator(ctx):
-    calc = ctx.call("launch_app", app="Calculator", new_instance=True)
+    calc = ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(calc["app"]["pid"])
     wid = ctx.wait_for_window("Calculator", pid=calc["app"]["pid"])["id"]
     tree = clear_calculator(ctx, wid)
@@ -822,35 +835,6 @@ def glow_pixels(pixels):
 
 
 @scenario
-def agent_cursor_visible(ctx):
-    window = ctx.launch_scratch_textedit("cursor.txt", "line one\nline two")
-    if not window["is_on_screen"]:
-        raise Skip("scratch window opened on a Space the user is not viewing; the agent cursor only shows on the current Space")
-    wid = window["id"]
-    _, frame = text_area(ctx, wid)
-    local = (frame[0] + 3, frame[1] + 6)
-    ctx.call("click", window_id=wid, x=local[0], y=local[1], observe="none")
-
-    screen_x, screen_y = window["frame"]["x"] + local[0], window["frame"]["y"] + local[1]
-    region = ctx.run.dir / "screenshots" / f"{ctx.name}-around-click.png"
-    time.sleep(0.3)
-    subprocess.run(["screencapture", "-x", "-R", f"{int(screen_x) - 10},{int(screen_y) - 10},48,48", str(region)], check=True)
-    ctx.screenshots.append(region.relative_to(ctx.run.dir).as_posix())
-    drawn = glow_pixels(png_pixels(region.read_bytes()))
-    # The cursor belongs to its window: whether the user's own windows cover the click point decides if it shows.
-    if ctx.call("status")["agent_activity"]["arrow_visible"]:
-        ctx.check("the agent's cursor is drawn on screen at the click point", drawn >= 20, drawn)
-    else:
-        ctx.check("the click point is covered, and the cursor is not drawn over the covering window", drawn < 5, drawn)
-
-    shot = ctx.mcp.call("screenshot", window_id=wid)[1][0]
-    ctx.check("the agent's own window screenshot does not include its cursor",
-              glow_pixels(png_pixels(base64.b64decode(shot["data"]))) < 5)
-    ctx.call("type_text", window_id=wid, text="Z")
-    ctx.check("the click still landed", value_of(ctx.tree(wid, include_screenshot=False)) == "Zline one\nline two")
-
-
-@scenario
 def tree_diffs(ctx):
     window = ctx.launch_scratch_textedit("diff.txt", "alpha")
     wid = window["id"]
@@ -905,7 +889,7 @@ def action_observations(ctx):
               all("observe" in tools[n] for n in ["click", "type_text", "set_value", "press_key", "select_text", "paste"])
               and not any("observe" in tools[n] for n in ["get_window_state", "screenshot", "browser_click"]))
 
-    calc = ctx.call("launch_app", app="Calculator", new_instance=True)
+    calc = ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(calc["app"]["pid"])
     wid = ctx.wait_for_window("Calculator", pid=calc["app"]["pid"])["id"]
     first = ctx.call("get_window_state", window_id=wid, full=True)
@@ -1146,7 +1130,14 @@ def scope_reads(ctx):
     ctx.check("the scoped element index still acts", ctx.call("set_value", window_id=wid, element_index=area, value="ok").get("ok"))
 
 
-def links_document(ctx, name, count=200, on_agent_display=False):
+def agent_origin(ctx, dx=40, dy=60):
+    """A point on the agent display, as "x,y" for a fixture's --origin: a window opened there never shows on the user's
+    screen and is reachable from whatever Space they are on."""
+    bounds = ctx.call("agent_display", action="create")["bounds"]
+    return f"{int(bounds['x'] + dx)},{int(bounds['y'] + dy)}"
+
+
+def links_document(ctx, name, count=200, on_agent_display=True):
     """A TextEdit window whose text area holds `count` links: that many indexed elements, all of which move on a scroll."""
     path = ctx.scratch / name
     path.write_text("<html><body>" + "".join(
@@ -1250,7 +1241,7 @@ def wide_document(ctx, name, lines):
     path = ctx.scratch / name
     path.write_text("{\\rtf1\\ansi{\\fonttbl\\f0\\fswiss Helvetica;}\\vieww26000\\viewh14000\\viewkind0\\pard\\f0\\fs36 "
                     + "\\\n".join(lines) + "}")
-    launched = ctx.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True)
+    launched = ctx.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(launched["app"]["pid"])
     return ctx.wait_for_window("TextEdit", pid=launched["app"]["pid"], title=name)
 
@@ -1347,7 +1338,7 @@ def perception_docs(ctx):
 
 @scenario
 def batch_layout_guard(ctx):
-    calc = ctx.call("launch_app", app="Calculator", new_instance=True)
+    calc = ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(calc["app"]["pid"])
     window = ctx.wait_for_window("Calculator", pid=calc["app"]["pid"])
     wid = window["id"]
@@ -1374,7 +1365,7 @@ def batch_layout_guard(ctx):
 def agent_display_optional(ctx):
     display = ctx.call("agent_display", action="create")
     ctx.require("agent display is active", display["is_active"] and display.get("bounds"), display)
-    window = ctx.launch_scratch_textedit("hosted.txt", "hosted")
+    window = ctx.launch_scratch_textedit("hosted.txt", "hosted", on_agent_display=False)
     wid = window["id"]
     placed = ctx.call("move_to_agent_display", window_id=wid)
     ctx.check("opt-in move put the window inside the agent display", inside(placed["agent_frame"], display["bounds"]), placed)
@@ -1395,6 +1386,52 @@ def off_space_read(ctx):
         tree = ctx.tree(w["id"], include_screenshot=False)
         if ctx.check(f"read AX tree of off-Space window {w['app']!r}", len(re.findall(r"\[\d+\]", tree)) >= 3, tree[:300]):
             return
+
+
+def fixture_app(name, bundle_id, **info):
+    """e2e/delayed.swift as a minimal .app, rebuilt when the source changes; LaunchServices launches bundles. `info`
+    joins its Info.plist."""
+    app = ROOT / f".bin/{name}.app"
+    binary = app / f"Contents/MacOS/{name}"
+    source = ROOT / "delayed.swift"
+    if not binary.exists() or binary.stat().st_mtime < source.stat().st_mtime:
+        shutil.rmtree(app, ignore_errors=True)
+        binary.parent.mkdir(parents=True)
+        subprocess.run(["swiftc", "-O", str(source), "-o", str(binary)], check=True, capture_output=True)
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": bundle_id, "CFBundleName": name, "CFBundleExecutable": name,
+            "CFBundlePackageType": "APPL", "LSMinimumSystemVersion": "14.0", **info,
+        }))
+        subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True, capture_output=True)
+    return app
+
+
+@scenario
+def launch_on_hidden_space(ctx):
+    """Behind a full-screen app, a new window of an app with no remembered frame opens on a desktop Space nobody is
+    viewing. macOS hides it from Accessibility and refuses to let another process move it, so launch_app must say so
+    at once (not after a futile search), and window tools must name the reason instead of "call list_windows again".
+    The move once the user shows that desktop needs a real Space switch, which only a person can make."""
+    if not observe()["main_space_full_screen"]:
+        raise Skip("the main display is not showing a full-screen app, so a new window opens where it can be moved")
+    display = ctx.call("agent_display", action="create")["bounds"]
+    app = fixture_app("SCPlainPlacement", "dev.secondcursor.e2e.plain", SCPlainPlacement=True)
+    started = time.time()
+    launched = ctx.call("launch_app", app=str(app), new_instance=True, on_agent_display=True)
+    took = time.time() - started
+    ctx.kill_on_exit(launched["app"]["pid"])
+    window = next(iter(launched.get("windows") or []), None)
+    ctx.require("launch_app reports the new window", window, launched)
+    if inside(window["frame"], display):
+        raise Skip("the window reached the agent display after all (the full-screen app left in the meantime)")
+    note = launched.get("note") or ""
+    ctx.check("the note says the window is on a desktop Space the user is not viewing",
+              "desktop Space the user is not viewing" in note, note)
+    ctx.check("launch_app answers without a futile Accessibility search (< 4 s)", took < 4, f"{took:.1f}s")
+    ctx.check("the window stays where the user cannot see it", not window["is_on_screen"], window)
+    error = refused(ctx, "get_window_state", window_id=window["id"], include_screenshot=False)
+    ctx.check("reading it names the hidden Space rather than asking to call list_windows again",
+              error and "desktop Space the user is not viewing" in error and "list_windows" not in error, error)
 
 
 @scenario
@@ -1825,7 +1862,7 @@ def pause(ctx):
         time.sleep(0.5)
         try:
             ctx.call("list_windows")
-            ctx.call("launch_app", app="Calculator", new_instance=True)
+            ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
             ctx.check("actions are refused while paused", False, "launch succeeded while paused")
         except ToolError as e:
             ctx.check("actions are refused while paused", "paused" in str(e).lower(), e)

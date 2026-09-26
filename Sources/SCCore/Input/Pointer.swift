@@ -1,6 +1,6 @@
 // Click and wheel recipes ported from cua-driver (MIT, github.com/trycua/cua); see LICENSES/cua-driver-MIT.txt.
+import AppKit
 import CoreGraphics
-import Foundation
 import SCShared
 
 /// Pixel input addressed to one window of one process. Events go to the process, never to the
@@ -28,19 +28,23 @@ enum Pointer {
     private static let touchSubtype: Int64 = 3
     private static let offscreen = Location(screen: CGPoint(x: -1, y: -1), local: CGPoint(x: -1, y: -1))
 
-    static func click(pid: pid_t, wid: CGWindowID, at location: Location, button: MouseButton, count: Int, flags: CGEventFlags = []) {
+    static func click(pid: pid_t, wid: CGWindowID, window: AXUIElement? = nil, at location: Location, button: MouseButton, count: Int,
+                      flags: CGEventFlags = []) {
+        let both = !isBareSurface(pid: pid, wid: wid, window: window, at: location.screen)
         withFocus(pid: pid, wid: wid) {
             switch button {
-            case .left: leftClick(pid: pid, wid: wid, at: location, count: count, flags: flags)
-            case .right: buttonClick(pid: pid, wid: wid, at: location, count: count, button: .right, flags: flags)
-            case .middle: buttonClick(pid: pid, wid: wid, at: location, count: count, button: .center, flags: flags)
+            case .left: leftClick(pid: pid, wid: wid, at: location, count: count, flags: flags, both: both)
+            case .right: buttonClick(pid: pid, wid: wid, at: location, count: count, button: .right, flags: flags, both: both)
+            case .middle: buttonClick(pid: pid, wid: wid, at: location, count: count, button: .center, flags: flags, both: both)
             }
         }
     }
 
     /// Down at `from`, interpolated drags, up at `to`. Drags carry the same window addressing as
     /// clicks, so selection, note drawing and slider moves work without the real cursor.
-    static func drag(pid: pid_t, wid: CGWindowID, from: Location, to: Location, flags: CGEventFlags = [], steps: Int = 16) {
+    static func drag(pid: pid_t, wid: CGWindowID, window: AXUIElement? = nil, from: Location, to: Location,
+                     flags: CGEventFlags = [], steps: Int = 16) {
+        let both = !isBareSurface(pid: pid, wid: wid, window: window, at: from.screen)
         withFocus(pid: pid, wid: wid) {
             let source = CGEventSource(stateID: .hidSystemState)
             let group = clickGroupID()
@@ -49,7 +53,7 @@ enum Pointer {
                 else { return }
                 stamp(event, pid: pid, wid: wid, location: location, clickState: clickState, buttonNumber: 0, group: group)
                 event.flags = flags
-                postBoth(event, pid: pid)
+                deliver(event, pid: pid, both: both)
                 usleep(delayMs * 1000)
             }
             post(.mouseMoved, from, clickState: 0, delayMs: 15)
@@ -81,7 +85,7 @@ enum Pointer {
     /// Stamped mouseMoved, then a down/up primer at (-1,-1) that satisfies Chromium's
     /// user-activation gate (and absorbs AppKit's first-click) without hitting any element,
     /// then the real pairs.
-    private static func leftClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, flags: CGEventFlags) {
+    private static func leftClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, flags: CGEventFlags, both: Bool) {
         let source = CGEventSource(stateID: .hidSystemState)
         let group = clickGroupID()
         let pairs = min(max(count, 1), 3)
@@ -101,24 +105,24 @@ enum Pointer {
             stamp(event, pid: pid, wid: wid, location: step.location, clickState: step.clickState, buttonNumber: 0, group: group)
             SkyLight.setField(event, Field.mouseEventNumber, step.phase)
             event.flags = step.location.screen == offscreen.screen ? [] : flags
-            postBoth(event, pid: pid)
+            deliver(event, pid: pid, both: both)
             if step.delayMs > 0 { usleep(step.delayMs * 1000) }
         }
     }
 
-    private static func buttonClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, button: CGMouseButton, flags: CGEventFlags) {
+    private static func buttonClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, button: CGMouseButton, flags: CGEventFlags, both: Bool) {
         let source = CGEventSource(stateID: .hidSystemState)
         let group = clickGroupID()
         let (down, up, number): (CGEventType, CGEventType, Int64) = button == .right
             ? (.rightMouseDown, .rightMouseUp, 1) : (.otherMouseDown, .otherMouseUp, 2)
-        postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: group)
+        postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: group, both: both)
         for pair in 1...min(max(count, 1), 3) {
             for type in [down, up] {
                 guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: location.screen, mouseButton: button)
                 else { continue }
                 stamp(event, pid: pid, wid: wid, location: location, clickState: Int64(pair), buttonNumber: number, group: group)
                 event.flags = flags
-                postBoth(event, pid: pid)
+                deliver(event, pid: pid, both: both)
                 usleep(type == down ? 28_000 : 80_000)
             }
         }
@@ -127,7 +131,7 @@ enum Pointer {
     /// `ticks` wheel notches at `location`; positive `dy` reveals content above, positive `dx` content to the left.
     static func scroll(pid: pid_t, wid: CGWindowID, at location: Location, dx: Int32, dy: Int32, ticks: Int) {
         let source = CGEventSource(stateID: .hidSystemState)
-        postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: clickGroupID())
+        postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: clickGroupID(), both: true)
         for _ in 0..<max(ticks, 1) {
             guard let event = CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
             else { continue }
@@ -137,17 +141,17 @@ enum Pointer {
             SkyLight.setField(event, Field.windowUnderPointer, Int64(wid))
             SkyLight.setField(event, Field.windowUnderPointerThatCanHandle, Int64(wid))
             SkyLight.setField(event, Field.targetPID, Int64(pid))
-            postBoth(event, pid: pid)
+            deliver(event, pid: pid, both: true)
             usleep(30_000)
         }
     }
 
     /// A window that never saw a move keeps stale cursor-tracking state and ignores the next down.
-    private static func postMovedPrimer(pid: pid_t, wid: CGWindowID, at location: Location, source: CGEventSource?, group: Int64) {
+    private static func postMovedPrimer(pid: pid_t, wid: CGWindowID, at location: Location, source: CGEventSource?, group: Int64, both: Bool) {
         guard let event = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: location.screen, mouseButton: .left)
         else { return }
         stamp(event, pid: pid, wid: wid, location: location, clickState: 0, buttonNumber: 0, group: group)
-        postBoth(event, pid: pid)
+        deliver(event, pid: pid, both: both)
         usleep(12_000)
     }
 
@@ -169,10 +173,62 @@ enum Pointer {
         }
     }
 
-    /// SkyLight reaches backgrounded Chromium/Catalyst windows; the public path lands where SkyLight mouse delivery drops.
-    private static func postBoth(_ event: CGEvent, pid: pid_t) {
-        SkyLight.post(event, to: pid, authenticated: false)
+    /// SkyLight reaches backgrounded Chromium/Catalyst windows; the public path lands where SkyLight mouse delivery
+    /// drops, including windows on other Spaces. An AppKit control acts once on the pair (a button tracks one press,
+    /// a caret click lands twice in the same place), but a bare custom surface acts on every copy, so it gets only
+    /// the public path (`isBareSurface`).
+    private static func deliver(_ event: CGEvent, pid: pid_t, both: Bool) {
+        if both { SkyLight.post(event, to: pid, authenticated: false) }
         event.postToPid(pid)
+    }
+
+    /// A custom-drawn surface in a native AppKit window on the current Space: below the window and plain containers,
+    /// no accessibility element lies under the point. Views like that (canvases, DAW panels, game views) act on each
+    /// copy of an event, so a toggle would flip back. Anything accessible under the point, and anything inside a web
+    /// view, keeps both copies. The app's hit test settles the common case, a control in front, in one call; otherwise
+    /// the window's own tree is walked, because the hit test answers for whatever window covers the point.
+    private static func isBareSurface(pid: pid_t, wid: CGWindowID, window: AXUIElement?, at point: CGPoint) -> Bool {
+        guard var node = window, WindowList.record(wid)?.isOnScreen == true, isPlainAppKit(pid) else { return false }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.25)
+        var hit: AXUIElement?
+        if AXUIElementCopyElementAtPosition(app, Float(point.x), Float(point.y), &hit) == .success, let hit {
+            AXUIElementSetMessagingTimeout(hit, 0.25)
+            if let role = hit.role, !containerRoles.contains(role), let owner = hit.element(kAXWindowAttribute),
+               CFEqual(owner, node) {
+                return false
+            }
+        }
+        for _ in 0..<16 {
+            AXUIElementSetMessagingTimeout(node, 0.25)
+            guard let role = node.role, containerRoles.contains(role) else { return false }
+            let children = node.elements(kAXChildrenAttribute)
+            children.forEach { AXUIElementSetMessagingTimeout($0, 0.25) }
+            guard let child = children.last(where: { $0.frame?.contains(point) == true }) else { return true }
+            node = child
+        }
+        return false
+    }
+
+    private static let containerRoles: Set<String> = [
+        kAXWindowRole, kAXGroupRole, kAXScrollAreaRole, kAXSplitGroupRole, kAXUnknownRole, "AXLayoutArea",
+    ]
+
+    private static let bundleLock = NSLock()
+    /// By bundle path rather than pid, so a reused pid never inherits another app's answer.
+    private static var plainAppKitBundles: [String: Bool] = [:]
+
+    /// Not Chromium, Electron or Catalyst, which need SkyLight's copy in the background.
+    private static func isPlainAppKit(_ pid: pid_t) -> Bool {
+        let running = NSRunningApplication(processIdentifier: pid)
+        guard let url = running?.bundleURL ?? running?.executableURL else { return false }
+        bundleLock.lock()
+        defer { bundleLock.unlock() }
+        if let known = plainAppKitBundles[url.path] { return known }
+        let catalyst = Bundle(url: url)?.infoDictionary?["UIDeviceFamily"] != nil
+        let plain = !catalyst && WindowResolver.detectEngine(url) == .native
+        plainAppKitBundles[url.path] = plain
+        return plain
     }
 
     private static func clickGroupID() -> Int64 {

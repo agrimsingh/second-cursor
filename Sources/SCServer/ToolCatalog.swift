@@ -86,7 +86,8 @@ enum ToolCatalog {
                         "new_instance": boolean(
                             "Start a separate process even if the app is already running.", default: false),
                         "on_agent_display": boolean(
-                            "Opt-in: move the app's new windows to the invisible agent display.", default: false),
+                            "Opt-in: move the app's new windows to the invisible agent display. While the user is in a full-screen app, a new window can open on a desktop Space they are not viewing, where macOS hides it from every tool; the note says so, and the window moves once the user shows that desktop.",
+                            default: false),
                     ], required: ["app"])
             ),
             Tool(

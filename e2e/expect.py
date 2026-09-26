@@ -37,16 +37,13 @@ Output: e2e/artifacts/<run-id>/ (report.md, results.json, transcript.jsonl)
 """
 import json
 import os
-import plistlib
-import shutil
 import signal
-import subprocess
 import sys
 import threading
 import time
 import urllib.request
 
-from run import (ROOT, Run, SCENARIOS, alive, clear_calculator, element_index, refused, scenario, shown, step,
+from run import (Run, SCENARIOS, alive, clear_calculator, element_index, fixture_app, refused, scenario, shown, step,
                  value_of)
 
 SCENARIOS.clear()
@@ -54,24 +51,12 @@ FIXTURE_BUTTONS = ("Change in 150 ms", "Change in 400 ms", "Silent change")
 
 
 def delayed_app():
-    """e2e/delayed.swift as a minimal .app, rebuilt when the source changes; LaunchServices launches bundles."""
-    app = ROOT / ".bin/SCDelayed.app"
-    binary = app / "Contents/MacOS/SCDelayed"
-    source = ROOT / "delayed.swift"
-    if not binary.exists() or binary.stat().st_mtime < source.stat().st_mtime:
-        shutil.rmtree(app, ignore_errors=True)
-        binary.parent.mkdir(parents=True)
-        subprocess.run(["swiftc", "-O", str(source), "-o", str(binary)], check=True, capture_output=True)
-        (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
-            "CFBundleIdentifier": "dev.secondcursor.e2e.delayed", "CFBundleName": "SCDelayed",
-            "CFBundleExecutable": "SCDelayed", "CFBundlePackageType": "APPL", "LSMinimumSystemVersion": "14.0",
-        }))
-        subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True, capture_output=True)
-    return app
+    return fixture_app("SCDelayed", "dev.secondcursor.e2e.delayed")
 
 
 def launch_delayed(ctx):
     """A fresh fixture window on the agent display; returns its id and its buttons' indexes."""
+    ctx.call("agent_display", action="create")
     launched = ctx.call("launch_app", app=str(delayed_app()), new_instance=True, on_agent_display=True)
     pid = launched["app"]["pid"]
     ctx.kill_on_exit(pid)
@@ -362,7 +347,12 @@ def wait_for_timeout(ctx):
     by_app = ctx.call("wait_for", app="TextEdit", element_index=area, value="present", caption="Waiting for the text")
     ctx.check("wait_for by app with element_index uses the window this session observed",
               by_app.get("window_id") == wid and by_app.get("status") == "verified", by_app)
+    # Presence is published on the main thread, which can be ~0.1 s behind while AppKit commits a menu bar change.
+    deadline = time.time() + 1
     activity = ctx.call("status")["agent_activity"]
+    while not activity.get("active") and time.time() < deadline:
+        time.sleep(0.1)
+        activity = ctx.call("status")["agent_activity"]
     ctx.check("it keeps the agent's presence up like a read, with its caption",
               activity.get("active") and activity.get("app") == "TextEdit" and activity.get("caption") == "Waiting for the text",
               activity)

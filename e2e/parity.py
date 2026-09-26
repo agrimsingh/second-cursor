@@ -138,7 +138,7 @@ def native_rich_editing(ctx):
     path = ctx.scratch / "rich.rtf"
     path.write_text(r"{\rtf1\ansi initial rich text}")
     launched = ctx.call(
-        "launch_app", app="TextEdit", urls=[str(path)], new_instance=True
+        "launch_app", app="TextEdit", urls=[str(path)], new_instance=True, on_agent_display=True
     )
     ctx.kill_on_exit(launched["app"]["pid"])
     w = ctx.wait_for_window("TextEdit", pid=launched["app"]["pid"], title="rich")["id"]

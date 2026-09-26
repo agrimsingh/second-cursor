@@ -29,6 +29,9 @@ extension Desktop {
         return .target(window: anchor.window, layer: anchor.layer, pid: record.pid, visible: anchor.visible)
     }
 
+    /// Set once at launch from `SCConfig.cursorOnAgentDisplay` (test instances only).
+    nonisolated(unsafe) public static var cursorOnAgentDisplay = false
+
     public struct CursorAnchor: Sendable, Equatable {
         public let window: UInt32
         public let layer: Int
@@ -44,7 +47,7 @@ extension Desktop {
         // Nobody looks at the agent display (SCDisplayPrivate.m creates it with this vendor and product).
         var display: CGDirectDisplayID = 0
         var count: UInt32 = 0
-        if CGGetDisplaysWithPoint(location, 1, &display, &count) == .success, count == 1,
+        if !cursorOnAgentDisplay, CGGetDisplaysWithPoint(location, 1, &display, &count) == .success, count == 1,
            CGDisplayVendorNumber(display) == 0xA6E7, CGDisplayModelNumber(display) == 0x0001 {
             return nil
         }

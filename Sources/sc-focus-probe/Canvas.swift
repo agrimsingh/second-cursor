@@ -1,11 +1,12 @@
 // Canvas mode for e2e/ocr.py: a custom-drawn window, like a DAW or a game, whose text accessibility cannot see.
-//   usage: sc-focus-probe --canvas <word> --state <path>
+//   usage: sc-focus-probe --canvas <word> --state <path> [--origin x,y] [--front]
 // The canvas draws <word> and a few more at known places and exposes no accessibility children. Beside it sit an
 // accessibility button whose caption is only drawn ("Loop", labelled "Transport") and a real label ("Tempo 128").
 // Writes {"pid","window","words","button","label","clicks"} atomically to <path> at launch and after every click,
-// with every rect and click in window-local points (top-left origin). A click turns "Stopped" into "Playing"; it does
-// not toggle back, because Second Cursor's pixel clicks can reach an AppKit view twice.
-// It never activates, stays out of the Dock, and opens small, behind other windows, for the test to move away.
+// with every rect and click in window-local points (top-left origin). A click toggles "Stopped" and "Playing", so a
+// click delivered twice would leave it where it was.
+// It never activates and stays out of the Dock. It opens at --origin (global points, top-left: tests pass a point on
+// the agent display, so it never shows on the user's screen), else small at the bottom left behind other windows.
 import AppKit
 
 private final class FlippedView: NSView {
@@ -68,9 +69,14 @@ final class Canvas: NSObject, NSApplicationDelegate {
     private var label: NSTextField!
     private var clicks: [[String: Double]] = []
 
-    init(word: String, statePath: String?) {
+    private let origin: CGPoint?
+    private let front: Bool
+
+    init(word: String, statePath: String?, origin: CGPoint?, front: Bool) {
         self.word = word
         self.statePath = statePath
+        self.origin = origin
+        self.front = front
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -83,7 +89,7 @@ final class Canvas: NSObject, NSApplicationDelegate {
         ]
         canvas.onClick = { [unowned self] point in
             clicks.append(["x": point.x, "y": window.frame.height - point.y])
-            canvas.words[3].text = "Playing"
+            canvas.words[3].text = canvas.words[3].text == "Stopped" ? "Playing" : "Stopped"
             canvas.needsDisplay = true
             write()
         }
@@ -97,13 +103,12 @@ final class Canvas: NSObject, NSApplicationDelegate {
         label.setFrameOrigin(NSPoint(x: 24, y: 230))
         content.addSubview(label)
 
-        // Bottom-left of the main screen, behind every other window, so it covers nothing the user is looking at.
-        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
-        window = NSWindow(contentRect: NSRect(x: screen.minX + 20, y: screen.minY + 20, width: 460, height: 330),
-                          styleMask: [.titled], backing: .buffered, defer: false)
+        let rect = fixtureRect(NSSize(width: 460, height: 330), origin: origin)
+        window = NSWindow(contentRect: rect, styleMask: [.titled], backing: .buffered, defer: false)
         window.title = "SC Canvas Probe"
         window.contentView = content
-        window.orderBack(nil)
+        // --front covers whatever sits below it (a test's covered window) without activating; otherwise it stays behind.
+        orderIn(window, content: rect, front: front)
         write()
     }
 

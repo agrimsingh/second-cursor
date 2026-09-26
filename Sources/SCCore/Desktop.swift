@@ -403,7 +403,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         }
         showCursor(record, .drag(from: Point(x: record.bounds.minX + from.x, y: record.bounds.minY + from.y),
                                  to: Point(x: record.bounds.minX + to.x, y: record.bounds.minY + to.y)))
-        Pointer.drag(pid: record.pid, wid: record.id,
+        Pointer.drag(pid: record.pid, wid: record.id, window: record.isOnScreen ? try? resolver.resolve(pid: record.pid, wid: record.id) : nil,
                      from: Self.location(record, local: CGPoint(x: from.x, y: from.y)),
                      to: Self.location(record, local: CGPoint(x: to.x, y: to.y)), flags: flags)
         return ActionResult(route: "skylight_drag")
@@ -1009,7 +1009,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             throw SCError.invalidArgument("Point (\(local.x), \(local.y)) is outside window \(record.id) (\(Int(record.bounds.width))x\(Int(record.bounds.height)))")
         }
         showCursor(record, .click(at: Point(x: record.bounds.minX + local.x, y: record.bounds.minY + local.y), count: count))
-        Pointer.click(pid: record.pid, wid: record.id, at: Self.location(record, local: local), button: button, count: count, flags: flags)
+        Pointer.click(pid: record.pid, wid: record.id, window: record.isOnScreen ? try? resolver.resolve(pid: record.pid, wid: record.id) : nil,
+                      at: Self.location(record, local: local), button: button, count: count, flags: flags)
         return ActionResult(route: "skylight_pointer")
     }
 

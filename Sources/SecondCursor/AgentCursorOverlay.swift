@@ -52,7 +52,7 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
     private var lastCall: Date?
 
     override init() {
-        let frame = Self.desktopFrame()
+        let frame = Self.screenFrame(containing: nil)
         window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
         super.init()
 
@@ -75,6 +75,9 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification] {
             center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.refreshAnchor() }
         }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.screensChanged() }
     }
 
     func present(_ event: AgentCursorEvent) {
@@ -229,12 +232,13 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
     /// the cursor reaches the target, not when its spring stops settling. A cursor the user cannot see jumps there
     /// and arrives at once, so it is in place when its window comes back into view.
     private func move(to global: Point, arrived: @escaping () -> Void, then landed: @escaping () -> Void) {
+        let changedDisplay = fit(to: global)
         let target = layerPoint(global)
         generation += 1
         let move = generation
         releaseArrival()
         stopResting()
-        let appearing = restingAt == nil
+        let appearing = restingAt == nil || changedDisplay
         let start = cursor.presentation()?.position ?? cursor.position
         restingAt = global
 
@@ -595,8 +599,45 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         return CGPoint(x: cocoa.x - window.frame.minX, y: cocoa.y - window.frame.minY)
     }
 
-    private static func desktopFrame() -> CGRect {
-        NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
+    /// With "Displays have separate Spaces" (the macOS default) a window draws on one display only, so the overlay
+    /// covers the display the cursor is on rather than the whole desktop. Returns whether the overlay moved.
+    @discardableResult
+    private func fit(to global: Point?) -> Bool {
+        let frame = Self.screenFrame(containing: global)
+        guard frame != window.frame else { return false }
+        window.setFrame(frame, display: false)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        root.frame = CGRect(origin: .zero, size: frame.size)
+        stage.frame = root.bounds
+        CATransaction.commit()
+        return true
+    }
+
+    /// A display was added (a monitor, the agent display), removed, or rearranged.
+    private func screensChanged() {
+        guard fit(to: restingAt), let restingAt else { return }
+        let point = layerPoint(restingAt)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        cursor.removeAnimation(forKey: "move")
+        cursor.position = point
+        placePill(at: point)
+        CATransaction.commit()
+    }
+
+    /// The Cocoa frame of the screen holding `global` (Quartz, top-left origin), else of the primary screen.
+    private static func screenFrame(containing global: Point?) -> CGRect {
+        let screens = NSScreen.screens
+        let primaryTop = screens.first?.frame.maxY ?? 0
+        let holder = global.flatMap { point in
+            screens.first { screen in
+                let frame = screen.frame
+                return CGRect(x: frame.minX, y: primaryTop - frame.maxY, width: frame.width, height: frame.height)
+                    .contains(CGPoint(x: point.x, y: point.y))
+            }
+        }
+        return (holder ?? screens.first)?.frame ?? .zero
     }
 
     private static let accent = NSColor(srgbRed: 245 / 255, green: 78 / 255, blue: 0, alpha: 1) // Cursor brand accent

@@ -48,6 +48,9 @@ public struct SCConfig: Codable, Sendable {
     /// Which tools tools/list advertises: "full" (nil) or "compact", which lists `act` instead of `batch` and the
     /// single-action tools. Every tool stays callable either way.
     public var toolSurface: String?
+    /// Draw the agent cursor for windows on the agent display, as if the user could see it, so e2e/cursor.py can run
+    /// there instead of on the user's screen. Honored only when `SC_HOME` is set (disposable test instances).
+    public var cursorOnAgentDisplay: Bool?
 
     public init(port: Int, token: String, blockedBundleIDs: [String], confirmationRequiredTools: [String]) {
         self.port = port

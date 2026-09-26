@@ -61,6 +61,18 @@ enum WindowServer {
         return (spaces as? [NSNumber])?.map(\.uint64Value) ?? []
     }
 
+    /// On Spaces, none of which any display is showing right now.
+    static func isOnHiddenSpace(_ window: CGWindowID) -> Bool {
+        let spaces = spaces(of: window).filter { $0 != 0 }
+        guard !spaces.isEmpty,
+              let managed = CGSCopyManagedDisplaySpaces(CGSMainConnectionID())?.takeRetainedValue() as? [[String: Any]]
+        else { return false }
+        let showing = Set(managed.compactMap {
+            (($0["Current Space"] as? [String: Any])?["ManagedSpaceID"] as? NSNumber)?.uint64Value
+        })
+        return showing.isDisjoint(with: spaces)
+    }
+
     /// The current Space of `display`, once the window server has given it one.
     static func currentSpace(of display: CGDirectDisplayID) -> UInt64? {
         guard let uuid = CGDisplayCreateUUIDFromDisplayID(display)?.takeRetainedValue(),

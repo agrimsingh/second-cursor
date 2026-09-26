@@ -801,6 +801,8 @@ def onboarding_gating(ctx):
         appeared = set(panel_windows()) - before
         ctx.check("a test instance (SC_HOME) never opens onboarding on its own", not appeared, appeared)
 
+    if "--ui" not in sys.argv:
+        raise Skip("the rest opens the onboarding panel on the user's screen; run with --ui to include it")
     appeared = set()
     with TempHome() as home:
         before = set(panel_windows())

@@ -16,9 +16,10 @@ Ways this can fail, each caught below:
   map to the wrong key.
 
 The frontmost app is `sc-focus-probe`, built from this package, wrapped in a throwaway .app so
-LaunchServices activates it, sized to cover the main screen, and quit at scenario end.
+LaunchServices activates it, sized to cover the main screen, and quit at scenario end. That takes the user's focus
+and covers their screen, so the probe scenarios only run with --takeover; without it they skip.
 
-Usage:  e2e/focus.py [scenario ...] [--installed]   (same targeting flags as e2e/run.py)
+Usage:  e2e/focus.py --takeover [scenario ...] [--installed]   (same targeting flags as e2e/run.py)
 Output: e2e/artifacts/<run-id>/ (report.md, results.json, transcript.jsonl, <scenario>-probe.json)
 """
 import http.server
@@ -105,6 +106,8 @@ class FocusProbe:
     Create it first in a scenario so its cleanup (quit + re-activate the previous app) runs last."""
 
     def __init__(self, ctx):
+        if "--takeover" not in sys.argv:
+            raise Skip("takes focus and covers the screen; run with --takeover when you are away from the Mac")
         self.ctx = ctx
         self.previous = observe()["frontmost"]
         self.state_path = ctx.scratch / "probe-state.json"
@@ -223,7 +226,7 @@ def covers(outer, inner):
 @scenario
 def focus_native_actions(ctx):
     probe = FocusProbe(ctx)
-    wid = ctx.launch_scratch_textedit("focus.txt", "line one\nline two")["id"]
+    wid = ctx.launch_scratch_textedit("focus.txt", "line one\nline two", on_agent_display=False)["id"]
     probe.start()
     area, (x, y, w, h) = text_area(ctx, wid)
 
