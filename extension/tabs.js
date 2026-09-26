@@ -1,4 +1,4 @@
-import { attach, cdp } from "./cdp.js";
+import { attach, cdp, networkIdle } from "./cdp.js";
 import { removeCursor, show } from "./cursor.js";
 import { BridgeError, sleep } from "./errors.js";
 
@@ -257,17 +257,20 @@ export function noteAction(tabId, at = Date.now()) {
 /**
  * Waits until the page's content has not changed for `quietMs`, at most `timeoutMs`. Within `reactMs` of an action
  * (or of the load, which counts as one), a page that has not changed since is usually still waiting for a request
- * (search results, a filter, "load more"), so the read waits for the change to start first. The first probe of a
- * document starts its clock, so an idle page costs `quietMs` once, and nothing on later reads.
+ * (search results, a filter, "load more"), so the read waits for the change to start first. After a load (`load`),
+ * a page whose network has gone idle has no request left to wait for, so the read stops waiting for one. The first
+ * probe of a document starts its clock, so an idle page costs `quietMs` once, and nothing on later reads.
  */
-export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200 } = {}) {
+export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200, load = false } = {}) {
   const began = Date.now();
   const actedAt = lastAction.get(tabId) ?? 0;
   while (Date.now() - began < timeoutMs) {
     const state = await settleProbe(tabId);
     if (!state) return;
     const sinceAction = Date.now() - actedAt;
-    const awaitingReaction = sinceAction < reactMs && (!state.mutated || state.quiet >= sinceAction);
+    let awaitingReaction = sinceAction < reactMs && (!state.mutated || state.quiet >= sinceAction);
+    // The idle signal covers the page's first load only, so actions keep the fixed window.
+    if (awaitingReaction && load && (await networkIdle(tabId).catch(() => false))) awaitingReaction = false;
     if (state.ready === "complete" && state.quiet >= quietMs && !awaitingReaction) return;
     await sleep(awaitingReaction ? 50 : Math.min(100, Math.max(20, quietMs - state.quiet)));
   }
@@ -300,7 +303,7 @@ export async function openTab(rawUrl, session = "legacy") {
   await attach(tab.id);
   show(tab.id, session);
   noteAction(tab.id);
-  await settled(tab.id, { quietMs: 500, timeoutMs: 6000, reactMs: 1500 });
+  await settled(tab.id, { quietMs: 500, timeoutMs: 6000, reactMs: 1500, load: true });
   return describe(await chrome.tabs.get(tab.id));
 }
 
@@ -312,7 +315,7 @@ export async function navigateTab(tabId, rawUrl) {
     timeoutMs: 20000,
   });
   noteAction(tabId);
-  await settled(tabId, { quietMs: 500, timeoutMs: 6000, reactMs: 1500 });
+  await settled(tabId, { quietMs: 500, timeoutMs: 6000, reactMs: 1500, load: true });
   return describe(await chrome.tabs.get(tabId));
 }
 

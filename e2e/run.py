@@ -40,6 +40,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # `from run import ...` inside scenarios must see this module's rebound globals even when run.py is __main__.
@@ -1452,8 +1453,20 @@ def electron_read(ctx):
 
 class FixtureServer:
     def __enter__(self):
-        handler = lambda *a: http.server.SimpleHTTPRequestHandler(*a, directory=str(ROOT / "fixtures"))
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        directory = str(ROOT / "fixtures")
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=directory, **kwargs)
+
+            def do_GET(self):
+                # ?delay_ms=N answers N ms late, like a slow backend request.
+                delay = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("delay_ms")
+                if delay:
+                    time.sleep(min(int(delay[0]), 10000) / 1000)
+                super().do_GET()
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         return f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
@@ -1510,7 +1523,9 @@ def browser_settled_reads(ctx):
 
     Ways this can fail, each checked against e2e/fixtures/late.html:
     - browser_open returns before the page renders what it fetches after load, so the model reads only the page's
-      frame and must read again (the results appear 1.2 s after load).
+      frame and must read again (the results arrive from a request that answers 1.2 s after load).
+    - A navigation keeps waiting for the page to react after its network has gone idle, so every load of a page that
+      fetches nothing more costs the whole post-load window (1.5 s). Checked with e2e/fixtures/form.html.
     - A read right after a click that makes the page fetch and render ("Load more", a filter) returns the old page.
     - Reads carry the per-element JSON list without structured=true, multiplying the payload about tenfold.
     - The cursor stays off the tab until the first action; Codex shows it as soon as the agent works in a tab.
@@ -1567,6 +1582,12 @@ def browser_settled_reads(ctx):
             ctx.checks.append({"label": label, "ok": True, "inconclusive": True,
                                "detail": "this Chrome does not expose Runtime.enable to the page's console; the "
                                          "not-detected check above proves nothing here"})
+
+        started = time.time()
+        ctx.call("browser_navigate", tab_id=tid, url=f"{base}/form.html")
+        took = time.time() - started
+        ctx.check("a navigation to a page that fetches nothing after load returns once its network is idle (< 1 s, "
+                  "not the 1.5 s post-load window)", took < 1.0, f"{took:.2f}s")
 
 
 @scenario

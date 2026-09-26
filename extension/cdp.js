@@ -2,18 +2,35 @@ import { BridgeError } from "./errors.js";
 
 const attached = new Set();
 const frameSessions = new Map();
+// Page lifecycle events ("load", "networkIdle", …) of each tab's top-level frames, for the document each loader
+// committed. They come from the Page domain, so knowing whether a page is still fetching needs no Network.enable.
+const lifecycles = new Map();
 chrome.debugger.onEvent.addListener((source,method,p)=>{
   if(method === "Target.attachedToTarget") {
     frameSessions.set(`${source.tabId}:${p.targetInfo.targetId}`,p.sessionId);
     chrome.debugger.sendCommand({tabId:source.tabId,sessionId:p.sessionId},"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
   }
   if(method === "Target.detachedFromTarget")for(const [k,v] of frameSessions)if(v===p.sessionId)frameSessions.delete(k);
+  if (method === "Page.lifecycleEvent" && !source.sessionId) {
+    const frames = lifecycles.get(source.tabId) ?? new Map();
+    lifecycles.set(source.tabId, frames);
+    if (frames.get(p.frameId)?.loaderId !== p.loaderId) frames.set(p.frameId, { loaderId: p.loaderId, names: new Set() });
+    frames.get(p.frameId).names.add(p.name);
+  }
 });
 
 chrome.debugger.onDetach.addListener(({ tabId }) => {
   attached.delete(tabId);
+  lifecycles.delete(tabId);
   for (const key of enabled) if (key.startsWith(`${tabId}:`)) enabled.delete(key);
 });
+
+/** True once the tab's current document has gone 500 ms without a network request in flight. */
+export async function networkIdle(tabId) {
+  const { frameTree } = await cdp(tabId, "Page.getFrameTree");
+  const lifecycle = lifecycles.get(tabId)?.get(frameTree.frame.id);
+  return lifecycle?.loaderId === frameTree.frame.loaderId && lifecycle.names.has("networkIdle");
+}
 
 // Runtime.enable is the best-known sign of an automated page to bot checks, and Network.enable reports every
 // request; like Codex, they are switched on only for the operations that read their events.
@@ -37,6 +54,8 @@ export async function attach(tabId) {
   }
   attached.add(tabId);
   await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
+  // Enabling also reports the lifecycle events the current document has already reached.
+  await chrome.debugger.sendCommand({ tabId }, "Page.setLifecycleEventsEnabled", { enabled: true }).catch(() => {});
   const target = { tabId };
   await chrome.debugger.sendCommand(target,"Page.setInterceptFileChooserDialog",{enabled:true}).catch(()=>{});
   await chrome.debugger.sendCommand(target,"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
