@@ -20,9 +20,11 @@ Output: e2e/artifacts/agent-<ts>/ report.md, results.json, transcript.jsonl (ver
         with more than one run, also e2e/artifacts/agent-compare-<ts>.md
 """
 import json
+import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -184,12 +186,22 @@ def agent_calculator_to_textedit(ctx):
 
     command = agent_command(project, prompt)
     started = time.time()
+    # cursor-agent leaves helpers running after it exits (a worker server and a language server); they stay in its
+    # process group, so the group is ended with it.
+    proc = subprocess.Popen(command, cwd=project, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
     try:
-        proc = subprocess.run(command, cwd=project, capture_output=True, text=True, timeout=TIMEOUT)
-        code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as e:
-        decode = lambda b: b.decode(errors="replace") if isinstance(b, bytes) else (b or "")
-        code, stdout, stderr = None, decode(e.stdout), decode(e.stderr)
+        stdout, stderr = proc.communicate(timeout=TIMEOUT)
+        code = proc.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        stdout, stderr = proc.communicate()
+        code = None
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     elapsed = time.time() - started
     (out_dir / "agent.jsonl").write_text(stdout)
     (out_dir / "agent-stderr.txt").write_text(f"$ {' '.join(command[:-1])} <prompt>\nexit: {code} ({elapsed:.1f}s)\n{stderr}")
