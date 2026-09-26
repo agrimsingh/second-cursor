@@ -74,8 +74,9 @@ def latency(ctx):
     scroll_sizes = sizes["scroll observation (links doc)"]
     ctx.check(f"scroll observation: median {statistics.median(scroll_sizes):.0f} chars "
               f"(full tree {sizes['get_window_state full (links doc)']})", True, scroll_sizes)
-    ctx.check("click observe=none stays near-instant (median under 100 ms)", medians["click observe=none"] < 100,
-              medians["click observe=none"])
+    # An on-screen target also waits for the agent arrow's glide (capped at ~150 ms) so the arrow lands with the click.
+    ctx.check("click observe=none stays fast (median under 250 ms, arrow glide included)",
+              medians["click observe=none"] < 250, medians["click observe=none"])
 
 
 if __name__ == "__main__":

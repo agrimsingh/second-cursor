@@ -1132,7 +1132,7 @@ def scroll_moved_diff(ctx):
     ctx.require("the bold checkbox is indexed", bold is not None, now[-600:])
     result = ctx.call("batch", window_id=wid, steps=[step("scroll", direction="up", amount=5), step("click", element_index=bold)])
     tree = (result.get("observation") or {}).get("tree", "")
-    changed = re.search(rf'^\+\[{bold}\] AXCheckBox "bold" value="1" \(\d+,\d+ \d+x\d+\)', tree, re.M)
+    changed = re.search(rf'^\+\s*\[{bold}\] AXCheckBox "bold" value="1" \(\d+,\d+ \d+x\d+\)', tree, re.M)
     ctx.check("a content change next to a scroll is printed with its current frame", changed, tree[:400])
     ctx.check("and the moved elements are still summed up on the ~ line, last", MOVED_LINE.search(tree.splitlines()[-1] if tree else ""), tree[-400:])
 
