@@ -27,6 +27,8 @@ To find one element in a big window (a button, field or row), call `find_element
 
 Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`, and on tabs those open (a result's `events` names them).
 
+For multi-step work in a browser tab (going through a list, filling a form, repeating an action per row), use `browser_repl`: one script with a Playwright-compatible `page` loops over the page's controls in a call, where discrete browser tools take one call per click. Read the page again after actions that change it (a list that reorders, pages, or gains items), and handle the errors it throws: a covered or ambiguous target is refused, never clicked blindly.
+
 When a task is about a list in a browser tab (search results, a feed, a table), take what you need from the list itself. Result cards usually show the name, price, rating and delivery time. Open an item's own page only when the list lacks a fact the task asks for: each page load costs seconds, and opening every result can double the task's time.
 
 If you hand UI work to a subagent and choose its model, medium reasoning effort is usually enough. In browser tests it matched extra-high effort's accuracy and ran up to twice as fast.
