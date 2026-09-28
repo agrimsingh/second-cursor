@@ -1530,7 +1530,8 @@ def browser_settled_reads(ctx):
     - browser_open returns before the page renders what it fetches after load, so the model reads only the page's
       frame and must read again (the results arrive from a request that answers 1.2 s after load).
     - A navigation keeps waiting for the page to react after its network has gone idle, so every load of a page that
-      fetches nothing more costs the whole post-load window (1.5 s). Checked with e2e/fixtures/form.html.
+      fetches nothing more costs the whole post-load window (1.5 s), or the read after it waits out the rest of the
+      reaction window. Checked with e2e/fixtures/form.html.
     - A click that makes the page fetch and render ("Load more", a filter) returns an observation of the old page.
     - Reads carry the per-element JSON list without structured=true, multiplying the payload about tenfold.
     - The cursor stays off the tab until the first action; Codex shows it as soon as the agent works in a tab.
@@ -1592,6 +1593,11 @@ def browser_settled_reads(ctx):
         took = time.time() - started
         ctx.check("a navigation to a page that fetches nothing after load returns once its network is idle (< 1 s, "
                   "not the 1.5 s post-load window)", took < 1.0, f"{took:.2f}s")
+        started = time.time()
+        ctx.call("browser_snapshot", tab_id=tid)
+        took = time.time() - started
+        ctx.check("so does a read right after it (< 0.5 s, not the rest of the 1.2 s reaction window)", took < 0.5,
+                  f"{took:.2f}s")
 
 
 @scenario

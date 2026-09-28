@@ -76,7 +76,7 @@ const handlers = {
     const tab = await navigateTab(tabId, url);
     return { tab };
   },
-  "tab.snapshot": async ({ tabId, session_id, full, structured, load }) => {
+  "tab.snapshot": async ({ tabId, session_id, full, structured }) => {
     await requireAgentTab(tabId);
     // The page runs no script, and so cannot be read, until its dialog is answered.
     if (openDialog(tabId))
@@ -87,7 +87,7 @@ const handlers = {
     // Like Codex, the cursor is on the tab from the moment the agent works in it, not only once it acts.
     await attach(tabId);
     show(tabId, session_id);
-    await settled(tabId, { load });
+    await settled(tabId);
     const key = `${session_id}:${tabId}`;
     const previous = observations.get(key);
     const snapshot = await structuredSnapshot(tabId);

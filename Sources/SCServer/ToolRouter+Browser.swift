@@ -45,7 +45,7 @@ extension ToolRouter {
 
         case "browser_navigate":
             let tab = try await browser.navigate(tabID: try args.int("tab_id"), url: try args.string("url"))
-            return await observed(["tab": Shape.tab(tab)], tabID: try args.int("tab_id"), mode: mode, load: true)
+            return await observed(["tab": Shape.tab(tab)], tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_snapshot":
             let params = try JSONSerialization.data(withJSONObject: [
@@ -119,13 +119,12 @@ extension ToolRouter {
     /// it settles, as a diff against this session's last read, which it replaces. The action already happened, so a
     /// failed read is reported as `observation_error` rather than thrown; with `both`, a failed capture keeps the tree.
     /// Events queued while the page settled come back on the read and join the action's.
-    /// `load`: the action was a page load, after which an idle network means nothing more is coming.
-    private func observed(_ result: [String: Any], tabID: Int, mode: String, load: Bool = false) async -> ToolOutput {
+    private func observed(_ result: [String: Any], tabID: Int, mode: String) async -> ToolOutput {
         var json = result
         do {
             switch mode {
             case "tree", "both":
-                let params = try JSONSerialization.data(withJSONObject: ["tabId": tabID, "full": false, "load": load])
+                let params = try JSONSerialization.data(withJSONObject: ["tabId": tabID, "full": false])
                 var observation = try JSONSerialization.jsonObject(
                     with: await browser.command("tab.snapshot", params: params)) as? [String: Any] ?? [:]
                 if let events = observation.removeValue(forKey: "events") as? [Any] {

@@ -309,24 +309,25 @@ const lastAction = new Map();
 chrome.tabs.onRemoved.addListener((tabId) => lastAction.delete(tabId));
 
 /**
- * Input that may make the page fetch and render something (a filter, a search, "load more"). `at` must be when the
- * input was dispatched: a page that re-renders during the action has already reacted, and stamping the end of the
- * action instead makes the next read wait out all of `reactMs` for a reaction that already happened.
+ * Input that may make the page fetch and render something (a filter, a search, "load more"), or (`load`) a page load.
+ * `at` must be when the input was dispatched: a page that re-renders during the action has already reacted, and
+ * stamping the end of the action instead makes the next read wait out all of `reactMs` for a reaction that already
+ * happened.
  */
-export function noteAction(tabId, at = Date.now()) {
-  lastAction.set(tabId, at);
+export function noteAction(tabId, at = Date.now(), load = false) {
+  lastAction.set(tabId, { at, load });
 }
 
 /**
  * Waits until the page's content has not changed for `quietMs`, at most `timeoutMs`. Within `reactMs` of an action
  * (or of the load, which counts as one), a page that has not changed since is usually still waiting for a request
- * (search results, a filter, "load more"), so the read waits for the change to start first. After a load (`load`),
- * a page whose network has gone idle has no request left to wait for, so the read stops waiting for one. The first
- * probe of a document starts its clock, so an idle page costs `quietMs` once, and nothing on later reads.
+ * (search results, a filter, "load more"), so the read waits for the change to start first. While the last action is
+ * a load, a page whose network has gone idle has no request left to wait for, so every read stops waiting for one.
+ * The first probe of a document starts its clock, so an idle page costs `quietMs` once, and nothing on later reads.
  */
-export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200, load = false } = {}) {
+export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200 } = {}) {
   const began = Date.now();
-  const actedAt = lastAction.get(tabId) ?? 0;
+  const { at: actedAt = 0, load = false } = lastAction.get(tabId) ?? {};
   while (Date.now() - began < timeoutMs) {
     const state = await settleProbe(tabId);
     if (!state) return;
@@ -365,8 +366,8 @@ export async function openTab(rawUrl, session = "legacy") {
   await settleAround(tab.id, async () => {}, { quietMs: 0, timeoutMs: 20000 });
   await attach(tab.id);
   show(tab.id, session);
-  noteAction(tab.id);
-  await settled(tab.id, { quietMs: 500, timeoutMs: 6000, reactMs: 1500, load: true });
+  noteAction(tab.id, Date.now(), true);
+  await settled(tab.id, { quietMs: 500, timeoutMs: 6000, reactMs: 1500 });
   return describe(await chrome.tabs.get(tab.id));
 }
 
@@ -377,8 +378,8 @@ export async function navigateTab(tabId, rawUrl) {
     quietMs: 1000,
     timeoutMs: 20000,
   });
-  noteAction(tabId);
-  await settled(tabId, { quietMs: 500, timeoutMs: 6000, reactMs: 1500, load: true });
+  noteAction(tabId, Date.now(), true);
+  await settled(tabId, { quietMs: 500, timeoutMs: 6000, reactMs: 1500 });
   return describe(await chrome.tabs.get(tabId));
 }
 
