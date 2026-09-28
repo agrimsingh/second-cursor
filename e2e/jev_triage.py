@@ -19,7 +19,11 @@ Arms, each against a fresh test instance:
   agent:M         cursor-agent -p with model M and the instance's MCP tools only.
   script:M        The same, plus a shell and the Second Cursor SDK, so M can write and run Node scripts.
   script-jev:M    script:M plus ./jev.mjs (e2e/jev.mjs), which lets those scripts ask Jev for per-item decisions.
-Every agent arm gets the project skill (.cursor/skills/second-cursor/SKILL.md) and opens the page itself.
+  repl:M          cursor-agent -p with model M and one tool, browser_repl (the instance runs with toolSurface "repl"):
+                  a persistent JavaScript REPL whose `page` is Playwright-shaped, in the spirit of Aside's browser
+                  agent. No skill: its prompt only says that a Playwright page is available.
+The other agent arms get the project skill (.cursor/skills/second-cursor/SKILL.md). Every agent arm opens the page
+itself.
 
 Ways the comparison can mislead, and what the run does about each:
   - The agent changes the inbox without the page: browser tools cannot run page JavaScript, and the fixture's backend
@@ -32,7 +36,7 @@ Ways the comparison can mislead, and what the run does about each:
     scripts as tool time; Jev loop time is wall time from the first read to the last click.
   - One run is noise: --repeat N.
 
-Usage:  python3 e2e/jev_triage.py --arms agent:M,script:M,script-jev:M,jev [--repeat N] [--timeout S] [--live]
+Usage:  python3 e2e/jev_triage.py --arms agent:M,script:M,script-jev:M,repl:M,jev [--repeat N] [--timeout S] [--live]
 Key:    TYPESAFE_API_KEY, or ~/.config/typesafe/key
 Output: e2e/artifacts/triage-<ts>-[live-]<arm>/ report.md, transcript.jsonl, triage.json (score and timing),
         page-events.json (every change the page sent its backend), plus jev.jsonl (every Jev request and response) or
@@ -100,6 +104,15 @@ Open {url} in the browser and do this in that tab, operating the page through it
 
 {goal}
 {jev}
+Reply with only DONE when the task is finished, or BLOCKED and the reason."""
+
+REPL_PROMPT = """Use only the browser_repl tool of the MCP server named "{server}". Do not use the shell, files, or any \
+other MCP server. The REPL is persistent and has a Playwright-compatible `page`, driving a Chrome tab through Second \
+Cursor.
+Open {url} in `page` and do this there, operating the page through its controls as a person would:
+
+{goal}
+
 Reply with only DONE when the task is finished, or BLOCKED and the reason."""
 
 JEV_NOTE = """
@@ -409,6 +422,9 @@ def lines(path):
 
 def agent_run(ctx, kind, model, url, timeout):
     files = {}
+    if kind == "repl":
+        prompt = REPL_PROMPT.format(server=SERVER, url=url, goal=GOAL)
+        return run_agent(ctx, model, prompt, url, timeout, skill=False)
     if kind in ("script", "script-jev"):
         files["sdk/index.mjs"] = REPO / "sdk/index.mjs"
         prompt = SCRIPT_PROMPT.format(server=SERVER, url=url, goal=GOAL, jev=JEV_NOTE if kind == "script-jev" else "")
@@ -419,9 +435,10 @@ def agent_run(ctx, kind, model, url, timeout):
     return run_agent(ctx, model, prompt, url, timeout, files=files)
 
 
-def run_agent(ctx, model, prompt, url, timeout, mcp_url=None, files=None):
+def run_agent(ctx, model, prompt, url, timeout, mcp_url=None, files=None, skill=True):
     """Runs cursor-agent -p in a temp project whose only MCP server is the run's target (or mcp_url, which must
-    forward to it), with the project skill and `files` ({relative path: source}), and returns its timing and usage.
+    forward to it), with the project skill unless skill=False and `files` ({relative path: source}), and returns its
+    timing and usage.
     `url` is the page the agent must reach through the target. The target is the test instance, or with
     --installed the user's own app, whose action log is then the run's."""
     inst = ctx.run.instance
@@ -431,9 +448,11 @@ def run_agent(ctx, model, prompt, url, timeout, mcp_url=None, files=None):
     action_log = inst.action_log if inst else USER_ACTION_LOG
     env = {**os.environ, "SC_HOME": str(inst.home)} if inst else {k: v for k, v in os.environ.items() if k != "SC_HOME"}
     server = {"url": mcp_url or ctx.mcp.url, "headers": {"Authorization": f"Bearer {ctx.mcp.token}"}}
-    (project / ".cursor/skills/second-cursor").mkdir(parents=True)
+    (project / ".cursor").mkdir()
     (project / ".cursor/mcp.json").write_text(json.dumps({"mcpServers": {SERVER: server}}, indent=2))
-    shutil.copy(REPO / ".cursor/skills/second-cursor/SKILL.md", project / ".cursor/skills/second-cursor/SKILL.md")
+    if skill:
+        (project / ".cursor/skills/second-cursor").mkdir(parents=True)
+        shutil.copy(REPO / ".cursor/skills/second-cursor/SKILL.md", project / ".cursor/skills/second-cursor/SKILL.md")
     for relative, source in (files or {}).items():
         (project / relative).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(source, project / relative)
@@ -583,9 +602,10 @@ def parse_arm(spec):
     kind, _, value = spec.partition(":")
     if kind == "jev":
         return "jev", None, int(value or 1)
-    if kind in ("agent", "script", "script-jev"):
+    if kind in ("agent", "script", "script-jev", "repl"):
         return kind, value or "grok-4.7-medium-fast", 1
-    raise SystemExit(f"unknown arm {spec!r}: use jev, jev:N, agent:<model>, script:<model> or script-jev:<model>")
+    raise SystemExit(f"unknown arm {spec!r}: use jev, jev:N, agent:<model>, script:<model>, script-jev:<model> or "
+                     "repl:<model>")
 
 
 if __name__ == "__main__":
@@ -595,7 +615,8 @@ if __name__ == "__main__":
     for _ in range(repeat):
         for kind, model, lookahead in arms:
             SCENARIOS[:] = [triage(kind, model, lookahead, timeout)]
-            trial = run.Run(config_overrides={"approvals": "allow", "appApproval": "off"}, browser=True)
+            surface = {"toolSurface": "repl"} if kind == "repl" else {}
+            trial = run.Run(config_overrides={"approvals": "allow", "appApproval": "off", **surface}, browser=True)
             renamed = trial.dir.with_name(f"triage-{trial.dir.name}-{'live-' if LIVE else ''}"
                                           f"{arm_label(kind, model, lookahead).replace(':', '-')}")
             trial.dir.rename(renamed)
