@@ -264,15 +264,21 @@ const SETTLE_PROBE = `(() => {
   let s = globalThis.__secondCursorSettle;
   if (!s || s.doc !== document) {
     s = { doc: document, last: performance.now(), mutated: false };
-    // Attribute changes are left out: animations and timers change them without the content changing. So is the
-    // agent's own cursor (cursor.js), which is added when the agent starts work on the page.
-    const cursorOnly = (r) => r.addedNodes.length + r.removedNodes.length > 0
-      && [...r.addedNodes, ...r.removedNodes].every((n) => n.id === "second-cursor-overlay");
-    new MutationObserver((records) => {
+    // Most attribute changes are left out: animations and timers change them without the content changing. The ones
+    // that say what an element is or shows (a menu expanding, a tab selected, a panel unhidden) are how many pages
+    // react to a click, with no node added. The agent's own cursor (cursor.js), added when the agent starts work on
+    // the page, never counts.
+    const cursorOnly = (r) => r.target.id === "second-cursor-overlay" || (r.addedNodes.length + r.removedNodes.length > 0
+      && [...r.addedNodes, ...r.removedNodes].every((n) => n.id === "second-cursor-overlay"));
+    const changed = (records) => {
       if (records.every(cursorOnly)) return;
       s.last = performance.now();
       s.mutated = true;
-    }).observe(document, { subtree: true, childList: true, characterData: true });
+    };
+    new MutationObserver(changed).observe(document, { subtree: true, childList: true, characterData: true });
+    new MutationObserver(changed).observe(document, { subtree: true, attributeFilter: ["aria-expanded", "aria-selected",
+      "aria-checked", "aria-pressed", "aria-current", "aria-hidden", "aria-disabled", "aria-activedescendant", "hidden",
+      "open", "disabled"] });
     globalThis.__secondCursorSettle = s;
   }
   return { quiet: performance.now() - s.last, mutated: s.mutated, ready: document.readyState };

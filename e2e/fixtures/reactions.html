@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Reactions</title>
+</head>
+<body>
+<main>
+  <label>Name <input id="name"></label>
+  <label>Search <input id="search" autocomplete="off"></label>
+  <ul id="results" aria-label="Results"></ul>
+  <label><input type="checkbox" id="agree"> Agree</label>
+  <button id="details" aria-expanded="false" aria-controls="panel">Details</button>
+  <section id="panel" hidden><p>Panel content</p></section>
+  <button id="add">Add row</button>
+  <ul id="rows" aria-label="Rows"></ul>
+  <button id="noop">Nothing</button>
+  <button id="load">Load</button>
+  <p id="loaded"></p>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let timer, rows = 0, loads = 0;
+// Like a typical autocomplete: a 300 ms debounce, then a request, then the list.
+$("search").addEventListener("input", () => {
+  clearTimeout(timer);
+  timer = setTimeout(async () => {
+    const query = $("search").value;
+    await fetch("reactions.html?delay_ms=150");
+    $("results").replaceChildren(...[1, 2, 3].map((i) =>
+      Object.assign(document.createElement("li"), { textContent: `${query} result ${i}` })));
+  }, 300);
+});
+$("details").addEventListener("click", () => {
+  const open = $("details").getAttribute("aria-expanded") === "true";
+  $("details").setAttribute("aria-expanded", String(!open));
+  $("panel").hidden = open;
+});
+$("add").addEventListener("click", () =>
+  $("rows").append(Object.assign(document.createElement("li"), { textContent: `Row ${++rows}` })));
+$("load").addEventListener("click", async () => {
+  await fetch("reactions.html?delay_ms=400");
+  $("loaded").textContent = `Loaded ${++loads}`;
+});
+</script>
+</body>
+</html>
