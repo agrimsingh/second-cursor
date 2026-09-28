@@ -604,7 +604,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let all = WindowList.all()
         resolver.forget(windowsNotIn: Set(all.map(\.id)))
         let onScreen = WindowList.onScreenIDs()
-        var listed: [pid_t: [CGWindowID: AXUIElement]] = [:]
+        var listed: [pid_t: [CGWindowID: AXUIElement]?] = [:]
         var result: [WindowInfo] = []
         for record in all where WindowList.isAppWindow(record) && record.pid != getpid() {
             let app = NSRunningApplication(processIdentifier: record.pid)
@@ -613,14 +613,20 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             if !needle.isEmpty, !appName.lowercased().contains(needle), !(app?.bundleIdentifier?.lowercased().contains(needle) ?? false) {
                 continue
             }
-            if listed[record.pid] == nil {
+            if listed.index(forKey: record.pid) == nil {
                 let element = AXUIElementCreateApplication(record.pid)
                 AXUIElementSetMessagingTimeout(element, 0.5)
                 listed[record.pid] = resolver.listedWindows(element)
             }
-            let window = listed[record.pid]?[record.id] ?? resolver.cached(pid: record.pid, wid: record.id)
+            let appWindows = listed[record.pid] ?? nil
+            let window = appWindows?[record.id] ?? resolver.cached(pid: record.pid, wid: record.id)
+            let onScreenNow = onScreen.contains(record.id)
+            // A window its app answered without, shown nowhere and on no Space a display hides, is one the app keeps
+            // but no longer shows (closed to the background, as Electron apps do): nothing can read it, and listing it
+            // sends an agent back to list_windows for a window that stays unreadable.
+            if !onScreenNow, window == nil, appWindows != nil, !Spaces.isHidden(record.id) { continue }
             var info = windowInfo(record, window: window)
-            info.isOnScreen = onScreen.contains(record.id)
+            info.isOnScreen = onScreenNow
             result.append(info)
         }
         return result

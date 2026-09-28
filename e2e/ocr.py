@@ -36,7 +36,7 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from run import Run, SCENARIOS, agent_origin, element_index, inside, scenario
+from run import Run, SCENARIOS, agent_origin, element_index, inside, probe_binary, scenario
 
 SCENARIOS.clear()
 
@@ -44,7 +44,6 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 TEXT_LINE = re.compile(r'^([+-]?)( *)text "((?:[^"\\]|\\.)*)" \((-?\d+),(-?\d+) (\d+)x(\d+)\)$', re.M)
 OCR_ATTR = re.compile(r' ocr="((?:[^"\\]|\\.)*)"')
 TIMINGS = {}
-_probe = None
 
 
 def require_on_agent_display(ctx, wid, what):
@@ -56,20 +55,6 @@ def require_on_agent_display(ctx, wid, what):
         time.sleep(0.2)
     ctx.require(f"{what} opened on the agent display, not on the user's screen",
                 window and inside(window["frame"], display), (window, display))
-
-
-def probe_binary():
-    global _probe
-    if _probe:
-        return _probe
-    built = subprocess.run(["swift", "build", "--product", "sc-focus-probe"], cwd=REPO,
-                           capture_output=True, text=True, timeout=900)
-    if built.returncode != 0:
-        raise AssertionError("swift build --product sc-focus-probe failed:\n" + (built.stderr or built.stdout)[-1500:])
-    bin_dir = subprocess.run(["swift", "build", "--show-bin-path"], cwd=REPO,
-                             capture_output=True, text=True, check=True, timeout=120).stdout.strip()
-    _probe = pathlib.Path(bin_dir) / "sc-focus-probe"
-    return _probe
 
 
 def text_lines(tree):

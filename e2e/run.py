@@ -1138,6 +1138,24 @@ def scope_reads(ctx):
     ctx.check("the scoped element index still acts", ctx.call("set_value", window_id=wid, element_index=area, value="ok").get("ok"))
 
 
+_probe = None
+
+
+def probe_binary():
+    """sc-focus-probe, built from this package: the fixture app a scenario opens where it needs one."""
+    global _probe
+    if _probe:
+        return _probe
+    built = subprocess.run(["swift", "build", "--product", "sc-focus-probe"], cwd=ROOT.parent,
+                           capture_output=True, text=True, timeout=900)
+    if built.returncode != 0:
+        raise AssertionError("swift build --product sc-focus-probe failed:\n" + (built.stderr or built.stdout)[-1500:])
+    bin_dir = subprocess.run(["swift", "build", "--show-bin-path"], cwd=ROOT.parent,
+                             capture_output=True, text=True, check=True, timeout=120).stdout.strip()
+    _probe = pathlib.Path(bin_dir) / "sc-focus-probe"
+    return _probe
+
+
 def agent_origin(ctx, dx=40, dy=60):
     """A point on the agent display, as "x,y" for a fixture's --origin: a window opened there never shows on the user's
     screen and is reachable from whatever Space they are on."""
@@ -1442,6 +1460,32 @@ def launch_on_hidden_space(ctx):
     error = refused(ctx, "get_window_state", window_id=window["id"], include_screenshot=False)
     ctx.check("reading it names the hidden Space rather than asking to call list_windows again",
               error and "desktop Space the user is not viewing" in error and "list_windows" not in error, error)
+
+
+@scenario
+def closed_windows_unlisted(ctx):
+    """A window its app closed to the background (ordered out, as Electron apps do with a closed window) is not listed:
+    nothing can read it, so listing it sent agents back to list_windows for it. The app's shown window still is."""
+    state_path = ctx.scratch / "closed-state.json"
+    process = subprocess.Popen([str(probe_binary()), "--closed", "--state", str(state_path), "--origin", agent_origin(ctx)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ctx.cleanups.append(process.kill)
+    deadline = time.time() + 15
+    while not state_path.exists() and time.time() < deadline:
+        time.sleep(0.2)
+    ctx.require("the fixture ordered its closed window out and wrote its state", state_path.exists())
+    state = json.loads(state_path.read_text())
+    # The WindowServer and Accessibility learn of the order-out a moment after the fixture wrote its state.
+    deadline = time.time() + 3
+    while True:
+        ids = {w["id"] for w in ctx.call("list_windows")["windows"]}
+        if state["closed"] not in ids or time.time() > deadline:
+            break
+        time.sleep(0.2)
+    ctx.check("the window the app shows is listed", state["shown"] in ids, state)
+    ctx.check("the window it closed to the background is not", state["closed"] not in ids, state)
+    error = refused(ctx, "get_window_state", window_id=state["closed"])
+    ctx.check("reading the closed window is refused as not found", error and "not found" in error, error)
 
 
 @scenario

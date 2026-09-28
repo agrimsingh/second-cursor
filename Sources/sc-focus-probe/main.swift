@@ -163,6 +163,9 @@ if let word = value("--canvas") {
     probe = Clicks(statePath: statePath, origin: origin)
     // --regular: a Dock app like TextEdit, whose background windows take input differently from an accessory app's.
     app.setActivationPolicy(arguments.contains("--regular") ? .regular : .accessory)
+} else if arguments.contains("--closed") {
+    probe = Closed(statePath: statePath, origin: origin)
+    app.setActivationPolicy(.accessory)
 } else {
     probe = Probe(statePath: statePath, avoid: avoid)
     app.setActivationPolicy(.regular)

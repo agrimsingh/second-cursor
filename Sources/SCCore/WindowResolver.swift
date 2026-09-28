@@ -31,7 +31,7 @@ final class WindowResolver: @unchecked Sendable {
         if let cached = cached(pid: pid, wid: wid) { return cached }
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 2)
-        let window = listedWindows(app)[wid]
+        let window = listedWindows(app)?[wid]
             ?? [kAXMainWindowAttribute, kAXFocusedWindowAttribute].lazy.compactMap { app.element($0) }.first { $0.windowID == wid }
             ?? scanRemoteTokens(pid: pid, target: wid)[wid]
         guard let window else { throw Spaces.isHidden(wid) ? SCError.windowOnHiddenSpace(wid) : SCError.windowNotFound(wid) }
@@ -48,9 +48,11 @@ final class WindowResolver: @unchecked Sendable {
         return nil
     }
 
-    func listedWindows(_ app: AXUIElement) -> [CGWindowID: AXUIElement] {
+    /// The app's windows by id, or nil when it did not answer (busy, or not speaking Accessibility at all).
+    func listedWindows(_ app: AXUIElement) -> [CGWindowID: AXUIElement]? {
+        guard let windows = app.attribute(kAXWindowsAttribute) as? [AXUIElement] else { return nil }
         var result: [CGWindowID: AXUIElement] = [:]
-        for window in app.elements(kAXWindowsAttribute) {
+        for window in windows {
             if let wid = window.windowID { result[wid] = window }
         }
         return result
