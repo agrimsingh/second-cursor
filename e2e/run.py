@@ -890,9 +890,12 @@ def refused(ctx, tool, **args):
 @scenario
 def action_observations(ctx):
     tools = {t["name"]: t["inputSchema"]["properties"] for t in ctx.mcp.rpc("tools/list")["tools"]}
-    ctx.check("observe is advertised on native actions only",
-              all("observe" in tools[n] for n in ["click", "type_text", "set_value", "press_key", "select_text", "paste"])
-              and not any("observe" in tools[n] for n in ["get_window_state", "screenshot", "browser_click"]))
+    ctx.check("observe is advertised on native and browser actions, not on reads",
+              all("observe" in tools[n] for n in ["click", "type_text", "set_value", "press_key", "select_text", "paste",
+                                                   "browser_click", "browser_type", "browser_press_key", "browser_scroll",
+                                                   "browser_navigate"])
+              and not any("observe" in tools[n] for n in ["get_window_state", "screenshot", "browser_snapshot",
+                                                          "browser_screenshot"]))
 
     calc = ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(calc["app"]["pid"])
