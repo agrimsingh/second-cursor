@@ -180,6 +180,7 @@ function domOperation(p, isSecretField) {
     if (l.text !== undefined)
       found = found.filter(
         (e) =>
+          !e.closest("head,script,style,noscript,template") &&
           matches(e.innerText || "", l.text) &&
           ![...e.children].some((c) => matches(c.innerText || "", l.text)),
       );
@@ -273,8 +274,9 @@ function domOperation(p, isSecretField) {
   const e = found[0];
   if (p.operation === "node") return e;
   if (p.operation === "inspect") {
-    const text =
-        "value" in e ? valueOf(e) : e.innerText || e.textContent || "",
+    const text = e.matches("input,textarea,select")
+        ? valueOf(e)
+        : e.innerText || e.textContent || "",
       offset = p.offset ?? 0,
       length = p.length ?? 4000;
     if (offset < 0 || length < 0 || length > 100000)

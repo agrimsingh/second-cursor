@@ -1487,6 +1487,11 @@ def browser(ctx):
         outline = ctx.call("browser_snapshot", tab_id=tid, full=True, include_screenshot=True)["outline"]
         field = re.search(r'\[(\w+)\] textbox "Name"', outline)
         ctx.require("snapshot exposes the Name textbox with a ref", field, outline[:500])
+        greeting = ctx.call("browser_command", tab_id=tid, operation="inspect", locator={"text": "Hello, ", "exact": False})
+        ctx.check("a text locator matches the page's text, not the source of its script", greeting["text"] == "Hello, stranger",
+                  greeting["text"])
+        submit = ctx.call("browser_command", tab_id=tid, operation="inspect", locator={"role": "button", "name": "Submit"})
+        ctx.check("inspect returns a button's text, not its empty value", submit["text"] == "Submit", submit["text"])
         typed = ctx.call("browser_type", tab_id=tid, ref=field.group(1), text="second cursor", submit=True)
         outline = typed["observation"]["outline"]
         ctx.check("typing + submit reached the page, and the action's observation shows it",
