@@ -775,6 +775,9 @@ extension BrowserREPL {
           throw error;
         }
         if (typeof result?.url === "string" && result.url) this.#url = result.url;
+        // Popups, downloads and closed tabs the extension reported since its last reply; dialogs are answered below.
+        if (isArray(result?.events))
+          for (const line of result.events) if (!/^\[system\] dialog (opened|closed) /.test(line)) print(String(line));
         if (!result?.dialog_open) return result;
         await dialog(params.tabId, result.dialog);
         return again && READS.has(params.operation ?? method) ? request(method, params, false) : { ok: true };
