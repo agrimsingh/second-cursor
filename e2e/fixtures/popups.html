@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><title>Second Cursor fixture — popups</title>
+  <style>#corner { position: fixed; right: 40px; bottom: 40px; width: 140px; height: 60px; }</style>
+</head>
+<body>
+  <h1>Popups</h1>
+  <p><a href="next.html?via=blank" target="_blank">Open in new tab</a></p>
+  <p><button onclick="window.open('next.html?via=open')">Open with window.open</button></p>
+  <p><button onclick="window.open('next.html?via=features', 'features', 'width=420,height=320')">Open popup window</button></p>
+  <p><button onclick="window.open('popup-close.html?close_ms=3000', 'closer', 'width=320,height=240')">Open self-closing popup</button></p>
+  <p><button onclick="answer.textContent = confirm('Proceed?') ? 'confirmed' : 'declined'">Ask</button> <span id="answer"></span></p>
+  <p><a href="next.html" download="popups-copy.html">Download a copy</a></p>
+  <p id="size"></p>
+  <button id="corner" onclick="this.textContent = 'hit ' + ++hits">Corner</button>
+  <script>
+    let hits = 0;
+    const size = () => (document.getElementById("size").textContent =
+      `inner ${innerWidth}x${innerHeight} outer ${outerWidth}x${outerHeight}`);
+    size();
+    addEventListener("resize", size);
+  </script>
+</body>
+</html>

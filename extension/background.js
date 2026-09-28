@@ -10,9 +10,11 @@ import {
   navigateTab,
   openTab,
   noteAction,
+  noteInput,
   requireAgentTab,
   settleAround,
   settled,
+  takeReports,
 } from "./tabs.js";
 
 import { extended, recordEvent, withDialog } from "./extended.js";
@@ -159,6 +161,8 @@ const handlers = {
 
 const ACTIONS = new Set(["tab.click", "tab.type", "tab.pressKey", "tab.scroll"]);
 const EXTENDED_ACTIONS = new Set(["click", "drag", "paste", "press_key", "scroll", "type", "upload"]);
+// Replies the app hands to the model; queued [system] lines ride on these and on nothing else, or they are lost.
+const REPORTING = new Set([...ACTIONS, "tabs.open", "tabs.close", "tab.snapshot", "extended"]);
 
 let port = null;
 let retryTimer = null;
@@ -196,17 +200,19 @@ async function dispatch(activePort, { id, method, params }) {
     )
       await requireAgentTab(params.tabId, params.session_id ?? "legacy");
     const dispatchedAt = Date.now();
+    const acts =
+      params.tabId != null &&
+      (ACTIONS.has(method) || (method === "extended" && EXTENDED_ACTIONS.has(params.operation)));
+    if (acts) noteInput(params.tabId);
     reply = {
       id,
       result: await (params.tabId != null
         ? withDialog(params.tabId, () => handler(params))
         : handler(params)),
     };
-    if (
-      params.tabId != null &&
-      (ACTIONS.has(method) || (method === "extended" && EXTENDED_ACTIONS.has(params.operation)))
-    )
-      noteAction(params.tabId, dispatchedAt);
+    const events = REPORTING.has(method) ? takeReports(params.session_id ?? "legacy") : [];
+    if (events.length) reply.result = { ...reply.result, events };
+    if (acts) noteAction(params.tabId, dispatchedAt);
   } catch (error) {
     reply = {
       id,

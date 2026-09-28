@@ -58,32 +58,35 @@ extension ToolRouter {
             return ToolOutput(json:json,images:images)
 
         case "browser_click":
-            let target: BrowserTarget
+            var params: [String: Any] = ["tabId": try args.int("tab_id")]
             if let ref = try args.optionalString("ref") {
-                target = .ref(ref)
+                params["ref"] = ref
             } else if let x = try args.optionalDouble("x"), let y = try args.optionalDouble("y") {
-                target = .point(x: x, y: y)
+                params["x"] = x
+                params["y"] = y
             } else {
                 throw SCError.invalidArgument("Pass ref, or both x and y")
             }
-            try await browser.click(tabID: try args.int("tab_id"), target: target)
-            return ToolOutput(json: Shape.ok)
+            return ToolOutput(json: try await reported("tab.click", params))
 
         case "browser_type":
-            try await browser.type(
-                tabID: try args.int("tab_id"), ref: try args.optionalString("ref"),
-                text: try args.string("text"), submit: try args.bool("submit", default: false))
-            return ToolOutput(json: Shape.ok)
+            var params: [String: Any] = [
+                "tabId": try args.int("tab_id"), "text": try args.string("text"),
+                "submit": try args.bool("submit", default: false),
+            ]
+            params["ref"] = try args.optionalString("ref")
+            return ToolOutput(json: try await reported("tab.type", params))
 
         case "browser_press_key":
-            try await browser.pressKey(tabID: try args.int("tab_id"), keys: try args.string("keys"))
-            return ToolOutput(json: Shape.ok)
+            return ToolOutput(
+                json: try await reported("tab.pressKey", ["tabId": try args.int("tab_id"), "keys": try args.string("keys")]))
 
         case "browser_scroll":
-            try await browser.scroll(
-                tabID: try args.int("tab_id"), direction: try args.direction(),
-                amount: max(try args.int("amount", default: 3), 1))
-            return ToolOutput(json: Shape.ok)
+            return ToolOutput(
+                json: try await reported("tab.scroll", [
+                    "tabId": try args.int("tab_id"), "direction": try args.direction().rawValue,
+                    "amount": max(try args.int("amount", default: 3), 1),
+                ]))
 
         case "browser_screenshot":
             let shot = try await browser.screenshot(tabID: try args.int("tab_id"))
@@ -98,6 +101,15 @@ extension ToolRouter {
         default:
             throw SCError.invalidArgument("Unknown tool \"\(name)\"")
         }
+    }
+
+    /// An action answers ok, plus the `[system]` lines the extension queued for the session since its last reply
+    /// (a tab the page opened, a dialog, a download).
+    private func reported(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+        let reply = try JSONSerialization.jsonObject(
+            with: await browser.command(method, params: JSONSerialization.data(withJSONObject: params))) as? [String: Any]
+        guard let events = reply?["events"] else { return Shape.ok }
+        return Shape.ok.merging(["events": events]) { $1 }
     }
 
     /// The extension draws the caption beside its in-page cursor (browser_command carries its own). Best effort:

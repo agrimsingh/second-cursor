@@ -108,7 +108,9 @@ Locators use one or more of `selector`, `role`/`name`, `label`, `text`, `placeho
 | cdp | Asks first; only Page.getLayoutMetrics, Page.getNavigationHistory, DOM.getDocument and Accessibility.getFullAXTree |
 | batch | Array of extended operation arguments, each flat or nested under `arguments` like the call itself; returns results and a final DOM observation |
 
-A dialog-triggering action returns the observed dialog instead of waiting for the click to complete. File choosers are intercepted, so files can be assigned without moving the system cursor. Google Workspace exports need a signed-in document; YouTube transcripts need captions. These service-specific paths are not covered by the local fixture suites.
+A dialog-triggering action returns the observed dialog instead of waiting for the click to complete. File choosers are intercepted, so files can be assigned without moving the system cursor.
+
+A tab or popup window that an agent tab opens (a `target=_blank` link, `window.open`) becomes an agent tab of the same session. If Chrome made it the active tab of the user's window, the tab the user was viewing is brought back. Chrome still shows the new tab for a few frames first, and nothing can stop a popup window from taking focus. Things the model did not ask about are queued per session and reported on the next result of `browser_open`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_close` or `browser_command`, as `events: ["[system] popup opened: tab 12 https://… (from tab 11)", …]`. The events are a popup opened, an agent tab closed by the page or the user, a download started, finished or canceled, and a dialog opened or closed. In a `batch`, each step's result carries its own events. Google Workspace exports need a signed-in document; YouTube transcripts need captions. These service-specific paths are not covered by the local fixture suites.
 
 ## JavaScript SDK
 

@@ -10,6 +10,7 @@
     "debugger",
     "tabs",
     "tabGroups",
+    "webNavigation",
     "nativeMessaging",
     "storage",
     "downloads",

@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Second Cursor fixture — closing popup</title></head>
+<body>
+  <h1>Closing popup</h1>
+  <button onclick="window.close()">Done</button>
+  <script>
+    const ms = Number(new URLSearchParams(location.search).get("close_ms"));
+    if (ms) setTimeout(() => window.close(), ms);
+  </script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Second Cursor fixture — the user's tab</title></head>
+<body>
+  <h1>The user's tab</h1>
+  <script>
+    const seen = [[document.visibilityState, performance.now()]];
+    document.addEventListener("visibilitychange", () => seen.push([document.visibilityState, performance.now()]));
+  </script>
+</body>
+</html>

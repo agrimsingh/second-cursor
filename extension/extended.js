@@ -8,6 +8,7 @@ import {
   userTabs,
   claimTab,
   releaseTab,
+  report,
   retainTab,
   settleAround,
 } from "./tabs.js";
@@ -46,12 +47,24 @@ export function recordEvent(source, method, p) {
   if (method === "Page.javascriptDialogOpening") {
     s.dialog = p;
     for (const wake of s.dialogWaiters) wake(p);
+    report(
+      source.tabId,
+      `dialog opened in tab ${source.tabId}: ${p.type} ${JSON.stringify(p.message.slice(0, 200))}; answer it with browser_command operation=dialog`,
+    );
   }
-  if (method === "Page.javascriptDialogClosed") s.dialog = null;
+  if (method === "Page.javascriptDialogClosed") {
+    s.dialog = null;
+    report(source.tabId, `dialog closed in tab ${source.tabId}: ${p.result ? "accepted" : "dismissed"}`);
+  }
   if (method === "Page.fileChooserOpened") s.chooser = p;
   if (method === "Page.downloadWillBegin") {
     s.downloads.push(p);
     if (s.downloads.length > 100) s.downloads.shift();
+    report(source.tabId, `download started in tab ${source.tabId}: ${p.suggestedFilename}`);
+  }
+  if (method === "Page.downloadProgress" && p.state !== "inProgress") {
+    const name = s.downloads.find((d) => d.guid === p.guid)?.suggestedFilename ?? p.guid;
+    report(source.tabId, `download ${p.state === "completed" ? "finished" : "canceled"} in tab ${source.tabId}: ${name}`);
   }
   if (method === "Network.responseReceived") {
     s.assets.set(p.requestId, {

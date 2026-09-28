@@ -34,9 +34,72 @@ async function updateAgentTabs(change) {
   return persistQueue;
 }
 
-chrome.tabs.onRemoved.addListener((tabId) =>
-  updateAgentTabs((set) => set.delete(tabId)),
+const reports = new Map();
+/** Queues a line for the model about an agent tab; the next reply to the tab's session carries it. */
+export async function report(tabId, line) {
+  const session = (await ownership())[tabId]?.session;
+  if (!session) return;
+  reports.set(session, [...(reports.get(session) ?? []), `[system] ${line}`].slice(-50));
+}
+export function takeReports(session) {
+  const lines = reports.get(session) ?? [];
+  reports.delete(session);
+  return lines;
+}
+
+const closing = new Set();
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const agent = (await agentTabSet()).has(tabId);
+  if (!closing.delete(tabId) && agent)
+    await report(tabId, `tab ${tabId} closed (by the page or the user); its id no longer works`);
+  await updateAgentTabs((set) => set.delete(tabId));
+});
+
+// What each window showed before its current tab, to hand the user's view back from a tab an agent tab opened.
+const viewed = new Map();
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) =>
+  viewed.set(windowId, { current: tabId, previous: viewed.get(windowId)?.current }),
 );
+chrome.windows.onRemoved.addListener((windowId) => viewed.delete(windowId));
+chrome.tabs.query({ active: true }).then((tabs) => {
+  for (const t of tabs) if (!viewed.has(t.windowId)) viewed.set(t.windowId, { current: t.id });
+});
+
+const inputAt = new Map();
+chrome.tabs.onRemoved.addListener((tabId) => inputAt.delete(tabId));
+/** The agent is about to send input to the tab. */
+export function noteInput(tabId) {
+  inputAt.set(tabId, Date.now());
+}
+
+/**
+ * A tab or window an agent tab opened (a target=_blank link, window.open) joins the opener's session. openerTabId
+ * cannot tell: for a tab opened into the same window, Chrome names the window's active tab, which is the user's.
+ * One the user opens from an agent tab (one handed off to them, say) stays theirs: a page can only open a window
+ * within the 5 s its last input keeps it activated, so only a tab opened that soon after the agent's input counts.
+ */
+async function adoptOpened({ sourceTabId, tabId, url }) {
+  const owner = (await ownership())[sourceTabId];
+  if (!owner?.created || !(await agentTabSet()).has(sourceTabId)) return;
+  if (Date.now() - (inputAt.get(sourceTabId) ?? 0) > 5000) return;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return;
+  // Chrome activates a new tab in the user's window; every moment it shows is taken from the user. A popup window
+  // is its own window, and nothing here can stop it taking focus.
+  if (tab.active) {
+    const { current, previous } = viewed.get(tab.windowId) ?? {};
+    const back = current === tabId ? previous : current;
+    if (back != null) await chrome.tabs.update(back, { active: true }).catch(() => {});
+  }
+  await updateAgentTabs((set) => set.add(tabId));
+  (await ownership())[tabId] = { session: owner.session, created: true, mode: "ephemeral" };
+  await saveOwnership();
+  await report(tabId, `popup opened: tab ${tabId} ${url} (from tab ${sourceTabId})`);
+  await chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {});
+  if ((await chrome.windows.get(tab.windowId)).type === "normal") await addToGroup(tab);
+  await attach(tabId).catch(() => {});
+}
+chrome.webNavigation.onCreatedNavigationTarget.addListener(adoptOpened);
 
 // The alarm wakes the service worker, so an abandoned claim is released (and the "being debugged"
 // bar goes away) even if the agent never calls again.
@@ -90,7 +153,7 @@ export async function requireAgentTab(tabId, session = null) {
   if (!(await agentTabSet()).has(tabId)) {
     throw new BridgeError(
       "not_allowed",
-      `Tab ${tabId} is not a Second Cursor tab; only tabs opened with browser_open can be driven`,
+      `Tab ${tabId} is not a Second Cursor tab; only tabs opened with browser_open, or opened by such a tab, can be driven`,
     );
   }
   const owner = (await ownership())[tabId];
@@ -326,6 +389,7 @@ export async function closeTab(tabId) {
     await dropTab(tabId);
     return { released: true, closed: false };
   }
+  closing.add(tabId);
   await chrome.tabs.remove(tabId);
   await updateAgentTabs((set) => set.delete(tabId));
   return { released: false, closed: true };
@@ -386,13 +450,16 @@ export async function retainTab(tabId, session, mode) {
 export async function closeSession(session) {
   for (const [id, entry] of Object.entries(await ownership()))
     if (entry.session === session) {
-      if (entry.created && entry.mode === "ephemeral")
+      if (entry.created && entry.mode === "ephemeral") {
+        closing.add(Number(id));
         await chrome.tabs.remove(Number(id)).catch(() => {});
+      }
       await releaseTab(Number(id), session).catch(async () => {
         delete (await ownership())[id];
         await updateAgentTabs((s) => s.delete(Number(id)));
       });
     }
   await saveOwnership();
+  reports.delete(session);
   return { closed: true };
 }
