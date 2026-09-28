@@ -16,6 +16,16 @@ import {
 
 const events = new Map();
 chrome.tabs.onRemoved.addListener((id) => events.delete(id));
+// Frames that started and stopped loading, per tab, so an input can wait for the navigation it began.
+const loads = new Map();
+chrome.tabs.onRemoved.addListener((id) => loads.delete(id));
+const loadsOf = (id) => loads.get(id) ?? loads.set(id, { started: 0, stopped: 0 }).get(id);
+// Waits for a load the input started: one begun within 30 ms, until every started load has stopped (at most 15 s).
+async function afterInput(tabId, before) {
+  const counts = loadsOf(tabId);
+  for (const until = Date.now() + 30; counts.started === before && Date.now() < until; ) await sleep(10);
+  for (const until = Date.now() + 15000; counts.stopped < counts.started && Date.now() < until; ) await sleep(25);
+}
 function state(id) {
   if (!events.has(id))
     events.set(id, {
@@ -32,6 +42,8 @@ function state(id) {
 /** The JavaScript dialog open in the tab, if any. */
 export const openDialog = (tabId) => state(tabId).dialog;
 export function recordEvent(source, method, p) {
+  if (method === "Page.frameStartedLoading") loadsOf(source.tabId).started++;
+  if (method === "Page.frameStoppedLoading") loadsOf(source.tabId).stopped++;
   const s = state(source.tabId);
   if (method === "Runtime.consoleAPICalled") {
     s.logs.push({
@@ -80,8 +92,9 @@ export function recordEvent(source, method, p) {
   }
 }
 
-// This function executes in an isolated page world and only operates on DOM elements.
-function domOperation(p, isSecretField) {
+// This function executes in an isolated page world and only operates on DOM elements. `anchor` is the element an
+// aria-ref locator resolved to.
+function domOperation(p, isSecretField, anchor) {
   let doc = document;
   for (const selector of Array.isArray(p.locator?.frame)
     ? p.locator.frame
@@ -154,8 +167,282 @@ function domOperation(p, isSecretField) {
     e.value && secret(e) ? "[redacted]" : String(e.value);
   const matches = (a, b) =>
     p.locator?.exact === false ? a.includes(b) : a.trim() === b;
+  // Chained locators (browser_repl) follow Playwright: text is case-insensitive substring unless exact, exact is
+  // case-sensitive and whole, whitespace is normalized, and each step searches below or narrows the previous set.
+  const chained = !!p.locator?.chain;
+  const normalized = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+  const textMatches = (value, want, exact) => {
+    const text = normalized(value);
+    if (want && typeof want === "object")
+      return new RegExp(want.regex.source, want.regex.flags).test(text);
+    return exact
+      ? text === normalized(want)
+      : text.toLowerCase().includes(normalized(want).toLowerCase());
+  };
+  const HEADINGS = { H1: 1, H2: 2, H3: 3, H4: 4, H5: 5, H6: 6 };
+  const ariaRole = (e) => {
+    const explicit = (e.getAttribute("role") || "").trim().split(/\s+/)[0];
+    if (explicit) return explicit;
+    const tag = e.tagName;
+    if (HEADINGS[tag]) return "heading";
+    if (tag === "INPUT") {
+      const type = (e.getAttribute("type") || "text").toLowerCase();
+      if (["button", "submit", "reset", "image"].includes(type)) return "button";
+      if (type === "hidden") return "";
+      if (e.hasAttribute("list")) return "combobox";
+      return (
+        {
+          checkbox: "checkbox",
+          radio: "radio",
+          range: "slider",
+          number: "spinbutton",
+          search: "searchbox",
+        }[type] || "textbox"
+      );
+    }
+    if (tag === "A" || tag === "AREA") return e.hasAttribute("href") ? "link" : "";
+    if (tag === "HEADER" || tag === "FOOTER")
+      return e.closest("article,aside,main,nav,section")
+        ? ""
+        : tag === "HEADER"
+          ? "banner"
+          : "contentinfo";
+    if (tag === "SECTION")
+      return e.hasAttribute("aria-label") || e.hasAttribute("aria-labelledby")
+        ? "region"
+        : "";
+    if (tag === "SELECT") return e.multiple || e.size > 1 ? "listbox" : "combobox";
+    if (tag === "IMG") return e.getAttribute("alt") === "" ? "presentation" : "img";
+    return (
+      {
+        ARTICLE: "article",
+        ASIDE: "complementary",
+        BUTTON: "button",
+        DD: "definition",
+        DETAILS: "group",
+        DIALOG: "dialog",
+        DT: "term",
+        FIELDSET: "group",
+        FIGURE: "figure",
+        FORM: "form",
+        HR: "separator",
+        LI: "listitem",
+        MAIN: "main",
+        MENU: "list",
+        NAV: "navigation",
+        OL: "list",
+        OPTION: "option",
+        OUTPUT: "status",
+        P: "paragraph",
+        PROGRESS: "progressbar",
+        TABLE: "table",
+        TBODY: "rowgroup",
+        TD: "cell",
+        TEXTAREA: "textbox",
+        TFOOT: "rowgroup",
+        TH: "columnheader",
+        THEAD: "rowgroup",
+        TR: "row",
+        UL: "list",
+      }[tag] || ""
+    );
+  };
+  const NAME_FROM_CONTENT = new Set([
+    "button",
+    "cell",
+    "checkbox",
+    "columnheader",
+    "gridcell",
+    "heading",
+    "link",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "radio",
+    "row",
+    "rowheader",
+    "switch",
+    "tab",
+    "term",
+    "tooltip",
+    "treeitem",
+  ]);
+  const labelOf = (e) =>
+    normalized(
+      (e.getAttribute("aria-labelledby") || "")
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((id) => doc.getElementById(id)?.textContent || "")
+        .join(" "),
+    ) ||
+    normalized(e.getAttribute("aria-label")) ||
+    normalized([...(e.labels ?? [])].map(labelText).join(" "));
+  const accName = (e, r) => {
+    const label = labelOf(e);
+    if (label) return label;
+    if (e.matches("img,area,input[type=image]") && e.getAttribute("alt"))
+      return e.getAttribute("alt");
+    if (e.matches("input[type=button],input[type=submit],input[type=reset]"))
+      return e.value || { submit: "Submit", reset: "Reset" }[e.type] || "";
+    const caption =
+      e.tagName === "FIELDSET"
+        ? e.querySelector(":scope > legend")
+        : e.tagName === "TABLE"
+          ? e.querySelector(":scope > caption")
+          : null;
+    if (caption) return normalized(caption.textContent);
+    if (NAME_FROM_CONTENT.has(r)) {
+      const text = normalized(e.innerText ?? e.textContent);
+      if (text) return text;
+    }
+    return (
+      e.getAttribute("title") ||
+      (["textbox", "searchbox", "combobox"].includes(r)
+        ? e.getAttribute("placeholder") || ""
+        : "")
+    );
+  };
+  const rendered = (e) =>
+    e.checkVisibility
+      ? e.checkVisibility({ visibilityProperty: true })
+      : visible(e);
+  // Playwright's visibility: a non-empty box and not visibility:hidden.
+  const shown = (e) => {
+    if (!rendered(e)) return false;
+    const b = e.getBoundingClientRect();
+    return b.width > 0 && b.height > 0;
+  };
+  const ariaHidden = (e) =>
+    !!e.closest('[aria-hidden="true"]') ||
+    !rendered(e.tagName === "OPTION" ? (e.closest("select") ?? e) : e);
+  const enabled = (e) =>
+    !(
+      e.disabled ||
+      e.closest('[aria-disabled="true"]') ||
+      (e.closest("fieldset[disabled]") && !e.closest("legend"))
+    );
+  const roleStates = (e, s) =>
+    (s.level === undefined ||
+      (Number(e.getAttribute("aria-level")) || HEADINGS[e.tagName] || 0) ===
+        s.level) &&
+    (s.checked === undefined ||
+      (e.matches("input[type=checkbox],input[type=radio]")
+        ? e.checked
+        : e.getAttribute("aria-checked") === "true") === s.checked) &&
+    (s.disabled === undefined || !enabled(e) === s.disabled) &&
+    (s.expanded === undefined ||
+      (e.getAttribute("aria-expanded") === "true") === s.expanded) &&
+    (s.pressed === undefined ||
+      (e.getAttribute("aria-pressed") === "true") === s.pressed) &&
+    (s.selected === undefined ||
+      (e.tagName === "OPTION"
+        ? e.selected
+        : e.getAttribute("aria-selected") === "true") === s.selected);
+  const ownText = (e) =>
+    e.matches("input[type=button],input[type=submit],input[type=reset]")
+      ? e.value
+      : (e.innerText ?? e.textContent ?? "");
+  const describeElement = (e) => {
+    const attributes = ["id", "type", "role", "aria-label", "data-testid", "href"]
+      .filter((a) => e.hasAttribute(a))
+      .slice(0, 3)
+      .map((a) => ` ${a}="${e.getAttribute(a).slice(0, 40)}"`)
+      .join("");
+    const text = normalized(e.innerText ?? e.textContent).slice(0, 80);
+    return `<${e.localName}${attributes}>${text ? ` "${text}"` : ""}`;
+  };
+  const inOrder = (list) =>
+    list.length < 2
+      ? list
+      : list.sort((a, b) =>
+          a === b
+            ? 0
+            : a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING
+              ? -1
+              : 1,
+        );
+  const notOverlay = (e) => e.id !== "second-cursor-overlay";
+  function chain(steps, set) {
+    const below = (keep) => {
+      const found = new Set();
+      for (const el of set ?? [root])
+        for (const e of el.querySelectorAll("*"))
+          if (notOverlay(e) && keep(e)) found.add(e);
+      return inOrder([...found]);
+    };
+    for (const s of steps) {
+      if (s.ref !== undefined) continue;
+      if (s.css !== undefined)
+        set = inOrder([
+          ...new Set(
+            (set ?? [root]).flatMap((el) => [...el.querySelectorAll(s.css)]),
+          ),
+        ]).filter(notOverlay);
+      else if (s.xpath !== undefined) {
+        const found = new Set();
+        for (const el of set ?? [root]) {
+          const r = doc.evaluate(s.xpath, el, null, 7, null);
+          for (let i = 0; i < r.snapshotLength; i++)
+            if (r.snapshotItem(i).nodeType === 1) found.add(r.snapshotItem(i));
+        }
+        set = inOrder([...found]);
+      } else if (s.role !== undefined)
+        set = below(
+          (e) =>
+            ariaRole(e) === s.role &&
+            (s.include_hidden || !ariaHidden(e)) &&
+            roleStates(e, s) &&
+            (s.name === undefined || textMatches(accName(e, s.role), s.name, s.exact)),
+        );
+      else if (s.text !== undefined)
+        set = below(
+          (e) =>
+            !e.closest("head,script,style,noscript,template") &&
+            textMatches(ownText(e), s.text, s.exact) &&
+            ![...e.children].some((c) => textMatches(ownText(c), s.text, s.exact)),
+        );
+      else if (s.label !== undefined)
+        set = below((e) => {
+          const label = labelOf(e);
+          return !!label && textMatches(label, s.label, s.exact);
+        });
+      else if (s.attribute !== undefined)
+        set = below(
+          (e) =>
+            e.hasAttribute(s.attribute) &&
+            (s.attribute === "data-testid"
+              ? e.getAttribute(s.attribute) === s.value
+              : textMatches(e.getAttribute(s.attribute), s.value, s.exact)),
+        );
+      else {
+        set ??= [...root.querySelectorAll("*")].filter(notOverlay);
+        if (s.has_text !== undefined)
+          set = set.filter((e) => textMatches(ownText(e), s.has_text, false));
+        else if (s.has_not_text !== undefined)
+          set = set.filter((e) => !textMatches(ownText(e), s.has_not_text, false));
+        else if (s.has !== undefined)
+          set = set.filter((e) => chain(s.has, [e]).length > 0);
+        else if (s.has_not !== undefined)
+          set = set.filter((e) => chain(s.has_not, [e]).length === 0);
+        else if (s.visible !== undefined)
+          set = set.filter((e) => shown(e) === s.visible);
+        else if (s.nth !== undefined) {
+          const i = s.nth < 0 ? set.length + s.nth : s.nth;
+          set = i >= 0 && i < set.length ? [set[i]] : [];
+        } else if (s.and !== undefined) {
+          const other = new Set(chain(s.and, null));
+          set = set.filter((e) => other.has(e));
+        } else if (s.or !== undefined)
+          set = inOrder([...new Set([...set, ...chain(s.or, null)])]);
+        else throw Error(`Unknown locator step ${JSON.stringify(s)}`);
+      }
+    }
+    return set ?? [];
+  }
   function locate() {
     const l = p.locator || {};
+    if (chained) return chain(l.chain, anchor ? [anchor] : l.chain[0]?.ref !== undefined ? [] : null);
     // The agent's own cursor (cursor.js) is not part of the page.
     let found = [...root.querySelectorAll(l.selector || "*")].filter(
       (e) => e.id !== "second-cursor-overlay",
@@ -262,11 +549,34 @@ function domOperation(p, isSecretField) {
     };
   }
   const found = locate();
-  if (p.operation === "query")
+  if (p.operation === "query") {
+    if (!chained)
+      return {
+        count: found.length,
+        visible: found.length === 1 && visible(found[0]),
+      };
     return {
       count: found.length,
-      visible: found.length === 1 && visible(found[0]),
+      visible: found.length === 1 && shown(found[0]),
+      enabled: found.length === 1 && enabled(found[0]),
+      ...(p.texts
+        ? {
+            texts: found
+              .slice(0, 1000)
+              .map((e) =>
+                (p.texts === "content" ? e.textContent : ownText(e)).slice(0, 100000),
+              ),
+          }
+        : {}),
     };
+  }
+  if (chained && found.length > 1)
+    throw Error(
+      `strict mode violation: resolved to ${found.length} elements:\n${found
+        .slice(0, 5)
+        .map((e, i) => `  ${i + 1}) ${describeElement(e)}`)
+        .join("\n")}${found.length > 5 ? `\n  … and ${found.length - 5} more` : ""}`,
+    );
   if (found.length !== 1)
     throw Error(
       `Locator matched ${found.length} elements; refine it to exactly one`,
@@ -274,9 +584,14 @@ function domOperation(p, isSecretField) {
   const e = found[0];
   if (p.operation === "node") return e;
   if (p.operation === "inspect") {
-    const text = e.matches("input,textarea,select")
-        ? valueOf(e)
-        : e.innerText || e.textContent || "",
+    const text =
+        p.text_kind === "content"
+          ? e.textContent || ""
+          : p.text_kind === "inner"
+            ? (e.innerText ?? e.textContent ?? "")
+            : e.matches("input,textarea,select")
+              ? valueOf(e)
+              : e.innerText || e.textContent || "",
       offset = p.offset ?? 0,
       length = p.length ?? 4000;
     if (offset < 0 || length < 0 || length > 100000)
@@ -287,10 +602,10 @@ function domOperation(p, isSecretField) {
       text: text.slice(offset, offset + length),
       total_length: text.length,
       has_more: offset + length < text.length,
-      role: role(e),
-      name: name(e),
-      enabled: !e.disabled,
-      visible: visible(e),
+      role: chained ? ariaRole(e) : role(e),
+      name: chained ? accName(e, ariaRole(e)) : name(e),
+      enabled: chained ? enabled(e) : !e.disabled,
+      visible: chained ? shown(e) : visible(e),
       checked: "checked" in e ? e.checked : null,
       attributes: Object.fromEntries(
         [...e.attributes].map((x) => [
@@ -299,6 +614,20 @@ function domOperation(p, isSecretField) {
         ]),
       ),
     };
+  }
+  // Playwright's actionability: acted-on elements must be visible and enabled; these errors are retried.
+  if (
+    chained &&
+    !p.force &&
+    ["center", "fill", "focus", "check", "select_option", "select_text", "perform_action"].includes(
+      p.operation,
+    )
+  ) {
+    if (!shown(e)) throw Error("Element is not visible");
+    if (!enabled(e)) throw Error("Element is disabled");
+    if (p.operation === "fill" && !(e.isContentEditable || e.matches("input,textarea")))
+      throw Error("Element is not an <input>, <textarea> or [contenteditable] element");
+    if (p.operation === "fill" && e.readOnly) throw Error("Element is not editable");
   }
   if (e.disabled) throw Error("Element is disabled");
   if (p.operation === "focus") {
@@ -352,8 +681,13 @@ function domOperation(p, isSecretField) {
     return { value: "value" in e ? valueOf(e) : e.textContent };
   }
   if (p.operation === "select_option") {
-    const values = Array.isArray(p.value) ? p.value : [p.value];
     const opts = [...e.options];
+    // Chained locators also match an option by its label, as Playwright's selectOption does.
+    const values = (Array.isArray(p.value) ? p.value : [p.value]).map((v) =>
+      chained && !opts.some((o) => o.value === v)
+        ? (opts.find((o) => normalized(o.label) === normalized(v))?.value ?? v)
+        : v,
+    );
     if (!values.every((v) => opts.some((o) => o.value === v)))
       throw Error("Option not found");
     for (const o of opts) o.selected = values.includes(o.value);
@@ -558,7 +892,49 @@ async function locatorTarget(tabId, p) {
   );
   return { point, levels };
 }
+// A chain that starts at an aria-ref (a snapshot's [e123], the node's backendNodeId) runs on that node.
+async function refDom(tabId, p, ref, object) {
+  const id = /^e?(\d+)$/.exec(String(ref).trim())?.[1];
+  if (!id)
+    throw new BridgeError(
+      "invalid_argument",
+      `Invalid ref ${JSON.stringify(ref)}; use an [e123] ref from the page's snapshot`,
+    );
+  const resolved = await cdp(tabId, "DOM.resolveNode", {
+    backendNodeId: Number(id),
+  }).catch(() => null);
+  const objectId = resolved?.object?.objectId;
+  if (!objectId)
+    throw new BridgeError(
+      "failed",
+      `Ref ${ref} is no longer on the page; take a new snapshot`,
+    );
+  try {
+    const result = await cdp(tabId, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: `function (p) { return (${domOperation.toString()})(p, ${isSecretField.toString()}, this); }`,
+      arguments: [{ value: p }],
+      returnByValue: !object,
+      awaitPromise: true,
+    });
+    if (result.exceptionDetails)
+      throw new BridgeError(
+        "failed",
+        result.exceptionDetails.exception?.description ??
+          result.exceptionDetails.text,
+      );
+    if (object) {
+      const send = (method, params) => cdp(tabId, method, params);
+      return { ...result.result, send, context: { send, root: { x: 0, y: 0 }, owners: [] } };
+    }
+    return result.result.value;
+  } finally {
+    cdp(tabId, "Runtime.releaseObject", { objectId }).catch(() => {});
+  }
+}
 async function dom(tabId, p, object = false) {
+  const ref = p.locator?.chain?.[0]?.ref;
+  if (ref !== undefined) return refDom(tabId, p, ref, object);
   const context = await contextFor(tabId, p);
   const arg = { ...p, locator: { ...p.locator, frame: undefined } };
   const result = await context.send("Runtime.evaluate", {
@@ -667,7 +1043,17 @@ const OPERATION_ARGUMENTS = {
   clipboard: "action read/write; text for write. Local approval required.",
 };
 
+// browser_repl asks for the tab's URL with every result, so page.url() follows navigations its actions cause.
 export async function extended(p) {
+  const result = await operate(p);
+  if (p.report_url && Number.isInteger(p.tabId) && result && typeof result === "object") {
+    const tab = await chrome.tabs.get(p.tabId).catch(() => null);
+    if (tab) result.url = tab.url || tab.pendingUrl || "";
+  }
+  return result;
+}
+
+async function operate(p) {
   const { tabId, operation: op } = p,
     session = p.session_id ?? "legacy";
   if (
@@ -737,7 +1123,8 @@ export async function extended(p) {
   if (op === "release") return releaseTab(tabId, session);
   if (op === "retain") return retainTab(tabId, session, p.mode);
   if (CURSOR_OPERATIONS.has(op)) setCaption(tabId, p.caption ?? "", session);
-  if (op === "dom_snapshot" || op === "inspect") return dom(tabId, p);
+  if (op === "dom_snapshot" || op === "inspect" || op === "query")
+    return dom(tabId, p);
   if (
     ["fill", "check", "select_option", "select_text", "perform_action"].includes(
       op,
@@ -769,9 +1156,11 @@ export async function extended(p) {
         modifiers,
       });
     await pointTo(tabId, point, p.count ?? 1);
+    const before = loadsOf(tabId).started;
     // Do not wait for navigation while a JS dialog is open.
     await send("mousePressed");
     await send("mouseReleased");
+    if (p.wait_navigation) await afterInput(tabId, before);
     return ok();
   }
   if (op === "type" || op === "press_key") {
@@ -779,8 +1168,10 @@ export async function extended(p) {
       if (op === "type") await pointAtLocator(tabId, p);
       await dom(tabId, { ...p, operation: "focus" });
     }
+    const before = loadsOf(tabId).started;
     if (op === "type") await type(tabId, { text: p.text });
     else await pressKey(tabId, p.keys);
+    if (p.wait_navigation) await afterInput(tabId, before);
     return ok();
   }
   if (op === "paste") {

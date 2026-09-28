@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>REPL fixture</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 16px; padding-bottom: 240px; }
+  #footer { position: fixed; left: 0; right: 0; bottom: 0; height: 48px; background: #eee; }
+  #footer button { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); }
+  #toast { position: fixed; left: 50%; bottom: 6px; transform: translateX(-50%); padding: 14px 48px;
+    background: #26251e; color: #fff; z-index: 10; white-space: nowrap; }
+  #cover { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.3); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>Orders</h1>
+<p id="status">Nothing yet</p>
+
+<section aria-label="Toolbar">
+  <button>Save</button>
+  <button>Save draft</button>
+  <button id="later" disabled>Publish</button>
+  <button id="reveal">Load details</button>
+  <button id="add">Add row</button>
+  <button id="shade">Cover the page</button>
+  <button id="confirm">Delete all</button>
+</section>
+
+<p id="details" hidden>Details loaded</p>
+<p>  Total:
+   <b>42</b>   items </p>
+<span data-testid="badge">Beta</span>
+
+<table>
+  <tr><td>Alice Smith</td><td>Pending</td><td><button>Edit</button></td></tr>
+  <tr><td>Bob Jones</td><td>Shipped</td><td><button>Edit</button></td></tr>
+  <tr><td>Carol White</td><td>Pending</td><td><button>Edit</button></td></tr>
+</table>
+
+<form>
+  <label>Email <input type="email" name="email"></label>
+  <label><input type="checkbox" name="subscribe"> Subscribe</label>
+  <label>Size
+    <select name="size">
+      <option value="s">Small</option>
+      <option value="m">Medium</option>
+      <option value="l">Large</option>
+    </select>
+  </label>
+</form>
+<div id="rows"></div>
+<div id="cover" hidden></div>
+<p><a href="next.html?delay_ms=800">Slow next page</a> <button id="archive">Archive</button></p>
+<!-- Like inbox-live.html's Undo toast: shown for 6 s over a control fixed at the bottom of the viewport. -->
+<div id="footer"><button id="spam">Label: Spam</button></div>
+<div id="toast" role="status" hidden>Conversation archived. <button id="undo">Undo</button></div>
+
+<script>
+const status = document.getElementById("status");
+const say = (text) => (status.textContent = text);
+for (const button of document.querySelectorAll("section button, table button"))
+  button.addEventListener("click", () => {
+    const row = button.closest("tr");
+    say(`Clicked: ${button.textContent}${row ? ` (${row.cells[0].textContent})` : ""}`);
+  });
+document.getElementById("reveal").addEventListener("click", () =>
+  setTimeout(() => (document.getElementById("details").hidden = false), 800));
+document.getElementById("add").addEventListener("click", () =>
+  setTimeout(() => {
+    const button = document.createElement("button");
+    button.textContent = "Late button";
+    button.addEventListener("click", () => say("Clicked: Late button"));
+    document.getElementById("rows").append(button);
+  }, 800));
+document.getElementById("shade").addEventListener("click", () => {
+  document.getElementById("cover").hidden = false;
+  setTimeout(() => (document.getElementById("cover").hidden = true), 800);
+});
+document.getElementById("spam").addEventListener("click", () => say("Clicked: Label: Spam"));
+document.getElementById("archive").addEventListener("click", () => {
+  say("Archived");
+  document.getElementById("toast").hidden = false;
+  setTimeout(() => (document.getElementById("toast").hidden = true), 6000);
+});
+document.getElementById("confirm").addEventListener("click", () =>
+  say(confirm("Delete every order?") ? "Confirmed delete" : "Cancelled delete"));
+setTimeout(() => (document.getElementById("later").disabled = false), 1500);
+document.getElementById("later").addEventListener("click", () => say("Clicked: Publish"));
+</script>
+</body>
+</html>

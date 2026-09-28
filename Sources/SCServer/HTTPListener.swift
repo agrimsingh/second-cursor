@@ -47,7 +47,9 @@ final class HTTPListener: @unchecked Sendable {
             .childChannelOption(ChannelOptions.socketOption(.tcp_nodelay), value: 1)
             .childChannelInitializer { channel in
                 self.remember(channel)
-                return channel.pipeline.configureHTTPServerPipeline().flatMap {
+                // Pipelining assistance stops reading while a response is pending, which hides a client that hung up
+                // (ClientRequest). Clients send one request per connection at a time.
+                return channel.pipeline.configureHTTPServerPipeline(withPipeliningAssistance: false).flatMap {
                     channel.pipeline.addHandler(MCPHTTPHandler(path: path, route: route))
                 }
             }
@@ -62,6 +64,39 @@ final class HTTPListener: @unchecked Sendable {
     }
 }
 
+/// The HTTP request a tool call arrived in: its JSON-RPC id, and whether the client is still waiting for the answer.
+/// A client that gives up closes the connection before the response is written.
+final class ClientRequest: @unchecked Sendable {
+    @TaskLocal static var current: ClientRequest?
+
+    let id: String?
+    private let lock = NSLock()
+    private var gone = false
+    private var handlers: [@Sendable () -> Void] = []
+
+    init(id: String?) {
+        self.id = id
+    }
+
+    /// Runs `handler` once the client has gone, at once if it already has.
+    func onGone(_ handler: @escaping @Sendable () -> Void) {
+        let now = lock.withLock {
+            if !gone { handlers.append(handler) }
+            return gone
+        }
+        if now { handler() }
+    }
+
+    fileprivate func clientLeft() {
+        let pending = lock.withLock {
+            defer { handlers = [] }
+            gone = true
+            return handlers
+        }
+        pending.forEach { $0() }
+    }
+}
+
 private final class MCPHTTPHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
@@ -73,6 +108,7 @@ private final class MCPHTTPHandler: ChannelInboundHandler {
     private var head: HTTPRequestHead?
     private var body = ByteBuffer()
     private var bodyTooLarge = false
+    private var inFlight: ClientRequest?
 
     init(path: String, route: @escaping HTTPListener.Route) {
         self.path = path
@@ -102,6 +138,12 @@ private final class MCPHTTPHandler: ChannelInboundHandler {
         context.close(promise: nil)
     }
 
+    func channelInactive(context: ChannelHandlerContext) {
+        inFlight?.clientLeft()
+        inFlight = nil
+        context.fireChannelInactive()
+    }
+
     private func respond(to head: HTTPRequestHead, context: ChannelHandlerContext) {
         let requestPath = String(head.uri.split(separator: "?", maxSplits: 1).first ?? "")
         let loop = context.eventLoop
@@ -127,9 +169,16 @@ private final class MCPHTTPHandler: ChannelInboundHandler {
             path: requestPath
         )
         let route = self.route
+        let id = request.body.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }?["id"]
+        let client = ClientRequest(id: id.map { "\($0)" })
+        inFlight = client
+        let boundSelf = NIOLoopBound(self, eventLoop: loop)
         Task {
-            let response = await route(request)
-            loop.execute { Self.write(response, for: head, to: boundContext.value) }
+            let response = await ClientRequest.$current.withValue(client) { await route(request) }
+            loop.execute {
+                if boundSelf.value.inFlight === client { boundSelf.value.inFlight = nil }
+                Self.write(response, for: head, to: boundContext.value)
+            }
         }
     }
 

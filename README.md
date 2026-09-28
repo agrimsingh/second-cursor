@@ -99,6 +99,7 @@ Second Cursor runs no model of its own. Whatever client you connect brings one, 
 | Sessions | `session`, `bind_target`, `operation_status`, `cancel_operation` |
 | Editing | `inspect_element`, `select_text`, `paste` |
 | Extended browser | `browser_instances`, `browser_command` (DOM, dialogs, files, exports, screenshots, history, assets) |
+| Browser REPL | `browser_repl`: persistent JavaScript with a Playwright-compatible `page` ([details](docs/api.md#browser-repl)) |
 | Input | `batch` (also as `act`), `click`, `drag`, `type_text`, `set_value`, `press_key`, `scroll`, `perform_action` |
 | Agent display (optional) | `agent_display`, `move_to_agent_display`, `return_window` |
 | Browser | `browser_status`, `browser_tabs`, `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_screenshot`, `browser_close` |
@@ -128,6 +129,7 @@ python3 e2e/cursor.py         # arrow and menu-bar presence, drawn on the agent 
 python3 e2e/clicks.py         # every pixel click, double-click and drag acts exactly once
 python3 e2e/latency.py        # per-call timings, written to latency.json
 python3 e2e/find.py           # find_elements, act, the compact tool surface
+python3 e2e/repl.py           # browser_repl: persistence, limits, sandbox, Playwright locators
 python3 e2e/focus.py --takeover   # focus safety; takes focus and covers the screen, so run it while you are away
 ```
 

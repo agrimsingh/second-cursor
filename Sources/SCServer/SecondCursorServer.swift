@@ -52,6 +52,8 @@ public final class SecondCursorServer: @unchecked Sendable {
         let router = ToolRouter(desktop: desktop, agentDisplay: agentDisplay, browser: browser, config: config,
                                 connectionCount: { [listener] in listener.activeConnectionCount })
         let tools = ToolCatalog.advertised(surface: config.toolSurface)
+        // browser_repl's description is all its client needs; the desktop instructions would only mislead.
+        let instructions = config.toolSurface == "repl" ? nil : Self.instructions
         let pipeline = StandardValidationPipeline(validators: [
             OriginValidator.localhost(),
             StaticBearerTokenValidator(token: config.token),
@@ -77,7 +79,9 @@ public final class SecondCursorServer: @unchecked Sendable {
                         return .data(try JSONEncoder().encode(result),headers:["Content-Type":"application/json"])
                     } catch { return .error(statusCode:400,.invalidRequest("Malformed request: \(error.localizedDescription)")) }
                 }
-                return await Self.handle(request, pipeline: pipeline, router: router, tools: tools)
+                Self.forwardCancellation(request, token: config.token, router: router)
+                return await Self.handle(
+                    request, pipeline: pipeline, router: router, tools: tools, instructions: instructions)
             }
         } catch let error as IOError where error.errnoCode == EADDRINUSE {
             throw StartError.portInUse(config.port)
@@ -122,11 +126,24 @@ public final class SecondCursorServer: @unchecked Sendable {
         return .data(data, headers: ["Content-Type": "application/json"])
     }
 
+    /// A client's `notifications/cancelled` arrives in its own HTTP request, so the per-request `Server` that would
+    /// act on it never sees the call; it goes to the running browser_repl call with that request id instead.
+    private static func forwardCancellation(_ request: HTTPRequest, token: String, router: ToolRouter) {
+        let context = HTTPValidationContext(httpMethod: request.method)
+        let validators: [any HTTPRequestValidator] = [OriginValidator.localhost(), StaticBearerTokenValidator(token: token)]
+        guard validators.allSatisfy({ $0.validate(request, context: context) == nil }), let body = request.body,
+            let message = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+            message["method"] as? String == "notifications/cancelled",
+            let id = (message["params"] as? [String: Any])?["requestId"]
+        else { return }
+        router.repl.cancel(requestID: "\(id)")
+    }
+
     /// One MCP `Server` per HTTP request: the stateless transport keys in-flight requests by
     /// JSON-RPC id and a long-lived `Server` refuses a second `initialize`, so sharing one
     /// instance breaks reconnecting clients and collides ids across concurrent clients.
     private static func handle(_ request: HTTPRequest, pipeline: StandardValidationPipeline, router: ToolRouter,
-                               tools: [Tool]) async -> HTTPResponse {
+                               tools: [Tool], instructions: String?) async -> HTTPResponse {
         let transport = StatelessHTTPServerTransport(validationPipeline: pipeline)
         let server = Server(
             name: "second-cursor",

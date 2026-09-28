@@ -5,6 +5,8 @@ import SCShared
 struct ToolOutput {
     var json: [String: Any]
     var images: [Screenshot] = []
+    /// Sent as the text item instead of `json`, for output a model reads as text.
+    var text: String? = nil
 }
 
 typealias WindowOwner = (pid: Int32, bundleID: String?)
@@ -17,8 +19,9 @@ final class ToolRouter: Sendable {
     let browser: BrowserControlling
     let appGuard: AppGuard
     let appApprovals: AppApprovals
-    let log = ActionLog()
+    let log: ActionLog
     let sessions: Sessions
+    let repl: BrowserREPL
     let connectionCount: @Sendable () -> Int
     private static let toolNames = Set(ToolCatalog.tools.map(\.name))
 
@@ -32,6 +35,9 @@ final class ToolRouter: Sendable {
         self.browser = browser
         self.appGuard = AppGuard(config: config)
         self.appApprovals = AppApprovals(config: config)
+        let log = ActionLog()
+        self.log = log
+        self.repl = BrowserREPL(browser: browser, log: log)
         self.sessions = Sessions(
             claimIdleSeconds: config.claimIdleSeconds ?? 300,
             retentionSeconds: config.operationRetentionSeconds ?? 3600)
@@ -68,6 +74,7 @@ final class ToolRouter: Sendable {
                     desktop.closeSession(session)
                     desktop.endAgentActivity(session: session)
                     appApprovals.clear(session: session)
+                    repl.close(session: session)
                     let payload = try JSONSerialization.data(withJSONObject: ["session_id": session])
                     _ = try? await browser.command("session.close", params: payload)
                     return Self.success(ToolOutput(json: ["closed": true]))
@@ -84,8 +91,10 @@ final class ToolRouter: Sendable {
             if name == "bind_target" {
                 return try await bindTarget(args, session: session, deadline: receivedAt.addingTimeInterval(60))
             }
-            // wait_for's timeout_ms bounds its wait (at most 10 s), not the call.
-            let timeout = name == "wait_for" ? 60 : Double(min(60_000, max(1, try args.int("timeout_ms", default: 60_000)))) / 1000
+            // wait_for's timeout_ms bounds its wait (at most 10 s), not the call. browser_repl answers before clients'
+            // 60 s tool timeouts, so no script outlives a client that gave up.
+            let limit = name == "browser_repl" ? 55_000 : 60_000
+            let timeout = name == "wait_for" ? 60 : Double(min(limit, max(1, try args.int("timeout_ms", default: limit)))) / 1000
             let deadline = receivedAt.addingTimeInterval(timeout)
             let suppliedID = try args.optionalString("operation_id")
             let id = suppliedID ?? UUID().uuidString
@@ -248,7 +257,7 @@ final class ToolRouter: Sendable {
 
     /// The action log covers state-changing calls only.
     private static func isLogged(_ name: String, _ args: Arguments) -> Bool {
-        name == "browser_command" || ToolCatalog.actionTools.contains(name)
+        name == "browser_command" || name == "browser_repl" || ToolCatalog.actionTools.contains(name)
             || (name == "agent_display" && (try? args.string("action"))?.lowercased() != "status")
     }
 
@@ -404,7 +413,7 @@ final class ToolRouter: Sendable {
     }
 
     private static func success(_ output: ToolOutput) -> CallTool.Result {
-        var content: [Tool.Content] = [.text(text: encode(output.json), annotations: nil, _meta: nil)]
+        var content: [Tool.Content] = [.text(text: output.text ?? encode(output.json), annotations: nil, _meta: nil)]
         for image in output.images {
             content.append(
                 .image(data: image.pngData.base64EncodedString(), mimeType: "image/png", annotations: nil, _meta: nil))

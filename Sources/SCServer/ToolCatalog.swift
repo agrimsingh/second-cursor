@@ -45,8 +45,10 @@ enum ToolCatalog {
         "click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "batch",
     ]
 
-    /// What tools/list shows: the single-action tools and batch, or ("compact") act in their place.
+    /// What tools/list shows: the single-action tools and batch, ("compact") act in their place, or ("repl") only
+    /// browser_repl.
     static func advertised(surface: String?) -> [Tool] {
+        if surface == "repl" { return tools.filter { $0.name == "browser_repl" } }
         let hidden = surface == "compact" ? compactHiddenTools : ["act"]
         return tools.filter { !hidden.contains($0.name) }
     }
@@ -385,7 +387,7 @@ enum ToolCatalog {
             if var schema = tool.inputSchema.objectValue, var props = schema["properties"]?.objectValue {
                 let browserScoped =
                     tool.name.hasPrefix("browser_") && !["browser_instances", "browser_status"].contains(tool.name)
-                let action = actionTools.contains(tool.name) || tool.name == "browser_command"
+                let action = actionTools.contains(tool.name) || ["browser_command", "browser_repl"].contains(tool.name)
                 if browserScoped { props["browser_id"] = string("Instance from browser_instances.") }
                 if windowScopedTools.contains(tool.name) {
                     props["app"] = string(
@@ -422,12 +424,15 @@ enum ToolCatalog {
                 }
                 if action {
                     props["operation_id"] = string("Retry ID; retained for one hour by default.")
-                    if windowScopedTools.contains(tool.name) || browserScoped {
+                    if windowScopedTools.contains(tool.name) || (browserScoped && tool.name != "browser_repl") {
                         props["observation_id"] = string("Reject a superseded observation.")
                     }
                 }
                 if action || ["get_window_state", "browser_snapshot", "inspect_element", "find_elements"].contains(tool.name) {
-                    props["timeout_ms"] = integer("Call deadline, including approval and queue time; max 60000.")
+                    props["timeout_ms"] = integer(
+                        tool.name == "browser_repl"
+                            ? "Call deadline, including queue time; at most and by default 55000."
+                            : "Call deadline, including approval and queue time; max 60000.")
                 }
                 schema["properties"] = .object(props)
                 return Tool(
@@ -507,6 +512,11 @@ enum ToolCatalog {
                             "Operation-specific fields. Call operation=capabilities for argument help and approval requirements.",
                     ]),
                 ], required: ["operation"])),
+        Tool(
+            name: "browser_repl",
+            description:
+                "Run JavaScript in a persistent REPL: top-level await works, and variables and functions persist between calls. Returns what the code printed and the value of its last expression. `page` is a Playwright-compatible page driving a background Chrome tab (`context` is its browser context). page.snapshot() returns the page's accessibility outline, whose [e123] refs work as page.locator('aria-ref=e123'). There is no page.evaluate: operate pages through locators.",
+            inputSchema: schema(["code": string("JavaScript to run.")], required: ["code"])),
         Tool(
             name: "wait_for",
             description:
