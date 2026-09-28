@@ -1,8 +1,8 @@
-import { cdp, ensureDomain, frameCDP } from "./cdp.js";
+import { cdp, ensureDomain, frameCDP, frameSession } from "./cdp.js";
 import { concealDuring, dragTo, pointTo, setCaption, show } from "./cursor.js";
 import { exportContent } from "./exports.js";
 import { BridgeError, sleep } from "./errors.js";
-import { click, pressKey, scroll, type } from "./input.js";
+import { click, pressKey, reachablePoint, scroll, type } from "./input.js";
 import { isSecretField } from "./snapshot.js";
 import {
   requireAgentTab,
@@ -477,10 +477,16 @@ async function contextFor(tabId, p) {
     return {
       send: (method, params) => cdp(tabId, method, params),
       offset: { x: 0, y: 0 },
+      root: { x: 0, y: 0 },
+      owners: [],
     };
+  // owners: the <iframe> of each frame Chrome runs in its own process, in its parent's session; root: where the
+  // frame whose session the target is read in starts, since hit tests take that frame's coordinates.
   let frameId = (await cdp(tabId, "Page.getFrameTree")).frameTree.frame.id,
     offset = { x: 0, y: 0 },
+    root = { x: 0, y: 0 },
     contextId;
+  const owners = [];
   for (const selector of frames) {
     contextId = (
       await frameCDP(tabId, frameId, "Page.createIsolatedWorld", {
@@ -513,6 +519,15 @@ async function contextFor(tabId, p) {
       description.node.contentDocument?.frameId ?? description.node.frameId;
     if (!child || child === frameId)
       throw new BridgeError("failed", "Frame has not loaded");
+    if (frameSession(tabId, child)) {
+      const parent = frameId;
+      owners.push({
+        send: (method, params) => frameCDP(tabId, parent, method, params),
+        id: description.node.backendNodeId,
+        origin: root,
+      });
+      root = { ...offset };
+    }
     frameId = child;
   }
   contextId = (
@@ -525,7 +540,20 @@ async function contextFor(tabId, p) {
     send: (method, params) => frameCDP(tabId, frameId, method, params),
     contextId,
     offset,
+    root,
+    owners,
   };
+}
+/** A locator's click point and hit-test levels, for reachablePoint (input.js). */
+async function locatorTarget(tabId, p) {
+  const point = await dom(tabId, { ...p, operation: "center" });
+  const { objectId, send, context } = await dom(tabId, { ...p, operation: "node" }, true);
+  const { node } = await send("DOM.describeNode", { objectId });
+  await send("Runtime.releaseObject", { objectId }).catch(() => {});
+  const levels = [...context.owners, { send, id: node.backendNodeId, origin: context.root }].map(
+    ({ send, id, origin }) => ({ send, id, x: point.x - origin.x, y: point.y - origin.y }),
+  );
+  return { point, levels };
 }
 async function dom(tabId, p, object = false) {
   const context = await contextFor(tabId, p);
@@ -542,7 +570,7 @@ async function dom(tabId, p, object = false) {
       result.exceptionDetails.exception?.description ??
         result.exceptionDetails.text,
     );
-  if (object) return { ...result.result, send: context.send };
+  if (object) return { ...result.result, send: context.send, context };
   const value = result.result.value;
   if (p.operation === "center") {
     value.x += context.offset.x;
@@ -717,7 +745,7 @@ export async function extended(p) {
   }
   if (op === "click") {
     const point = p.locator
-      ? await dom(tabId, { ...p, operation: "center" })
+      ? await reachablePoint("The locator's element", () => locatorTarget(tabId, p))
       : { x: p.x, y: p.y };
     if (!Number.isFinite(point.x) || !Number.isFinite(point.y))
       throw new BridgeError(

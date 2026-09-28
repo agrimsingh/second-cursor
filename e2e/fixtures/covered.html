@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Covered fixture</title>
+<style>
+  body { font: 15px/1.4 system-ui, sans-serif; margin: 20px; }
+  #target { position: absolute; left: 40px; top: 100px; }
+  #glassed { position: absolute; left: 40px; top: 170px; }
+  #glass { position: absolute; left: 0; top: 150px; width: 420px; height: 70px; background: rgba(245, 78, 0, 0.1); pointer-events: none; }
+  #toast { position: fixed; left: 0; right: 0; top: 80px; height: 70px; background: #26251e; color: #fff; padding: 10px 20px; display: none; }
+  #toast.shown { display: block; }
+  #controls { position: absolute; left: 480px; top: 100px; }
+  #frame { position: absolute; left: 40px; top: 260px; width: 380px; height: 150px; border: 0; }
+  #curtain { position: absolute; left: 20px; top: 250px; width: 420px; height: 170px; background: #f2f1ed; display: none; }
+  #curtain.shown { display: block; }
+</style>
+</head>
+<body>
+<p id="status">clicks=0 glassed=0</p>
+<button id="target">Label: Spam</button>
+<button id="glassed">Under glass</button>
+<div id="glass"></div>
+<div id="toast">Message archived <button id="undo">Undo</button> <button id="dismiss">Dismiss</button></div>
+<div id="controls">
+  <p><button id="show">Show toast</button></p>
+  <p><button id="brief">Show brief toast</button></p>
+  <p><button id="cover">Show curtain</button></p>
+</div>
+<iframe id="frame" title="Widget"></iframe>
+<div id="curtain"><button id="uncover">Hide curtain</button></div>
+<button id="far" style="position: absolute; left: 40px; top: 1800px" onclick="this.textContent = 'Far clicked'">Far below</button>
+<script>
+let clicks = 0, glassed = 0;
+const status = () => (document.getElementById("status").textContent = `clicks=${clicks} glassed=${glassed}`);
+const toast = document.getElementById("toast");
+const curtain = document.getElementById("curtain");
+document.getElementById("target").onclick = () => { clicks++; status(); };
+document.getElementById("glassed").onclick = () => { glassed++; status(); };
+document.getElementById("show").onclick = () => toast.classList.add("shown");
+document.getElementById("brief").onclick = () => {
+  toast.classList.add("shown");
+  setTimeout(() => toast.classList.remove("shown"), 1000);
+};
+document.getElementById("dismiss").onclick = () => toast.classList.remove("shown");
+document.getElementById("cover").onclick = () => curtain.classList.add("shown");
+document.getElementById("uncover").onclick = () => curtain.classList.remove("shown");
+document.getElementById("frame").src = location.origin.replace("127.0.0.1", "localhost") + "/hints-frame.html";
+</script>
+</body>
+</html>

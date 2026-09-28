@@ -1,6 +1,6 @@
 import { cdp, frameCDP, frameSession } from "./cdp.js";
 import { concealDuring, pointTo, show } from "./cursor.js";
-import { BridgeError, withTimeout } from "./errors.js";
+import { BridgeError, sleep, withTimeout } from "./errors.js";
 import { parseChord } from "./keys.js";
 import { isolatedFrame } from "./snapshot.js";
 
@@ -27,15 +27,91 @@ function resolve(tabId, ref) {
   return { id: Number(match[2]), send: sender(frameId), owners };
 }
 
-/** Where the ref's frame's viewport starts in the tab's viewport. */
-async function frameOffset(owners) {
-  let x = 0, y = 0;
+/** Where each frame of the ref's chain starts in the tab's viewport, from the tab's frame down to the ref's own. */
+async function frameOrigins(owners) {
+  const origins = [{ x: 0, y: 0 }];
   for (const owner of owners) {
     const { model } = await owner.send("DOM.getBoxModel", { backendNodeId: owner.id });
-    x += model.content[0];
-    y += model.content[1];
+    const last = origins.at(-1);
+    origins.push({ x: last.x + model.content[0], y: last.y + model.content[1] });
   }
-  return { x, y };
+  return origins;
+}
+
+const frameOffset = async (owners) => (await frameOrigins(owners)).at(-1);
+
+// Called on the node a click must reach, with the node hit at the click point: null when the click reaches it (the
+// hit is it, inside it, or its label), else what is in the way, as `role "text"` or `tag "text"`. Called on the hit
+// node alone, it describes that node.
+const COVERING = `function (hit) {
+  const up = (n) => n.parentNode || n.host;
+  let el = hit ?? this;
+  el = el.nodeType === 1 ? el : el.parentElement;
+  if (!el) return null;
+  if (hit) {
+    for (let n = hit; n; n = up(n)) if (n === this) return null;
+    if (el.closest("#second-cursor-overlay") || el.closest("label")?.control === this) return null;
+    const target = new Set();
+    for (let n = this; n; n = up(n)) target.add(n);
+    while (up(el)?.nodeType === 1 && !target.has(up(el))) el = up(el);
+  }
+  const text = (el.getAttribute("aria-label") || el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+  const what = el.getAttribute("role") || el.localName;
+  return text ? what + ' "' + (text.length > 60 ? text.slice(0, 60) + "…" : text) + '"' : what;
+}`;
+
+/**
+ * What covers a click point, or null. `levels` go from the tab's process down to the target's: in each, the node
+ * the point must hit (an <iframe> of the next level, or the target), in the coordinates of that session's root frame.
+ * Layers with pointer-events: none, the agent's cursor among them, let clicks through and are skipped.
+ */
+async function coveredBy(levels) {
+  for (const { send, id, x, y } of levels) {
+    const objectGroup = "second-cursor-hit";
+    try {
+      // It takes document coordinates, so a scrolled frame's scroll offset is added to the viewport point.
+      const { cssLayoutViewport: view } = await send("Page.getLayoutMetrics");
+      const hit = await send("DOM.getNodeForLocation", { x: Math.round(x + view.pageX), y: Math.round(y + view.pageY) });
+      if (hit.backendNodeId === id) continue;
+      const [target, node] = await Promise.all(
+        [id, hit.backendNodeId].map((backendNodeId) => send("DOM.resolveNode", { backendNodeId, objectGroup })),
+      );
+      const call = (objectId, args) =>
+        send("Runtime.callFunctionOn", { objectId, functionDeclaration: COVERING, arguments: args, returnByValue: true });
+      // A hit in another frame than the target's lives in another JavaScript world, which only covering explains.
+      const { result } = await call(target.object.objectId, [{ objectId: node.object.objectId }]).catch(() =>
+        call(node.object.objectId, []),
+      );
+      if (result.value) return result.value;
+    } catch {
+      // Nothing at the point, or a node gone mid-check: the click goes ahead as it always did.
+    } finally {
+      send("Runtime.releaseObjectGroup", { objectGroup }).catch(() => {});
+    }
+  }
+  return null;
+}
+
+const HIT_WAIT_MS = 2000;
+
+/**
+ * The point to click on a target, once nothing covers it there. `locate` scrolls the target into view and returns
+ * { point, levels } (see coveredBy); it runs again on every try, since the target may move while a toast or an
+ * animation clears. After HIT_WAIT_MS the click is refused, without dispatching, naming what covers the target.
+ */
+export async function reachablePoint(what, locate) {
+  const began = Date.now();
+  for (;;) {
+    const { point, levels } = await locate();
+    const cover = await coveredBy(levels);
+    if (!cover) return point;
+    if (Date.now() - began >= HIT_WAIT_MS)
+      throw new BridgeError(
+        "failed",
+        `${what} is covered by ${cover}, so the click was not sent; wait for it to go away or close it, then click again`,
+      );
+    await sleep(100);
+  }
 }
 
 function refError(ref, error) {
@@ -49,23 +125,29 @@ function refError(ref, error) {
 const center = (quad) => ({ x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4, y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4 });
 const shift = (point, offset) => ({ x: point.x + offset.x, y: point.y + offset.y });
 
-async function refCenter(tabId, ref) {
+async function refTarget(tabId, ref) {
   const { id, send, owners } = resolve(tabId, ref);
+  let local;
   try {
     for (const owner of owners) await owner.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: owner.id });
     await send("DOM.scrollIntoViewIfNeeded", { backendNodeId: id });
-    const { model } = await send("DOM.getBoxModel", { backendNodeId: id });
-    return shift(center(model.content), await frameOffset(owners));
+    local = center((await send("DOM.getBoxModel", { backendNodeId: id })).model.content);
   } catch (error) {
     const quads = await send("DOM.getContentQuads", { backendNodeId: id }).then((r) => r.quads, () => []);
-    if (quads.length) return shift(center(quads[0]), await frameOffset(owners));
-    throw refError(ref, error);
+    if (!quads.length) throw refError(ref, error);
+    local = center(quads[0]);
   }
+  const origins = await frameOrigins(owners);
+  const point = shift(local, origins.at(-1));
+  const levels = [...owners, { id, send }].map((level, i) => ({
+    ...level, x: point.x - origins[i].x, y: point.y - origins[i].y,
+  }));
+  return { point, levels };
 }
 
 export async function click(tabId, { ref, x, y }) {
   let point;
-  if (ref != null && ref !== "") point = await refCenter(tabId, ref);
+  if (ref != null && ref !== "") point = await reachablePoint(`Ref ${ref}`, () => refTarget(tabId, ref));
   else if (Number.isFinite(x) && Number.isFinite(y)) point = { x, y };
   else throw new BridgeError("invalid_argument", "click needs a ref or both x and y");
 

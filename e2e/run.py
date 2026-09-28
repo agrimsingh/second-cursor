@@ -1764,6 +1764,95 @@ def browser_snapshot_hints(ctx):
                   error and "no longer on the page" in error, error)
 
 
+@scenario
+def browser_covered_clicks(ctx):
+    """A click on a ref or locator that something covers, checked against e2e/fixtures/covered.html.
+
+    Ways this can fail:
+    - The click lands on what covers the target (an Undo toast over a button), and reports ok.
+    - It fails without saying what covers the target, or fails at once for a toast that clears within a second.
+    - The agent's own cursor, resting on the target after the last click, or a layer with pointer-events: none
+      counts as covering, so ordinary clicks fail; or a scrolled page is hit-tested at the wrong place.
+    - Something in the page over a cross-origin frame goes unnoticed, since the frame's process cannot see it.
+    - A locator click, or a click inside a batch, skips the check.
+    - The check makes every click slow (latency per click is saved to <run>/covered-clicks.json).
+    """
+    if not ctx.call("browser_status").get("connected"):
+        raise Skip("Chrome extension not connected")
+    with FixtureServer() as base:
+        opened = ctx.call("browser_open", url=f"{base}/covered.html")
+        tid = opened["tab"]["id"]
+        ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
+        outline = opened["observation"]["outline"]
+
+        def ref(pattern):
+            match = re.search(r"\[(\w+)\] " + pattern, outline)
+            ctx.require(f"a ref for {pattern}", match, outline)
+            return match.group(1)
+
+        def status():
+            return re.search(r"clicks=\d+ glassed=\d+", ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]).group(0)
+
+        def timed(tool, **args):
+            started = time.time()
+            try:
+                ctx.call(tool, tab_id=tid, **args)
+                return time.time() - started, None
+            except ToolError as e:
+                return time.time() - started, str(e)
+
+        target, spam = ref(r'button "Label: Spam"'), {"role": "button", "name": "Label: Spam"}
+        took, error = timed("browser_click", ref=target)
+        ctx.check("an uncovered click goes through", not error and status() == "clicks=1 glassed=0", error)
+        latency = {"ref": [], "locator": []}
+        for _ in range(9):
+            latency["ref"].append(timed("browser_click", ref=target, observe="none")[0])
+            latency["locator"].append(timed("browser_command", operation="click", locator=spam)[0])
+        ctx.check("the agent's cursor, resting on the target after each click, never counts as covering it",
+                  status() == "clicks=19 glassed=0", status())
+        took, error = timed("browser_click", ref=ref(r'button "Under glass"'))
+        ctx.check("a layer with pointer-events: none over a button does not count as covering it",
+                  not error and status() == "clicks=19 glassed=1", error)
+        ctx.call("browser_click", tab_id=tid, ref=ref(r'button "Show toast"'))
+        outline = ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]
+        for label, tool, args in (("ref", "browser_click", {"ref": target}),
+                                  ("locator", "browser_command", {"operation": "click", "locator": spam})):
+            took, error = timed(tool, **args)
+            ctx.check(f"a covered {label} click fails after waiting about 2 s, naming what covers it",
+                      error and 'covered by div "Message archived Undo Dismiss"' in error and 1.8 < took < 4,
+                      (round(took, 2), error))
+        error = refused(ctx, "browser_command", tab_id=tid, operation="batch",
+                        steps=[{"operation": "click", "locator": spam}])
+        ctx.check("so does a click in a batch", error and "covered by" in error, error)
+        ctx.check("none of them reached the button", status() == "clicks=19 glassed=1", status())
+
+        ctx.call("browser_click", tab_id=tid, ref=ref(r'button "Dismiss"'))
+        ctx.call("browser_click", tab_id=tid, ref=ref(r'button "Show brief toast"'))
+        took, error = timed("browser_click", ref=target)
+        ctx.check("a click waits for a toast that clears within a second, then goes through",
+                  not error and status() == "clicks=20 glassed=1", (round(took, 2), error))
+
+        chip = re.search(r"\[(f\d+e\d+)\] clickable \"Frame chip\"", outline)
+        ctx.require("the cross-origin frame's chip has a frame ref", chip, outline)
+        ctx.call("browser_click", tab_id=tid, ref=ref(r'button "Show curtain"'))
+        took, error = timed("browser_click", ref=chip.group(1))
+        ctx.check("a frame ref click fails when the page covers the frame, naming the cover",
+                  error and "covered by div" in error and "Hide curtain" in error, error)
+        outline = ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]
+        ctx.call("browser_click", tab_id=tid, ref=ref(r'button "Hide curtain"'))
+        took, error = timed("browser_click", ref=chip.group(1))
+        after = ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]
+        ctx.check("and goes through once the cover is gone", not error and "Chip clicked" in after, error or after)
+        took, error = timed("browser_click", ref=ref(r'button "Far below"'))
+        ctx.check("a button the click scrolls into view is hit-tested where it now is, and goes through",
+                  not error and "Far clicked" in ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"], error)
+
+        medians = {k: round(sorted(v)[len(v) // 2] * 1000) for k, v in latency.items()}
+        (ctx.run.dir / "covered-clicks.json").write_text(json.dumps({"median_ms": medians, "samples_s": latency}, indent=2))
+        ctx.check(f"uncovered clicks: median browser_click {medians['ref']} ms (observe none; includes its 300 ms wait "
+                  f"for a navigation to start), browser_command click {medians['locator']} ms", True, latency)
+
+
 OVERLAY_ID = "second-cursor-overlay"
 
 
