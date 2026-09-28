@@ -25,7 +25,7 @@ If tools fail with "not running" or permission errors, run `SecondCursor doctor`
 
 To find one element in a big window (a button, field or row), call `find_elements` with `text` and/or `role` instead of reading the whole outline again: it searches your latest observation, including elements a truncated outline left out, and returns their `[index]` lines.
 
-Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`.
+Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`, and on tabs those open (a result's `events` names them).
 
 When a task is about a list in a browser tab (search results, a feed, a table), take what you need from the list itself. Result cards usually show the name, price, rating and delivery time. Open an item's own page only when the list lacks a fact the task asks for: each page load costs seconds, and opening every result can double the task's time.
 
