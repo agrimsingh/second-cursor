@@ -70,6 +70,14 @@ chrome.tabs.onRemoved.addListener((tabId) => inputAt.delete(tabId));
 /** The agent is about to send input to the tab. */
 export function noteInput(tabId) {
   inputAt.set(tabId, Date.now());
+  quickReactions.delete(tabId);
+}
+
+const quickReactions = new Map();
+
+/** The input being dispatched on this tab cannot start a request worth waiting for, so reads after it wait `ms`. */
+export function expectQuickReaction(tabId, ms) {
+  quickReactions.set(tabId, ms);
 }
 
 /**
@@ -321,7 +329,8 @@ chrome.tabs.onRemoved.addListener((tabId) => lastAction.delete(tabId));
  * happened.
  */
 export function noteAction(tabId, at = Date.now(), load = false) {
-  lastAction.set(tabId, { at, load });
+  lastAction.set(tabId, { at, load, reactMs: quickReactions.get(tabId) });
+  quickReactions.delete(tabId);
 }
 
 /**
@@ -333,12 +342,13 @@ export function noteAction(tabId, at = Date.now(), load = false) {
  */
 export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200 } = {}) {
   const began = Date.now();
-  const { at: actedAt = 0, load = false } = lastAction.get(tabId) ?? {};
+  const { at: actedAt = 0, load = false, reactMs: quick } = lastAction.get(tabId) ?? {};
+  const reactWithin = Math.min(reactMs, quick ?? reactMs);
   while (Date.now() - began < timeoutMs) {
     const state = await settleProbe(tabId);
     if (!state) return;
     const sinceAction = Date.now() - actedAt;
-    let awaitingReaction = sinceAction < reactMs && (!state.mutated || state.quiet >= sinceAction);
+    let awaitingReaction = sinceAction < reactWithin && (!state.mutated || state.quiet >= sinceAction);
     // The idle signal covers the page's first load only, so actions keep the fixed window.
     if (awaitingReaction && load && (await networkIdle(tabId).catch(() => false))) awaitingReaction = false;
     if (state.ready === "complete" && state.quiet >= quietMs && !awaitingReaction) return;

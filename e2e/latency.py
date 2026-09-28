@@ -134,6 +134,9 @@ def browser_latency(ctx):
     toggle = medians["click an aria-expanded toggle"]
     ctx.check("a toggle that only changes aria-expanded and hidden counts as the page reacting (median under 1000 ms, "
               "not the 1.2 s wait for a reaction)", toggle < 1000, toggle)
+    plain = medians["type into a plain field"]
+    ctx.check("typing into a field that shows no suggestions does not wait for them (median under 800 ms)", plain < 800,
+              plain)
 
 
 if __name__ == "__main__":

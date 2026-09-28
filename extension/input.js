@@ -3,6 +3,10 @@ import { concealDuring, pointTo, show } from "./cursor.js";
 import { BridgeError, sleep, withTimeout } from "./errors.js";
 import { parseChord } from "./keys.js";
 import { isolatedFrame } from "./snapshot.js";
+import { expectQuickReaction } from "./tabs.js";
+
+// Long enough for a field that checks what was typed after a short debounce.
+const PLAIN_FIELD_REACT_MS = 300;
 
 const gone = (ref) => new BridgeError("invalid_argument", `Ref ${ref} is no longer on the page; take a new browser_snapshot`);
 
@@ -165,12 +169,27 @@ function fieldPoint(quad) {
   return { x: left + Math.min(24, width / 2), y: (Math.min(...ys) + Math.max(...ys)) / 2 };
 }
 
+/**
+ * Whether typing into the field may bring up suggestions, which arrive after a debounce and a request. Fields that show
+ * their own say so (a combobox or search role, aria-autocomplete, a datalist, or autocomplete="off" to keep the
+ * browser's list out of the way); a name or email field does not, and neither does anything that is not a plain field.
+ */
+async function suggests(send, id) {
+  const { node } = await send("DOM.describeNode", { backendNodeId: id });
+  if (!["input", "textarea"].includes(node.localName)) return true;
+  const attributes = {};
+  for (let i = 0; i + 1 < (node.attributes?.length ?? 0); i += 2) attributes[node.attributes[i]] = node.attributes[i + 1];
+  return ["combobox", "searchbox"].includes(attributes.role) || attributes.type === "search"
+    || attributes.autocomplete === "off" || ["aria-autocomplete", "aria-controls", "aria-owns", "list"].some((a) => a in attributes);
+}
+
 export async function type(tabId, { ref, text, submit }) {
   if (ref != null && ref !== "") {
     const { id, send, owners } = resolve(tabId, ref);
     await send("DOM.focus", { backendNodeId: id }).catch((error) => {
       throw refError(ref, error);
     });
+    if (text && !submit && !(await suggests(send, id).catch(() => true))) expectQuickReaction(tabId, PLAIN_FIELD_REACT_MS);
     pointTo(tabId, async () => {
       const { model } = await send("DOM.getBoxModel", { backendNodeId: id });
       return shift(fieldPoint(model.border), await frameOffset(owners));

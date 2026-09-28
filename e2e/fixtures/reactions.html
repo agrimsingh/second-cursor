@@ -26,7 +26,7 @@ $("search").addEventListener("input", () => {
   clearTimeout(timer);
   timer = setTimeout(async () => {
     const query = $("search").value;
-    await fetch("reactions.html?delay_ms=150");
+    await fetch("reactions.html?delay_ms=150", { cache: "no-store" });
     $("results").replaceChildren(...[1, 2, 3].map((i) =>
       Object.assign(document.createElement("li"), { textContent: `${query} result ${i}` })));
   }, 300);
@@ -39,7 +39,7 @@ $("details").addEventListener("click", () => {
 $("add").addEventListener("click", () =>
   $("rows").append(Object.assign(document.createElement("li"), { textContent: `Row ${++rows}` })));
 $("load").addEventListener("click", async () => {
-  await fetch("reactions.html?delay_ms=400");
+  await fetch("reactions.html?delay_ms=400", { cache: "no-store" });
   $("loaded").textContent = `Loaded ${++loads}`;
 });
 </script>
