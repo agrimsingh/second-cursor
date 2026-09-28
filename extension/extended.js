@@ -349,7 +349,7 @@ function domOperation(p, isSecretField) {
       }),
     );
     e.dispatchEvent(new Event("change", { bubbles: true }));
-    return { value: "value" in e ? e.value : e.textContent };
+    return { value: "value" in e ? valueOf(e) : e.textContent };
   }
   if (p.operation === "select_option") {
     const values = Array.isArray(p.value) ? p.value : [p.value];
@@ -368,6 +368,9 @@ function domOperation(p, isSecretField) {
     return { checked: e.checked };
   }
   if (p.operation === "select_text") {
+    // How often a text matches would reveal a redacted value a guess at a time.
+    if (secret(e))
+      throw Error("select_text is not available on password and payment card fields");
     const text = "value" in e ? e.value : e.textContent,
       needle = p.text;
     if (!needle) throw Error("Nonempty text required");

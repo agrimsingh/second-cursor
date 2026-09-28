@@ -1,5 +1,6 @@
 import { cdp } from "./cdp.js";
 import { BridgeError, sleep } from "./errors.js";
+import { isSecretField } from "./snapshot.js";
 
 async function evaluate(tabId, expression) {
   const r = await cdp(tabId, "Runtime.evaluate", {
@@ -57,6 +58,29 @@ function markdown() {
   return walk(document.body)
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+/**
+ * The page's HTML without the agent's cursor, and with the value a password or payment card field serializes (its
+ * value attribute, a textarea's text) redacted. Each such element's own markup is swapped in the text, since cloning
+ * the document would run the page's custom element constructors.
+ */
+function html(isSecretField) {
+  let out = document.documentElement.outerHTML;
+  const cursor = document.getElementById("second-cursor-overlay");
+  if (cursor) out = out.replace(cursor.outerHTML, "");
+  for (const e of document.querySelectorAll("input[value],textarea")) {
+    const name =
+      e.getAttribute("aria-label") ||
+      [...(e.labels ?? [])].map((l) => l.textContent).join(" ").trim() ||
+      e.getAttribute("placeholder");
+    const value = e.value || e.defaultValue;
+    if (!value || !isSecretField({ type: e.type, autocomplete: e.getAttribute("autocomplete"), name, value })) continue;
+    const copy = e.cloneNode(false);
+    if (copy.hasAttribute("value")) copy.setAttribute("value", "[redacted]");
+    if (e.localName === "textarea") copy.textContent = e.textContent && "[redacted]";
+    out = out.replace(e.outerHTML, copy.outerHTML);
+  }
+  return out;
 }
 export async function exportContent(tabId, p) {
   const tab = await chrome.tabs.get(tabId),
@@ -140,7 +164,7 @@ export async function exportContent(tabId, p) {
     throw new BridgeError("invalid_argument", "Unknown export format");
   const expression =
     format === "html"
-      ? `(()=>{const h=document.getElementById("second-cursor-overlay"),html=document.documentElement.outerHTML;return h?html.replace(h.outerHTML,""):html})()`
+      ? `(${html.toString()})(${isSecretField.toString()})`
       : format === "md"
         ? `(${markdown.toString()})()`
         : "document.body.innerText";

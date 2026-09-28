@@ -1646,14 +1646,16 @@ def browser_snapshot_hints(ctx):
       tab's own process, where the same backend ids name other nodes; a click lands at the frame-local point instead
       of the frame's place in the tab; typed text or Enter never reaches the frame's field.
     - A password, card number, expiry or security code shows its value on the field's line (a field's visible text
-      repeats its value), in the structured elements, in browser_command dom_snapshot or inspect, or as a count of
-      bullets; an ordinary field loses its value.
+      repeats its value), in the structured elements, in browser_command dom_snapshot, inspect, fill's result or an
+      HTML or text export, or as a count of bullets; select_text's match count probes it; an ordinary field loses its
+      value.
     - Content in open or closed shadow roots is missing (Chrome's tree covers both; this guards it).
     - A 1x1 tracker iframe or a hidden one has its document read into the outline.
     """
     if not ctx.call("browser_status").get("connected"):
         raise Skip("Chrome extension not connected")
-    secrets = ["hunter2", "4242", "737", "12/34", "5555555555554444", "•", "typed-Secret-77"]
+    secrets = ["hunter2", "4242", "737", "12/34", "5555555555554444", "•", "typed-Secret-77", "attr-Secret-9",
+               "fill-Secret-5"]
     with FixtureServer() as base:
         tid = ctx.call("browser_open", url=f"{base}/hints.html")["tab"]["id"]
         ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
@@ -1701,7 +1703,7 @@ def browser_snapshot_hints(ctx):
         ctx.check("the same-origin frame's content is there too, with plain refs",
                   re.search(r'^\s*\[e\d+\] button "Apply coupon"', part(outline, "local"), re.M)
                   and not re.search(r"\[f\d+", part(outline, "local")), outline)
-        for field in ("Password", "Card number", "Expiry", "Security code", "Card no."):
+        for field in ("Password", "Card number", "Expiry", "Security code", "Card no.", "Backup code"):
             ctx.check(f"{field}: its value is redacted", f'textbox "{field}" value="[redacted]"' in outline, outline)
         ctx.check("an ordinary field keeps its value, printed once",
                   'textbox "Email" value="ada@example.com"' in outline, outline)
@@ -1722,16 +1724,29 @@ def browser_snapshot_hints(ctx):
                     ctx.call("browser_snapshot", tab_id=tid, full=True, structured=True)["elements"], ensure_ascii=False),
                 "dom_snapshot": json.dumps(values(command("dom_snapshot")["elements"]), ensure_ascii=False),
                 "inspect": json.dumps([[r["text"], r["attributes"].get("value")] for r in (
-                    command("inspect", locator={"selector": s}) for s in ("#password", "#cc", "#exp", "#cvc", "#cc2"))]),
+                    command("inspect", locator={"selector": s})
+                    for s in ("#password", "#cc", "#exp", "#cvc", "#cc2", "#pin"))]),
+                "fill": json.dumps(command("fill", locator={"selector": "#cvc"}, text="fill-Secret-5")),
+                "text export": command("export", format="text")["content"],
+                # The fixture's own script sets most of the secrets, so its source is left out of the search.
+                "html export": re.sub(r"<script>.*?</script>", "", command("export", format="html")["content"], flags=re.S),
             }
             return {name: [s for s in secrets if s in text] for name, text in reads.items() if any(s in text for s in secrets)}
 
         leaked = leaks()
         ctx.check("no secret value, nor a password's length in bullets, is in the outline, the structured elements, "
-                  "dom_snapshot or inspect", not leaked, leaked)
-        ctx.check("an ordinary field keeps its value in dom_snapshot and inspect",
+                  "dom_snapshot, inspect, fill's result or an export", not leaked, leaked)
+        ctx.check("the HTML export redacts a secret field's value attribute",
+                  re.search(r'<input id="pin" type="password" value="\[redacted\]">',
+                            command("export", format="html")["content"]), leaked)
+        ctx.check("an ordinary field keeps its value in dom_snapshot, inspect and fill's result",
                   "ada@example.com" in values(command("dom_snapshot")["elements"])
-                  and command("inspect", locator={"selector": "#email"})["text"] == "ada@example.com")
+                  and command("inspect", locator={"selector": "#email"})["text"] == "ada@example.com"
+                  and command("fill", locator={"selector": "#email"}, text="ada@example.com")["value"] == "ada@example.com")
+        error = refused(ctx, "browser_command", tab_id=tid, operation="select_text", locator={"selector": "#password"},
+                        text="h")
+        ctx.check("select_text refuses a secret field, whose match count would reveal its value a guess at a time",
+                  error and "not available on password" in error, error)
 
         clicks(r'clickable "Open project Alpha"', outline, "Opened project Alpha")
         clicks(r'clickable "Mountain cabin · \$120 / night"', outline, "Picked Mountain cabin")

@@ -90,7 +90,7 @@ Locators use one or more of `selector`, `role`/`name`, `label`, `text`, `placeho
 | capabilities | Operations, argument help, CDP allowlist, approval requirements |
 | user_tabs, claim, release | Discover personal tabs and claim one (both ask); release without closing |
 | retain | mode: ephemeral, deliverable, handoff; retained tabs survive session cleanup |
-| dom_snapshot, inspect | Structured DOM state; inspect supports offset/length and returns attributes and bounds. Password and payment card values read `[redacted]`, as in browser_snapshot |
+| dom_snapshot, inspect | Structured DOM state; inspect supports offset/length and returns attributes and bounds |
 | click | locator or x/y; button, count, modifiers |
 | fill, type, paste | text; paste format text/md/html; HTML requires a locator |
 | select_text | text, prefix/suffix, selection_type |
@@ -111,6 +111,8 @@ Locators use one or more of `selector`, `role`/`name`, `label`, `text`, `placeho
 | batch | Array of extended operation arguments, each flat or nested under `arguments` like the call itself; returns results and a final DOM observation |
 
 A dialog-triggering action returns the observed dialog instead of waiting for the click to complete. File choosers are intercepted, so files can be assigned without moving the system cursor.
+
+Password and payment card fields (by type, autocomplete, or a label such as "Card number") read `value="[redacted]"` in `browser_snapshot` and action observations, and `[redacted]` in `dom_snapshot`, `inspect`, `fill`'s result and HTML export. `select_text` refuses them, since how often a text matches would reveal the value a guess at a time. Screenshots show what the page shows. The approval-gated `cdp` operation returns what Chrome reports and is outside this redaction.
 
 A tab or popup window that an agent tab opens (a `target=_blank` link, `window.open`) becomes an agent tab of the same session. If Chrome made it the active tab of the user's window, the tab the user was viewing is brought back. Chrome still shows the new tab for a few frames first, and nothing can stop a popup window from taking focus. Things the model did not ask about are queued per session and reported on the next result of `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_close` or `browser_command`, as `events: ["[system] popup opened: tab 12 https://… (from tab 11)", …]`. The events are a popup opened, an agent tab closed by the page or the user, a download started, finished or canceled, and a dialog opened or closed. In a `batch`, each step's result carries its own events. Google Workspace exports need a signed-in document; YouTube transcripts need captions. These service-specific paths are not covered by the local fixture suites.
 
