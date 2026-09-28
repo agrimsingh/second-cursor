@@ -3,6 +3,7 @@ import { concealDuring, dragTo, pointTo, setCaption, show } from "./cursor.js";
 import { exportContent } from "./exports.js";
 import { BridgeError, sleep } from "./errors.js";
 import { click, pressKey, scroll, type } from "./input.js";
+import { isSecretField } from "./snapshot.js";
 import {
   requireAgentTab,
   userTabs,
@@ -80,7 +81,7 @@ export function recordEvent(source, method, p) {
 }
 
 // This function executes in an isolated page world and only operates on DOM elements.
-function domOperation(p) {
+function domOperation(p, isSecretField) {
   let doc = document;
   for (const selector of Array.isArray(p.locator?.frame)
     ? p.locator.frame
@@ -140,6 +141,17 @@ function domOperation(p) {
     "";
   const visible = (e) =>
     !!e.getClientRects().length && getComputedStyle(e).visibility !== "hidden";
+  // Password and payment card values stay out of reads, as in browser_snapshot.
+  const secret = (e) =>
+    e.matches("input,textarea") &&
+    isSecretField({
+      type: e.type,
+      autocomplete: e.getAttribute("autocomplete"),
+      name: name(e) || e.getAttribute("placeholder"),
+      value: e.value,
+    });
+  const valueOf = (e) =>
+    e.value && secret(e) ? "[redacted]" : String(e.value);
   const matches = (a, b) =>
     p.locator?.exact === false ? a.includes(b) : a.trim() === b;
   function locate() {
@@ -202,13 +214,14 @@ function domOperation(p) {
           )
         )
           return [];
-        const b = e.getBoundingClientRect();
+        const b = e.getBoundingClientRect(),
+          value = "value" in e ? valueOf(e) : null;
         return [
           {
             role: r || e.tagName.toLowerCase(),
             name: n.slice(0, 300),
-            value: "value" in e ? String(e.value).slice(0, 300) : null,
-            value_length: "value" in e ? String(e.value).length : null,
+            value: value?.slice(0, 300) ?? null,
+            value_length: value?.length ?? null,
             enabled: !e.disabled,
             focused: d.activeElement === e,
             checked: "checked" in e ? e.checked : null,
@@ -261,7 +274,7 @@ function domOperation(p) {
   if (p.operation === "node") return e;
   if (p.operation === "inspect") {
     const text =
-        "value" in e ? String(e.value) : e.innerText || e.textContent || "",
+        "value" in e ? valueOf(e) : e.innerText || e.textContent || "",
       offset = p.offset ?? 0,
       length = p.length ?? 4000;
     if (offset < 0 || length < 0 || length > 100000)
@@ -278,7 +291,10 @@ function domOperation(p) {
       visible: visible(e),
       checked: "checked" in e ? e.checked : null,
       attributes: Object.fromEntries(
-        [...e.attributes].map((x) => [x.name, x.value]),
+        [...e.attributes].map((x) => [
+          x.name,
+          x.name === "value" && x.value && secret(e) ? "[redacted]" : x.value,
+        ]),
       ),
     };
   }
@@ -513,7 +529,7 @@ async function dom(tabId, p, object = false) {
   const context = await contextFor(tabId, p);
   const arg = { ...p, locator: { ...p.locator, frame: undefined } };
   const result = await context.send("Runtime.evaluate", {
-    expression: `(${domOperation.toString()})(${JSON.stringify(arg)})`,
+    expression: `(${domOperation.toString()})(${JSON.stringify(arg)}, ${isSecretField.toString()})`,
     returnByValue: !object,
     awaitPromise: true,
     ...(context.contextId ? { contextId: context.contextId } : {}),

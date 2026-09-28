@@ -1623,6 +1623,136 @@ def browser_compact_outline(ctx):
         ctx.check("the whole page fits in a few lines", len(outline.splitlines()) <= 14, outline)
 
 
+@scenario
+def browser_snapshot_hints(ctx):
+    """What the accessibility tree leaves out of the outline, added from the DOM and from frames in other processes.
+
+    Ways this can fail, each checked against e2e/fixtures/hints.html and hints-frame.html:
+    - An element made clickable only by a listener (a card), an onclick attribute, or a framework's root listener plus
+      a pointer cursor (a row) gets no ref, or every child that inherits its pointer cursor gets one too.
+    - A scroll panel gets no ref, or a container whose content fits is marked scrollable.
+    - A cross-origin iframe, which Chrome runs in another process, reads as an empty iframe line; its refs act on the
+      tab's own process, where the same backend ids name other nodes; a click lands at the frame-local point instead
+      of the frame's place in the tab; typed text or Enter never reaches the frame's field.
+    - A password, card number, expiry or security code shows its value on the field's line (a field's visible text
+      repeats its value), in the structured elements, in browser_command dom_snapshot or inspect, or as a count of
+      bullets; an ordinary field loses its value.
+    - Content in open or closed shadow roots is missing (Chrome's tree covers both; this guards it).
+    - A 1x1 tracker iframe or a hidden one has its document read into the outline.
+    """
+    if not ctx.call("browser_status").get("connected"):
+        raise Skip("Chrome extension not connected")
+    secrets = ["hunter2", "4242", "737", "12/34", "5555555555554444", "•", "typed-Secret-77"]
+    with FixtureServer() as base:
+        tid = ctx.call("browser_open", url=f"{base}/hints.html")["tab"]["id"]
+        ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
+
+        browser = ctx.run.instance and ctx.run.instance.browser
+        if browser:
+            port = int((browser.profile / "DevToolsActivePort").read_text().split()[0])
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
+                targets = json.load(response)
+            ctx.require("Chrome runs the localhost frame in its own process (an iframe target)",
+                        any(t.get("type") == "iframe" and "localhost" in t.get("url", "") for t in targets),
+                        [(t.get("type"), t.get("url")) for t in targets])
+
+        def read():
+            return ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]
+
+        # The page, then the same-origin copy of the frame (in the tab's process), then the localhost copy.
+        def part(outline, which):
+            page, rest = outline.split('iframe "Local coupon widget"', 1)
+            return dict(zip(("page", "local", "isolated"), [page, *rest.split('iframe "Coupon widget"', 1)]))[which]
+
+        def ref(pattern, outline, which="page"):
+            match = re.search(r"^\s*\[(\w+)\] " + pattern, part(outline, which), re.M)
+            ctx.require(f"a ref for {pattern} ({which})", match, outline)
+            return match.group(1)
+
+        def clicks(pattern, outline, status, which="page"):
+            ctx.call("browser_click", tab_id=tid, ref=ref(pattern, outline, which))
+            after = poll(read, lambda o: status in part(o, which))
+            ctx.check(f"clicking {pattern} ({which}) by its ref reached the page: {status}", status in part(after, which),
+                      part(after, which)[:600])
+
+        outline = ctx.call("browser_snapshot", tab_id=tid, full=True, include_screenshot=True)["outline"]
+        (ctx.run.dir / "hints-outline.txt").write_text(outline + "\n")
+        ctx.check("children that inherit a card's pointer cursor get no line of their own",
+                  "Mountain cabin" not in re.sub(r".*clickable.*", "", outline) and 'clickable "Plain link"' not in outline,
+                  outline)
+        ctx.check("only the overflowing panel is scrollable", outline.count("scrollable") == 1, outline)
+        ctx.check("the panel lists its content below its line",
+                  re.search(r'^( *)\[e\d+\] scrollable "Activity log"\n\1  text "Log line 1 ', outline, re.M), outline)
+        ref(r'button "Closed shadow action"', outline)
+        ctx.check("the localhost frame's content sits under its iframe line, with frame refs",
+                  re.search(r'^( *)iframe "Coupon widget"\n(\1  .*\n)*\1  +\[f\d+e\d+\] button "Apply coupon"', outline, re.M),
+                  outline)
+        ctx.check("the same-origin frame's content is there too, with plain refs",
+                  re.search(r'^\s*\[e\d+\] button "Apply coupon"', part(outline, "local"), re.M)
+                  and not re.search(r"\[f\d+", part(outline, "local")), outline)
+        for field in ("Password", "Card number", "Expiry", "Security code", "Card no."):
+            ctx.check(f"{field}: its value is redacted", f'textbox "{field}" value="[redacted]"' in outline, outline)
+        ctx.check("an ordinary field keeps its value, printed once",
+                  'textbox "Email" value="ada@example.com"' in outline, outline)
+        ctx.check("a 1x1 iframe and a hidden one are not read", outline.count('button "Apply coupon"') == 2, outline)
+
+        def command(operation, **args):
+            return ctx.call("browser_command", tab_id=tid, operation=operation, **args)
+
+        def values(elements):
+            return [v for e in elements for v in [e.get("value"), *values(e.get("children", []))] if v]
+
+        def leaks():
+            """Secrets reachable through each read. dom_snapshot and inspect carry coordinates, so only their values
+            are searched."""
+            reads = {
+                "outline": read(),
+                "structured elements": json.dumps(
+                    ctx.call("browser_snapshot", tab_id=tid, full=True, structured=True)["elements"], ensure_ascii=False),
+                "dom_snapshot": json.dumps(values(command("dom_snapshot")["elements"]), ensure_ascii=False),
+                "inspect": json.dumps([[r["text"], r["attributes"].get("value")] for r in (
+                    command("inspect", locator={"selector": s}) for s in ("#password", "#cc", "#exp", "#cvc", "#cc2"))]),
+            }
+            return {name: [s for s in secrets if s in text] for name, text in reads.items() if any(s in text for s in secrets)}
+
+        leaked = leaks()
+        ctx.check("no secret value, nor a password's length in bullets, is in the outline, the structured elements, "
+                  "dom_snapshot or inspect", not leaked, leaked)
+        ctx.check("an ordinary field keeps its value in dom_snapshot and inspect",
+                  "ada@example.com" in values(command("dom_snapshot")["elements"])
+                  and command("inspect", locator={"selector": "#email"})["text"] == "ada@example.com")
+
+        clicks(r'clickable "Open project Alpha"', outline, "Opened project Alpha")
+        clicks(r'clickable "Mountain cabin · \$120 / night"', outline, "Picked Mountain cabin")
+        clicks(r'clickable "Delegated row two"', outline, "Row two chosen")
+        clicks(r'clickable "Shadow card"', outline, "Shadow card clicked")
+        clicks(r'button "Shadow action"', outline, "Shadow button clicked")
+        # browser_scroll takes no ref; a click into the panel makes it the target of keyboard scrolling.
+        ctx.call("browser_click", tab_id=tid, ref=ref(r'scrollable "Activity log"', outline))
+        ctx.call("browser_press_key", tab_id=tid, keys="end")
+        after = poll(read, lambda o: "Panel scrolled" in o)
+        ctx.check("a click on the panel's ref, then End, scrolls the panel", "Panel scrolled" in after, after[:300])
+
+        clicks(r'clickable "Frame chip"', outline, "Chip clicked", "local")
+        clicks(r'clickable "Frame chip"', outline, "Chip clicked", "isolated")
+        ctx.call("browser_type", tab_id=tid, ref=ref(r'textbox "Coupon"', outline, "isolated"), text="SAVE10", submit=True)
+        after = poll(read, lambda o: "Applied SAVE10" in part(o, "isolated"))
+        ctx.check("typing into the localhost frame's field and pressing Enter reached it",
+                  "Applied SAVE10" in part(after, "isolated"), after)
+        clicks(r'clickable "Frame chip"', outline, "Chip clicked", "isolated")
+        clicks(r'button "Apply coupon"', outline, "Applied SAVE10", "isolated")
+
+        typed = ctx.call("browser_type", tab_id=tid, ref=ref(r'textbox "Password"', outline), text="typed-Secret-77")
+        after = read()
+        leaked = leaks()
+        ctx.check("a typed password stays redacted, in the typing's observation and every read",
+                  not leaked and "typed-Secret-77" not in json.dumps(typed)
+                  and 'textbox "Password" value="[redacted]"' in after, (leaked, typed))
+        error = refused(ctx, "browser_click", tab_id=tid, ref="f99e5")
+        ctx.check("a ref into an unknown frame is refused, not looked up in the tab's own process",
+                  error and "no longer on the page" in error, error)
+
+
 OVERLAY_ID = "second-cursor-overlay"
 
 

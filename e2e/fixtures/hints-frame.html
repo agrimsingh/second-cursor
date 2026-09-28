@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Coupon widget</title>
+<style>body { font: 15px system-ui, sans-serif; margin: 12px; } .chip { display: inline-block; padding: 4px 10px; border: 1px solid #aaa; cursor: pointer; }</style>
+</head>
+<body>
+<form id="form"><label>Coupon <input id="coupon"></label>
+<button id="apply">Apply coupon</button></form>
+<span class="chip" id="chip">Frame chip</span>
+<p id="result">No coupon</p>
+<script>
+const result = document.getElementById("result");
+document.getElementById("form").onsubmit = (e) => { e.preventDefault(); result.textContent = "Applied " + document.getElementById("coupon").value; };
+document.getElementById("chip").addEventListener("click", () => { result.textContent = "Chip clicked"; });
+</script>
+</body>
+</html>

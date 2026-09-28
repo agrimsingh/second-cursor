@@ -90,7 +90,7 @@ Locators use one or more of `selector`, `role`/`name`, `label`, `text`, `placeho
 | capabilities | Operations, argument help, CDP allowlist, approval requirements |
 | user_tabs, claim, release | Discover personal tabs and claim one (both ask); release without closing |
 | retain | mode: ephemeral, deliverable, handoff; retained tabs survive session cleanup |
-| dom_snapshot, inspect | Structured DOM state; inspect supports offset/length and returns attributes and bounds |
+| dom_snapshot, inspect | Structured DOM state; inspect supports offset/length and returns attributes and bounds. Password and payment card values read `[redacted]`, as in browser_snapshot |
 | click | locator or x/y; button, count, modifiers |
 | fill, type, paste | text; paste format text/md/html; HTML requires a locator |
 | select_text | text, prefix/suffix, selection_type |

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hints fixture</title>
+<style>
+  body { font: 15px/1.4 system-ui, sans-serif; margin: 20px; }
+  .card { display: inline-block; width: 180px; margin: 6px; padding: 10px; border: 1px solid #ccc; cursor: pointer; }
+  .card h3 { margin: 0 0 4px; font-size: 15px; }
+  .row { padding: 4px 8px; cursor: pointer; }
+  #panel { height: 90px; overflow: auto; border: 1px solid #999; width: 320px; }
+  #fits { height: 90px; overflow: auto; border: 1px solid #ddd; width: 320px; }
+  #tall { height: 420px; }
+  iframe { margin-left: 60px; width: 420px; height: 160px; border: 2px solid #333; }
+</style>
+</head>
+<body>
+<h1>Hints fixture</h1>
+<p id="status" role="status">Nothing clicked</p>
+
+<div onclick="say('Opened project Alpha')">Open project Alpha</div>
+
+<div class="card" id="cabin"><h3>Mountain cabin</h3><span>$120 / night</span></div>
+<div class="card" id="loft"><h3>City loft</h3><span>$95 / night</span></div>
+
+<div id="delegated">
+  <div class="row" data-say="Row one chosen">Delegated row one</div>
+  <div class="row" data-say="Row two chosen">Delegated row two</div>
+</div>
+
+<p><a href="#nowhere"><span style="cursor: pointer">Plain link</span></a></p>
+
+<div id="panel" aria-label="Activity log"></div>
+<div id="fits"><p>Short content that fits</p></div>
+
+<shadow-card></shadow-card>
+<closed-card></closed-card>
+
+<form id="checkout" onsubmit="event.preventDefault()">
+  <label>Email <input id="email" type="email"></label>
+  <label>Password <input id="password" type="password" autocomplete="current-password"></label>
+  <label>Card number <input id="cc" autocomplete="cc-number" inputmode="numeric"></label>
+  <label>Expiry <input id="exp" autocomplete="cc-exp" placeholder="MM/YY"></label>
+  <label>Security code <input id="cvc" autocomplete="cc-csc"></label>
+  <label>Card no. <input id="cc2"></label>
+</form>
+
+<iframe title="Tracker" src="hints-frame.html" style="width: 1px; height: 1px; border: 0; margin: 0"></iframe>
+<iframe title="Hidden widget" src="hints-frame.html" style="display: none"></iframe>
+<iframe title="Local coupon widget" src="hints-frame.html"></iframe>
+<div id="tall">Spacer</div>
+<iframe title="Coupon widget"></iframe>
+
+<script>
+function say(text) { document.getElementById("status").textContent = text; }
+for (const card of document.querySelectorAll(".card")) {
+  card.addEventListener("click", () => say("Picked " + card.querySelector("h3").textContent));
+}
+// Like a framework's root listener: the rows themselves carry no handler.
+document.addEventListener("click", (e) => {
+  const row = e.target.closest?.("[data-say]");
+  if (row) say(row.dataset.say);
+});
+const panel = document.getElementById("panel");
+for (let i = 1; i <= 30; i++) panel.insertAdjacentHTML("beforeend", `<div>Log line ${i}</div>`);
+panel.addEventListener("scroll", () => say("Panel scrolled"), { once: true });
+
+customElements.define("shadow-card", class extends HTMLElement {
+  constructor() {
+    super();
+    const root = this.attachShadow({ mode: "open" });
+    root.innerHTML = `<button id="sb">Shadow action</button><div id="sc" style="cursor:pointer">Shadow card</div>`;
+    root.getElementById("sb").onclick = () => say("Shadow button clicked");
+    root.getElementById("sc").addEventListener("click", () => say("Shadow card clicked"));
+  }
+});
+customElements.define("closed-card", class extends HTMLElement {
+  constructor() {
+    super();
+    const root = this.attachShadow({ mode: "closed" });
+    root.innerHTML = `<button>Closed shadow action</button>`;
+    root.querySelector("button").onclick = () => say("Closed shadow clicked");
+  }
+});
+
+document.getElementById("email").value = "ada@example.com";
+document.getElementById("password").value = "hunter2-Secret!";
+document.getElementById("cc").value = "4242 4242 4242 4242";
+document.getElementById("exp").value = "12/34";
+document.getElementById("cvc").value = "737";
+document.getElementById("cc2").value = "5555555555554444";
+
+document.querySelector('iframe[title="Coupon widget"]').src = location.origin.replace("127.0.0.1", "localhost") + "/hints-frame.html";
+</script>
+</body>
+</html>

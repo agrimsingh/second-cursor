@@ -87,6 +87,9 @@ export function protocolMessage(error) {
   }
 }
 
+/** The session of a frame Chrome isolated in its own process; undefined for frames in the tab's process. */
+export const frameSession = (tabId, frameId) => frameSessions.get(`${tabId}:${frameId}`);
+
 export async function frameCDP(tabId,frameId,method,params={}) {
   await attach(tabId);
   const sessionId=frameSessions.get(`${tabId}:${frameId}`);

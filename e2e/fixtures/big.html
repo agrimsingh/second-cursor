@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Big listing</title>
+<style>
+  .card { display: inline-block; width: 160px; margin: 4px; padding: 6px; border: 1px solid #ddd; }
+  .card.tile { cursor: pointer; }
+  .meta span { margin-right: 4px; }
+  #filters { height: 140px; overflow: auto; }
+</style>
+</head>
+<body>
+<h1>Big listing</h1>
+<nav id="filters" aria-label="Filters"></nav>
+<main id="grid"></main>
+<script>
+// About 20,000 DOM nodes, like a long product listing: half the cards are pointer-cursor tiles, half hold a link.
+let filters = "", cards = "";
+for (let i = 0; i < 60; i++) filters += `<label><input type="checkbox"> Brand ${i}</label><br>`;
+for (let i = 0; i < 1500; i++) {
+  const meta = `<div class="meta"><span>$${(i * 1.37).toFixed(2)}</span><span>${(i % 5) + 1}.0</span><span>Ships in ${i % 7} days</span></div>`;
+  cards += i % 2
+    ? `<div class="card tile"><div><img alt="" src="data:,"></div><h3>Item ${i}</h3>${meta}</div>`
+    : `<div class="card"><div><img alt="" src="data:,"></div><h3>Item ${i}</h3>${meta}<a href="#i${i}">Details</a></div>`;
+}
+document.getElementById("filters").innerHTML = filters;
+document.getElementById("grid").innerHTML = cards;
+</script>
+</body>
+</html>

@@ -1,18 +1,45 @@
-import { cdp } from "./cdp.js";
+import { cdp, frameCDP, frameSession } from "./cdp.js";
 import { concealDuring, pointTo, show } from "./cursor.js";
 import { BridgeError, withTimeout } from "./errors.js";
 import { parseChord } from "./keys.js";
+import { isolatedFrame } from "./snapshot.js";
 
-function backendNodeId(ref) {
-  const match = /^e?(\d+)$/.exec(String(ref ?? "").trim());
+const gone = (ref) => new BridgeError("invalid_argument", `Ref ${ref} is no longer on the page; take a new browser_snapshot`);
+
+/**
+ * A ref's node: its backend id, the session of the process it lives in, and the chain of <iframe> elements from the
+ * tab's frame down to its frame, each with the session it is read in.
+ */
+function resolve(tabId, ref) {
+  const match = /^(?:f(\d+))?e?(\d+)$/.exec(String(ref ?? "").trim());
   if (!match) throw new BridgeError("invalid_argument", `Invalid ref ${JSON.stringify(ref)}; use an [e123] ref from browser_snapshot`);
-  return Number(match[1]);
+  const sender = (frameId) => (frameId ? (method, params) => frameCDP(tabId, frameId, method, params) : (method, params) => cdp(tabId, method, params));
+  const owners = [];
+  let frameId = null;
+  for (let ordinal = Number(match[1] ?? 0); ordinal; ) {
+    const frame = isolatedFrame(tabId, ordinal);
+    // Without its session, a frame's backend ids would be looked up in the tab's own process, where they name other nodes.
+    if (!frame || !frameSession(tabId, frame.frameId)) throw gone(ref);
+    frameId ??= frame.frameId;
+    owners.unshift({ id: frame.owner, send: sender(isolatedFrame(tabId, frame.parent)?.frameId) });
+    ordinal = frame.parent;
+  }
+  return { id: Number(match[2]), send: sender(frameId), owners };
+}
+
+/** Where the ref's frame's viewport starts in the tab's viewport. */
+async function frameOffset(owners) {
+  let x = 0, y = 0;
+  for (const owner of owners) {
+    const { model } = await owner.send("DOM.getBoxModel", { backendNodeId: owner.id });
+    x += model.content[0];
+    y += model.content[1];
+  }
+  return { x, y };
 }
 
 function refError(ref, error) {
-  if (/no node|could not find node|does not belong/i.test(error.message)) {
-    return new BridgeError("invalid_argument", `Ref ${ref} is no longer on the page; take a new browser_snapshot`);
-  }
+  if (/no node|could not find node|does not belong/i.test(error.message)) return gone(ref);
   if (/layout object|box model/i.test(error.message)) {
     return new BridgeError("failed", `Ref ${ref} is not visible on the page`);
   }
@@ -20,16 +47,18 @@ function refError(ref, error) {
 }
 
 const center = (quad) => ({ x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4, y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4 });
+const shift = (point, offset) => ({ x: point.x + offset.x, y: point.y + offset.y });
 
 async function refCenter(tabId, ref) {
-  const id = backendNodeId(ref);
+  const { id, send, owners } = resolve(tabId, ref);
   try {
-    await cdp(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId: id });
-    const { model } = await cdp(tabId, "DOM.getBoxModel", { backendNodeId: id });
-    return center(model.content);
+    for (const owner of owners) await owner.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: owner.id });
+    await send("DOM.scrollIntoViewIfNeeded", { backendNodeId: id });
+    const { model } = await send("DOM.getBoxModel", { backendNodeId: id });
+    return shift(center(model.content), await frameOffset(owners));
   } catch (error) {
-    const quads = await cdp(tabId, "DOM.getContentQuads", { backendNodeId: id }).then((r) => r.quads, () => []);
-    if (quads.length) return center(quads[0]);
+    const quads = await send("DOM.getContentQuads", { backendNodeId: id }).then((r) => r.quads, () => []);
+    if (quads.length) return shift(center(quads[0]), await frameOffset(owners));
     throw refError(ref, error);
   }
 }
@@ -56,11 +85,14 @@ function fieldPoint(quad) {
 
 export async function type(tabId, { ref, text, submit }) {
   if (ref != null && ref !== "") {
-    const id = backendNodeId(ref);
-    await cdp(tabId, "DOM.focus", { backendNodeId: id }).catch((error) => {
+    const { id, send, owners } = resolve(tabId, ref);
+    await send("DOM.focus", { backendNodeId: id }).catch((error) => {
       throw refError(ref, error);
     });
-    pointTo(tabId, () => cdp(tabId, "DOM.getBoxModel", { backendNodeId: id }).then(({ model }) => fieldPoint(model.border)));
+    pointTo(tabId, async () => {
+      const { model } = await send("DOM.getBoxModel", { backendNodeId: id });
+      return shift(fieldPoint(model.border), await frameOffset(owners));
+    });
   } else show(tabId);
   if (text) await cdp(tabId, "Input.insertText", { text: String(text) });
   if (submit) await pressKey(tabId, "Enter");
