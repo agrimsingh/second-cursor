@@ -80,8 +80,9 @@ public final class SecondCursorServer: @unchecked Sendable {
                     } catch { return .error(statusCode:400,.invalidRequest("Malformed request: \(error.localizedDescription)")) }
                 }
                 Self.forwardCancellation(request, token: config.token, router: router)
-                return await Self.handle(
+                let response = await Self.handle(
                     request, pipeline: pipeline, router: router, tools: tools, instructions: instructions)
+                return Self.identifyingClient(response, to: request)
             }
         } catch let error as IOError where error.errnoCode == EADDRINUSE {
             throw StartError.portInUse(config.port)
@@ -136,7 +137,18 @@ public final class SecondCursorServer: @unchecked Sendable {
             message["method"] as? String == "notifications/cancelled",
             let id = (message["params"] as? [String: Any])?["requestId"]
         else { return }
-        router.repl.cancel(requestID: "\(id)")
+        if let key = ClientRequest.key(client: ClientRequest.client(request.headers), id: id) {
+            router.repl.cancel(requestID: key)
+        }
+    }
+
+    /// The transport is stateless, but an id a client echoes on every request tells its cancellations from another's.
+    private static func identifyingClient(_ response: HTTPResponse, to request: HTTPRequest) -> HTTPResponse {
+        guard case .data(let data, var headers) = response, let body = request.body,
+            (try? JSONSerialization.jsonObject(with: body) as? [String: Any])?["method"] as? String == "initialize"
+        else { return response }
+        headers[HTTPHeaderName.sessionID] = UUID().uuidString
+        return .data(data, headers: headers)
     }
 
     /// One MCP `Server` per HTTP request: the stateless transport keys in-flight requests by

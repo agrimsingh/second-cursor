@@ -387,7 +387,7 @@ def repl_playwright(ctx):
                                    "await page.getByRole('button', { name: 'Label: Spam' }).click({ timeout: 1000 })")
         ctx.check("a click on a target the Undo toast covers fails, naming the toast",
                   not ok and text.startswith("TimeoutError: locator.click: Timeout 1000ms exceeded")
-                  and '<div id="toast" role="status"> "Conversation archived. Undo" intercepts pointer events' in text,
+                  and 'is covered by status "Conversation archived. Undo"' in text,
                   text)
         text = value(ctx, "await page.locator('#status').textContent()")
         ctx.check("and the click did not land on the toast", text == "Archived", text)
@@ -463,14 +463,22 @@ def repl_sessions(ctx):
               not ok and "session was closed" in text and time.time() - started < 2, (time.time() - started, text))
 
 
-def raw_request(ctx, payload):
-    """An open HTTP connection carrying one MCP request, so the test can hang up on it like a client that gives up."""
+def raw_request(ctx, payload, client=None):
+    """An open HTTP connection carrying one MCP request, so the test can hang up on it like a client that gives up.
+    `client` is sent as the Mcp-Session-Id the server issued."""
     url = urllib.parse.urlsplit(ctx.mcp.url)
     connection = http.client.HTTPConnection(url.hostname, url.port, timeout=90)
     connection.request("POST", url.path, body=json.dumps(payload), headers={
         "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-        "MCP-Protocol-Version": harness.PROTOCOL_VERSION, "Authorization": f"Bearer {ctx.mcp.token}"})
+        "MCP-Protocol-Version": harness.PROTOCOL_VERSION, "Authorization": f"Bearer {ctx.mcp.token}",
+        **({"Mcp-Session-Id": client} if client else {})})
     return connection
+
+
+def answer(connection):
+    response = connection.getresponse()
+    return response.status, response.getheader("Mcp-Session-Id"), harness.parse_body(
+        response.getheader("Content-Type", ""), response.read().decode())
 
 
 def repl_call(code, session, request_id, **args):
@@ -501,21 +509,29 @@ def repl_client_gives_up(ctx):
     ctx.check("a client that hangs up ends its call: the next call runs at once and the loop has stopped",
               ok and text == "[ true, true ]" and seconds < 2, (seconds, text))
 
+    _, issued, _ = answer(raw_request(ctx, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": harness.PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}}))
+    ctx.check("initialize issues an Mcp-Session-Id, which scopes the client's cancellations", bool(issued), issued)
     cancelled = sessions[3]
     box = {}
-    thread = threading.Thread(target=lambda: box.update(
-        result=ctx.mcp.raw(repl_call("while (true) {}", cancelled, "cancel-me-1", timeout_ms=30000))))
     started = time.time()
+    thread = threading.Thread(target=lambda: box.update(result=answer(raw_request(
+        ctx, repl_call("while (true) {}", cancelled, "cancel-me-1", timeout_ms=30000), client=issued))))
     thread.start()
     time.sleep(1)
-    status, _, _ = ctx.mcp.raw({"jsonrpc": "2.0", "method": "notifications/cancelled",
-                                "params": {"requestId": "cancel-me-1", "reason": "e2e"}})
+    notice = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "cancel-me-1", "reason": "e2e"}}
+    answer(raw_request(ctx, notice, client="another-client"))
+    answer(raw_request(ctx, notice))
+    time.sleep(1)
+    ctx.check("a cancellation from another client, or from none, with the same request id leaves the call running",
+              thread.is_alive())
+    status, _, _ = answer(raw_request(ctx, notice, client=issued))
     thread.join()
-    answer = (harness.parse_body(box["result"][1], box["result"][2]) or {}).get("result", {})
-    text = (answer.get("content") or [{}])[0].get("text", "")
-    ctx.check("notifications/cancelled stops the running call, even a synchronous loop",
-              status < 300 and answer.get("isError") and text.startswith("Cancelled: the client stopped waiting")
-              and time.time() - started < 3, (status, round(time.time() - started, 2), text))
+    result = (box["result"][2] or {}).get("result", {})
+    text = (result.get("content") or [{}])[0].get("text", "")
+    ctx.check("its own client's notifications/cancelled stops the running call, even a synchronous loop",
+              status < 300 and result.get("isError") and text.startswith("Cancelled: the client stopped waiting")
+              and time.time() - started < 4, (status, round(time.time() - started, 2), text))
     ctx.check("and the session answers at once afterwards", value(ctx, "'after'", session_id=cancelled) == "after")
 
     for label, (thread, result) in {"by default": (default, default_box),

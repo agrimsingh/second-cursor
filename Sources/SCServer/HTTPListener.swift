@@ -64,11 +64,13 @@ final class HTTPListener: @unchecked Sendable {
     }
 }
 
-/// The HTTP request a tool call arrived in: its JSON-RPC id, and whether the client is still waiting for the answer.
-/// A client that gives up closes the connection before the response is written.
+/// The HTTP request a tool call arrived in: which client sent it and its JSON-RPC id, and whether the client is still
+/// waiting for the answer. A client that gives up closes the connection before the response is written.
 final class ClientRequest: @unchecked Sendable {
     @TaskLocal static var current: ClientRequest?
 
+    /// The client's `Mcp-Session-Id` (issued on initialize) with the JSON-RPC id: request ids are unique only
+    /// within one client, and a client without the header shares a scope with every other such client.
     let id: String?
     private let lock = NSLock()
     private var gone = false
@@ -76,6 +78,14 @@ final class ClientRequest: @unchecked Sendable {
 
     init(id: String?) {
         self.id = id
+    }
+
+    static func key(client: String?, id: Any?) -> String? {
+        id.map { "\(client ?? "")\u{0}\($0)" }
+    }
+
+    static func client(_ headers: [String: String]) -> String? {
+        headers.first { $0.key.caseInsensitiveCompare("Mcp-Session-Id") == .orderedSame }?.value
     }
 
     /// Runs `handler` once the client has gone, at once if it already has.
@@ -170,7 +180,7 @@ private final class MCPHTTPHandler: ChannelInboundHandler {
         )
         let route = self.route
         let id = request.body.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }?["id"]
-        let client = ClientRequest(id: id.map { "\($0)" })
+        let client = ClientRequest(id: ClientRequest.key(client: ClientRequest.client(headers), id: id))
         inFlight = client
         let boundSelf = NIOLoopBound(self, eventLoop: loop)
         Task {
