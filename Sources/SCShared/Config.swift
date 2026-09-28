@@ -45,9 +45,9 @@ public struct SCConfig: Codable, Sendable {
     /// How every local approval is answered: "prompt" (nil) asks the user; "deny" refuses without UI; "allow" grants
     /// without UI, honored only when `SC_HOME` is set (disposable test instances), otherwise treated as "prompt".
     public var approvals: String?
-    /// Which tools tools/list advertises: "full" (nil), "compact", which lists `act` instead of `batch` and the
-    /// single-action tools, "repl", which lists only `browser_repl`, or "discrete", "full" without `browser_repl`.
-    /// Every tool stays callable either way.
+    /// Which tools tools/list advertises: every tool but `act` and `browser_repl` (nil); "compact", which lists `act`
+    /// instead of `batch` and the single-action tools; "full", which adds `browser_repl`; or "repl", which lists only
+    /// `browser_repl`. Every tool stays callable either way.
     public var toolSurface: String?
     /// Draw the agent cursor for windows on the agent display, as if the user could see it, so e2e/cursor.py can run
     /// there instead of on the user's screen. Honored only when `SC_HOME` is set (disposable test instances).

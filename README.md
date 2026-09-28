@@ -99,7 +99,7 @@ Second Cursor runs no model of its own. Whatever client you connect brings one, 
 | Sessions | `session`, `bind_target`, `operation_status`, `cancel_operation` |
 | Editing | `inspect_element`, `select_text`, `paste` |
 | Extended browser | `browser_instances`, `browser_command` (DOM, dialogs, files, exports, screenshots, history, assets) |
-| Browser REPL | `browser_repl`: persistent JavaScript with a Playwright-compatible `page` ([details](docs/api.md#browser-repl)) |
+| Browser REPL (opt-in, `toolSurface: "full"`) | `browser_repl`: persistent JavaScript with a Playwright-compatible `page` ([details](docs/api.md#browser-repl)) |
 | Input | `batch` (also as `act`), `click`, `drag`, `type_text`, `set_value`, `press_key`, `scroll`, `perform_action` |
 | Agent display (optional) | `agent_display`, `move_to_agent_display`, `return_window` |
 | Browser | `browser_status`, `browser_tabs`, `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_screenshot`, `browser_close` |

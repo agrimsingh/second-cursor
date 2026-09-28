@@ -544,7 +544,8 @@ def repl_client_gives_up(ctx):
 
 @scenario
 def repl_surface(ctx):
-    """Failure mode 21: toolSurface "repl" lists only browser_repl; every tool stays callable."""
+    """Failure mode 21: toolSurface "repl" lists only browser_repl; every tool stays callable. The default surface
+    leaves browser_repl out, "full" adds it, and it answers on every surface."""
     with TestInstance({"toolSurface": "repl"}) as inst:
         init = inst.mcp.initialize()
         names = [t["name"] for t in inst.mcp.rpc("tools/list")["tools"]]
@@ -553,7 +554,17 @@ def repl_surface(ctx):
         ctx.check("other tools stay callable", "paused" in inst.mcp.call("status")[0])
         result = inst.mcp.rpc("tools/call", {"name": "browser_repl", "arguments": {"code": "1 + 1"}})
         ctx.check("browser_repl answers", result["content"][0]["text"] == "2", result)
+    with TestInstance() as inst:
+        inst.mcp.initialize()
+        names = [t["name"] for t in inst.mcp.rpc("tools/list")["tools"]]
+        ctx.check("the default surface lists the discrete browser tools but not browser_repl",
+                  "browser_click" in names and "browser_repl" not in names, names)
+        result = inst.mcp.rpc("tools/call", {"name": "browser_repl", "arguments": {"code": "2 + 2"}})
+        ctx.check("browser_repl still answers there", result["content"][0]["text"] == "4", result)
+    names = [t["name"] for t in ctx.mcp.rpc("tools/list")["tools"]]
+    ctx.check('toolSurface "full" lists browser_repl next to the discrete browser tools',
+              "browser_repl" in names and "browser_click" in names and "act" not in names, names)
 
 
 if __name__ == "__main__":
-    sys.exit(0 if Run().run(set(sys.argv[1:])) else 1)
+    sys.exit(0 if Run(config_overrides={"toolSurface": "full"}).run(set(sys.argv[1:])) else 1)

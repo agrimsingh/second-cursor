@@ -45,12 +45,13 @@ enum ToolCatalog {
         "click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "batch",
     ]
 
-    /// What tools/list shows: the single-action tools and batch, ("compact") act in their place, ("repl") only
-    /// browser_repl, or ("discrete") the standard list without it.
+    /// What tools/list shows: the single-action tools and batch, ("compact") act in their place, ("full") browser_repl
+    /// as well, or ("repl") browser_repl alone. Models offered both browser_repl and the discrete browser tools mixed
+    /// them and ran slower than with either, so browser_repl is listed only when asked for.
     static func advertised(surface: String?) -> [Tool] {
         if surface == "repl" { return tools.filter { $0.name == "browser_repl" } }
-        let hidden: Set<String> = surface == "compact" ? compactHiddenTools
-            : surface == "discrete" ? ["act", "browser_repl"] : ["act"]
+        let hidden: Set<String> = surface == "compact" ? compactHiddenTools.union(["browser_repl"])
+            : surface == "full" ? ["act"] : ["act", "browser_repl"]
         return tools.filter { !hidden.contains($0.name) }
     }
 

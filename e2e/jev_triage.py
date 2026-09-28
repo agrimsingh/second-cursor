@@ -16,15 +16,15 @@ Arms, each against a fresh test instance:
   jev             Jev drives: each step sends Jev the goal, the page outline from browser_snapshot and the recent
                   clicks, and asks which control to click next (a choice over every ref on the page, plus done and
                   blocked). No task-specific code. jev:N asks for the next N clicks in one call.
-  agent:M         cursor-agent -p with model M and the instance's MCP tools only, without browser_repl (toolSurface
-                  "discrete", as for script and script-jev).
+  agent:M         cursor-agent -p with model M and the instance's MCP tools only, on the default surface, which leaves
+                  browser_repl out (as for script and script-jev).
   script:M        The same, plus a shell and the Second Cursor SDK, so M can write and run Node scripts.
   script-jev:M    script:M plus ./jev.mjs (e2e/jev.mjs), which lets those scripts ask Jev for per-item decisions.
   repl:M          cursor-agent -p with model M and one tool, browser_repl (the instance runs with toolSurface "repl"):
                   a persistent JavaScript REPL whose `page` is Playwright-shaped, in the spirit of Aside's browser
                   agent. No skill: its prompt only says that a Playwright page is available.
-  default:M       cursor-agent -p with model M and the standard tool surface, discrete browser tools and browser_repl,
-                  as users get it; the prompt names neither, and tool_counts records which it chose.
+  both:M          cursor-agent -p with model M and toolSurface "full": the discrete browser tools and browser_repl; the
+                  prompt names neither, and tool_counts records which it chose.
 The other agent arms get the project skill (.cursor/skills/second-cursor/SKILL.md). Every agent arm opens the page
 itself.
 
@@ -39,7 +39,7 @@ Ways the comparison can mislead, and what the run does about each:
     scripts as tool time; Jev loop time is wall time from the first read to the last click.
   - One run is noise: --repeat N.
 
-Usage:  python3 e2e/jev_triage.py --arms agent:M,script:M,script-jev:M,repl:M,default:M,jev [--repeat N] [--timeout S] [--live]
+Usage:  python3 e2e/jev_triage.py --arms agent:M,script:M,script-jev:M,repl:M,both:M,jev [--repeat N] [--timeout S] [--live]
 Key:    TYPESAFE_API_KEY, or ~/.config/typesafe/key
 Output: e2e/artifacts/triage-<ts>-[live-]<arm>/ report.md, transcript.jsonl, triage.json (score and timing),
         page-events.json (every change the page sent its backend), plus jev.jsonl (every Jev request and response) or
@@ -99,7 +99,7 @@ Open {url} with browser_open and do this in that tab, operating the page through
 
 Reply with only DONE when the task is finished, or BLOCKED and the reason."""
 
-DEFAULT_PROMPT = """Use only the tools of the MCP server named "{server}" (Second Cursor). Do not use the shell, \
+BOTH_PROMPT = """Use only the tools of the MCP server named "{server}" (Second Cursor). Do not use the shell, \
 files, or any other MCP server.
 Open {url} in the browser and do this there, operating the page through its controls as a person would:
 
@@ -437,8 +437,8 @@ def agent_run(ctx, kind, model, url, timeout):
     if kind == "repl":
         prompt = REPL_PROMPT.format(server=SERVER, url=url, goal=GOAL)
         return run_agent(ctx, model, prompt, url, timeout, skill=False)
-    if kind == "default":
-        return run_agent(ctx, model, DEFAULT_PROMPT.format(server=SERVER, url=url, goal=GOAL), url, timeout)
+    if kind == "both":
+        return run_agent(ctx, model, BOTH_PROMPT.format(server=SERVER, url=url, goal=GOAL), url, timeout)
     if kind in ("script", "script-jev"):
         files["sdk/index.mjs"] = REPO / "sdk/index.mjs"
         prompt = SCRIPT_PROMPT.format(server=SERVER, url=url, goal=GOAL, jev=JEV_NOTE if kind == "script-jev" else "")
@@ -617,10 +617,10 @@ def parse_arm(spec):
     kind, _, value = spec.partition(":")
     if kind == "jev":
         return "jev", None, int(value or 1)
-    if kind in ("agent", "script", "script-jev", "repl", "default"):
+    if kind in ("agent", "script", "script-jev", "repl", "both"):
         return kind, value or "grok-4.7-medium-fast", 1
     raise SystemExit(f"unknown arm {spec!r}: use jev, jev:N, agent:<model>, script:<model>, script-jev:<model>, "
-                     "repl:<model> or default:<model>")
+                     "repl:<model> or both:<model>")
 
 
 if __name__ == "__main__":
@@ -630,7 +630,7 @@ if __name__ == "__main__":
     for _ in range(repeat):
         for kind, model, lookahead in arms:
             SCENARIOS[:] = [triage(kind, model, lookahead, timeout)]
-            surface = {} if kind == "default" else {"toolSurface": "repl" if kind == "repl" else "discrete"}
+            surface = {"toolSurface": "repl"} if kind == "repl" else {"toolSurface": "full"} if kind == "both" else {}
             trial = run.Run(config_overrides={"approvals": "allow", "appApproval": "off", **surface}, browser=True)
             renamed = trial.dir.with_name(f"triage-{trial.dir.name}-{'live-' if LIVE else ''}"
                                           f"{arm_label(kind, model, lookahead).replace(':', '-')}")
