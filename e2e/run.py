@@ -1484,20 +1484,20 @@ def browser(ctx):
         ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
         ctx.check("opened tab is an agent tab", tab["is_agent_tab"], tab)
 
-        outline = ctx.call("browser_snapshot", tab_id=tid, include_screenshot=True)["outline"]
+        outline = ctx.call("browser_snapshot", tab_id=tid, full=True, include_screenshot=True)["outline"]
         field = re.search(r'\[(\w+)\] textbox "Name"', outline)
         ctx.require("snapshot exposes the Name textbox with a ref", field, outline[:500])
-        ctx.call("browser_type", tab_id=tid, ref=field.group(1), text="second cursor", submit=True)
-        time.sleep(0.5)
-        outline = ctx.call("browser_snapshot", tab_id=tid)["outline"]
-        ctx.check("typing + submit reached the page", "Hello, second cursor" in outline, outline[:500])
+        typed = ctx.call("browser_type", tab_id=tid, ref=field.group(1), text="second cursor", submit=True)
+        outline = typed["observation"]["outline"]
+        ctx.check("typing + submit reached the page, and the action's observation shows it",
+                  "Hello, second cursor" in outline, outline[:500])
 
         # Models write batch steps in the compact schema's shape, with each step's fields under arguments.
         ctx.call("browser_command", tab_id=tid, operation="batch", steps=[
             {"operation": "fill", "arguments": {"locator": {"label": "Name"}, "text": "nested"}},
             {"operation": "click", "arguments": json.dumps({"locator": {"role": "button", "name": "Submit"}})},
         ])
-        outline = ctx.call("browser_snapshot", tab_id=tid)["outline"]
+        outline = ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]
         ctx.check("batch steps with their fields under arguments, as an object or a JSON string, both ran",
                   "Hello, nested" in outline, outline[:500])
         error = refused(ctx, "browser_command", tab_id=tid, operation="batch",
@@ -1526,7 +1526,7 @@ def browser_settled_reads(ctx):
       frame and must read again (the results arrive from a request that answers 1.2 s after load).
     - A navigation keeps waiting for the page to react after its network has gone idle, so every load of a page that
       fetches nothing more costs the whole post-load window (1.5 s). Checked with e2e/fixtures/form.html.
-    - A read right after a click that makes the page fetch and render ("Load more", a filter) returns the old page.
+    - A click that makes the page fetch and render ("Load more", a filter) returns an observation of the old page.
     - Reads carry the per-element JSON list without structured=true, multiplying the payload about tenfold.
     - The cursor stays off the tab until the first action; Codex shows it as soon as the agent works in a tab.
     - Ordinary work switches on the DevTools Runtime domain, which the page can detect through its console. Only
@@ -1562,11 +1562,10 @@ def browser_settled_reads(ctx):
 
         more = re.search(r'\[(\w+)\] button "Load more"', outline)
         ctx.require("the Load more button has a ref", more, outline[:400])
-        ctx.call("browser_click", tab_id=tid, ref=more.group(1))
-        read = ctx.call("browser_snapshot", tab_id=tid)
-        ctx.check("a read right after the click waits for what the click made the page fetch",
+        read = ctx.call("browser_click", tab_id=tid, ref=more.group(1))["observation"]
+        ctx.check("the click's observation waits for what the click made the page fetch",
                   "Second batch ready" in read["outline"], read["outline"][-300:])
-        ctx.check("a plain read has no per-element list", "elements" not in read, list(read))
+        ctx.check("it has no per-element list", "elements" not in read, list(read))
         rich = ctx.call("browser_snapshot", tab_id=tid, full=True, structured=True)
         ctx.check("structured=true adds it", bool(rich.get("elements")), list(rich))
         ctx.check("the page saw no DevTools Runtime client while the agent opened, read and clicked",
@@ -1806,7 +1805,8 @@ def browser_cursor(ctx):
     browser = getattr(ctx.run.instance, "browser", None)
     with FixtureServer() as base:
         url = f"{base}/cursor.html"
-        tid = ctx.call("browser_open", url=url)["tab"]["id"]
+        opened = ctx.call("browser_open", url=url)
+        tid = opened["tab"]["id"]
         ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
 
         def command(operation, tab=tid, **args):
@@ -1837,12 +1837,12 @@ def browser_cursor(ctx):
             ctx.check(f"the agent's own {'browser_command screenshot' if extended else 'browser_screenshot'}, right "
                       "after the click, has no trace of its cursor", count <= 3, f"{count} orange pixels")
 
-        outline = ctx.call("browser_snapshot", tab_id=tid)["outline"]
+        outline = opened["observation"]["outline"]
         button = re.search(r'\[(\w+)\] button "Count clicks"', outline)
         field = re.search(r'\[(\w+)\] textbox "Name"', outline)
         ctx.require("the fixture exposes its button and field", button and field, outline[:400])
 
-        ctx.call("browser_click", tab_id=tid, x=160, y=100, caption="Opening the menu")
+        clicked = ctx.call("browser_click", tab_id=tid, x=160, y=100, caption="Opening the menu")
         own_capture("own-screenshot-after-click", tid)
         state = poll(overlay, lambda s: at(s, 160, 100, "Opening the menu"))
         ctx.require("after a captioned click the host is in the page with the caption in its shadow root",
@@ -1880,8 +1880,8 @@ def browser_cursor(ctx):
             ctx.check("the pill shows the whole caption, not cut off with an ellipsis", widths[0] <= widths[1],
                       f"text width, pill content width = {widths}")
 
-        snapshot = json.dumps(ctx.call("browser_snapshot", tab_id=tid))
-        ctx.check("browser_snapshot (outline and elements) never shows the caption or the host",
+        snapshot = json.dumps([clicked, ctx.call("browser_snapshot", tab_id=tid, full=True, structured=True)])
+        ctx.check("the click's observation and browser_snapshot (outline and elements) never show the caption or the host",
                   "Opening the menu" not in snapshot and OVERLAY_ID not in snapshot, snapshot[:300])
         dom = json.dumps(command("dom_snapshot"))
         ctx.check("dom_snapshot does not list the host or its caption",

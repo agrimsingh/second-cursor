@@ -8,7 +8,8 @@ members, 36 invoices). GOAL changes one setting in each of four sections and rea
 (Maya Cheng, the Push "Weekly digest", Jira Service Management) punish a model that stops reading closely.
 
 Arms, each against a fresh test instance: cursor-agent -p with model M and MCP tools only.
-  direct:M   The instance's MCP server as is. browser_snapshot returns the full outline by default.
+  direct:M   The instance's MCP server as is. Browser actions return what changed, and browser_snapshot reads after
+             the first are diffs.
   jev:M      Through CondensingProxy with JevKeep: every full outline browser_open or browser_snapshot returns is split
              into chunks of at most CHUNK_LINES lines under their containers, and one Jev call asks, per chunk, whether
              the goal needs it.

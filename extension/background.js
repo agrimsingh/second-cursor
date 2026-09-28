@@ -17,7 +17,7 @@ import {
   takeReports,
 } from "./tabs.js";
 
-import { extended, recordEvent, withDialog } from "./extended.js";
+import { extended, openDialog, recordEvent, withDialog } from "./extended.js";
 import { closeSession, endTurn } from "./tabs.js";
 
 const HOST = "dev.secondcursor.host";
@@ -76,12 +76,18 @@ const handlers = {
     const tab = await navigateTab(tabId, url);
     return { tab };
   },
-  "tab.snapshot": async ({ tabId, session_id, full, structured }) => {
+  "tab.snapshot": async ({ tabId, session_id, full, structured, load }) => {
     await requireAgentTab(tabId);
+    // The page runs no script, and so cannot be read, until its dialog is answered.
+    if (openDialog(tabId))
+      throw new BridgeError(
+        "failed",
+        `A JavaScript dialog is open in tab ${tabId}; answer it with browser_command operation=dialog, then read the page`,
+      );
     // Like Codex, the cursor is on the tab from the moment the agent works in it, not only once it acts.
     await attach(tabId);
     show(tabId, session_id);
-    await settled(tabId);
+    await settled(tabId, { load });
     const key = `${session_id}:${tabId}`;
     const previous = observations.get(key);
     const snapshot = await structuredSnapshot(tabId);
@@ -90,34 +96,14 @@ const handlers = {
     let outline = snapshot.outline;
     let is_diff = false;
     if (full === false && previous) {
-      const old = previous.outline.split("\n");
-      const now = outline.split("\n");
-      // A positional splice preserves ordering and repeated rows. Large edits return the full tree.
-      let start = 0;
-      while (
-        start < old.length &&
-        start < now.length &&
-        old[start] === now[start]
-      )
-        start++;
-      let oldEnd = old.length,
-        newEnd = now.length;
-      while (
-        oldEnd > start &&
-        newEnd > start &&
-        old[oldEnd - 1] === now[newEnd - 1]
-      ) {
-        oldEnd--;
-        newEnd--;
-      }
-      const changed = [
-        ...old.slice(start, oldEnd).map((line) => "-" + line),
-        ...now.slice(start, newEnd).map((line) => "+" + line),
-      ];
-      const diff = changed.length
-        ? `@@ -${start + 1},${oldEnd - start} +${start + 1},${newEnd - start} @@\n${changed.join("\n")}`
-        : "(no changes)";
-      if (diff.length < outline.length * 0.6) {
+      const changed = changedLines(
+        previous.outline.split("\n"),
+        outline.split("\n"),
+      );
+      const diff =
+        changed && (changed.length ? changed.join("\n") : "(no changes)");
+      // Large edits return the full tree.
+      if (diff && diff.length < outline.length * 0.6) {
         outline = diff;
         is_diff = true;
       }
@@ -158,6 +144,52 @@ const handlers = {
     return await screenshot(tabId);
   },
 };
+
+/**
+ * The removed (-) and added (+) lines between two outlines, in order. Lines on a longest common subsequence drop
+ * out, so an edit in the header and another in the body do not resend the rows between them, and repeated rows keep
+ * their count. Null when the change is a different page, not an edit.
+ */
+function changedLines(old, now) {
+  let head = 0;
+  while (head < old.length && head < now.length && old[head] === now[head])
+    head++;
+  let tail = 0;
+  while (
+    tail < old.length - head &&
+    tail < now.length - head &&
+    old[old.length - 1 - tail] === now[now.length - 1 - tail]
+  )
+    tail++;
+  const a = old.slice(head, old.length - tail);
+  const b = now.slice(head, now.length - tail);
+  if (a.length * b.length > 250000) return null;
+  const table = Array.from(
+    { length: a.length + 1 },
+    () => new Uint32Array(b.length + 1),
+  );
+  for (let i = a.length - 1; i >= 0; i--)
+    for (let j = b.length - 1; j >= 0; j--)
+      table[i][j] =
+        a[i] === b[j]
+          ? table[i + 1][j + 1] + 1
+          : Math.max(table[i + 1][j], table[i][j + 1]);
+  const changed = [];
+  let i = 0,
+    j = 0;
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) {
+      i++;
+      j++;
+    } else if (
+      j === b.length ||
+      (i < a.length && table[i + 1][j] >= table[i][j + 1])
+    )
+      changed.push("-" + a[i++]);
+    else changed.push("+" + b[j++]);
+  }
+  return changed;
+}
 
 const ACTIONS = new Set(["tab.click", "tab.type", "tab.pressKey", "tab.scroll"]);
 const EXTENDED_ACTIONS = new Set(["click", "drag", "paste", "press_key", "scroll", "type", "upload"]);

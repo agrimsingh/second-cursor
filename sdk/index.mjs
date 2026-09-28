@@ -271,6 +271,7 @@ export class Tab {
   async observe(options = {}) {
     this.observation = await this.browser.call("browser_snapshot", {
       tab_id: this.id,
+      full: true,
       ...options,
     });
     return this.observation;

@@ -12,6 +12,7 @@ Ways this can fail, and the checks that catch them:
 - The model is never told: no "[system] popup opened" line in the click's result or the next one.
 - A popup that closes itself (window.close) leaves the model holding a dead tab id without a word.
 - Dialogs and downloads the agent caused are only visible by polling browser_command.
+- A click that opens a dialog waits to read a page the dialog keeps from running, until the call's deadline.
 - Agent tabs render at the window's size, so a resize between a screenshot and a click moves the page under the
   model's coordinates. The default is only measured (<scenario>.json): in headless Chrome a background tab keeps its
   size and a tab the user is watching follows the window. The viewport operation must hold its size either way.
@@ -185,11 +186,15 @@ def browser_popups(ctx):
         ctx.check("the popup closed itself", gone)
         ctx.check("the model is told it closed", any(f"tab {closer}" in l and "closed" in l for l in lines), lines)
 
+        started = time.time()
         result = ctx.call("browser_click", tab_id=tid, ref=ref_of(outline, "button", "Ask"))
+        took = time.time() - started
         answered = ctx.call("browser_command", tab_id=tid, operation="dialog", accept=True)
         read = ctx.call("browser_snapshot", tab_id=tid)
         lines = events_of(result) + events_of(answered) + events_of(read)
-        measurements["dialog"] = {"click_result": result, "answer_result": answered, "events": lines}
+        measurements["dialog"] = {"click_result": result, "click_s": took, "answer_result": answered, "events": lines}
+        ctx.check("the click that opens it returns at once, saying the page waits on the dialog instead of reading it",
+                  took < 5 and "dialog is open" in result.get("observation_error", ""), (took, result))
         ctx.check("the dialog was answered", "confirmed" in read["outline"], read["outline"][-300:])
         ctx.check("the model is told a dialog opened", any("dialog opened" in l and "Proceed?" in l for l in lines),
                   lines)
@@ -267,7 +272,7 @@ def browser_fixed_viewport(ctx):
             results, hits = {}, 0
             for case, shrink, watching in (("background", (320, 180), False), ("watching", (200, 120), True)):
                 shot = ctx.call("browser_screenshot", tab_id=tid)
-                size = SIZE.search(ctx.call("browser_snapshot", tab_id=tid)["outline"]).groups()
+                size = SIZE.search(ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]).groups()
                 bounds = ctx.call("browser_command", tab_id=tid, operation="inspect",
                                   locator={"selector": "#corner"})["bounds"]
                 point = (bounds["x"] + bounds["width"] / 2, bounds["y"] + bounds["height"] / 2)
@@ -277,9 +282,9 @@ def browser_fixed_viewport(ctx):
                                           f"{{width: {window['width'] - shrink[0]}, height: {window['height'] - shrink[1]}}})")
                 time.sleep(0.5)
                 after = ctx.call("browser_screenshot", tab_id=tid)
-                after_size = SIZE.search(ctx.call("browser_snapshot", tab_id=tid)["outline"]).groups()
-                ctx.call("browser_click", tab_id=tid, x=point[0], y=point[1])
-                hit = f"hit {hits + 1}" in ctx.call("browser_snapshot", tab_id=tid)["outline"]
+                after_size = SIZE.search(ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]).groups()
+                clicked = ctx.call("browser_click", tab_id=tid, x=point[0], y=point[1])
+                hit = f"hit {hits + 1}" in clicked["observation"]["outline"]
                 hits += hit
                 results[case] = {
                     "window": [window["width"], window["height"]],

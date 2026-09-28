@@ -15,7 +15,7 @@ If tools fail with "not running" or permission errors, run `SecondCursor doctor`
 
 1. Start of every turn: call `get_window_state` for the window you will touch. The UI may have changed since your last turn, and the first read of a turn is a full outline.
 2. Target by element index: `[12] AXButton "Equals"` means `element_index: 12`. Use x/y only when the element is not in the outline; coordinates are window-local points (screenshot pixels).
-3. Each action returns a diff of its window (`+` new or changed, `-` gone, `(no changes)`). Read it instead of calling `get_window_state` again.
+3. Each action returns a diff of its window (`+` new or changed, `-` gone, `(no changes)`). Read it instead of calling `get_window_state` again. Browser actions do the same for their tab, so call `browser_snapshot` only to wait for the page or for the whole outline (`full: true`).
 4. If the outline is truncated or a region needs detail, read it with `scope: <index>`. Use `full: true` only when a diff is not enough.
 5. Pass `app: "TextEdit"` instead of `window_id` when the app has a single obvious window; use `window_id` from `list_windows` when it has several. Read the app with `get_window_state` first: actions by `app` go to the window you observed last, and are refused if you haven't observed one.
 6. For a sequence whose steps you already know (buttons to press, fields to fill), send one `batch` instead of many calls. End the batch before any step whose outcome you need to see (a menu, dialog, search results).

@@ -363,7 +363,7 @@ extension ToolRouter {
 
     private static func milliseconds(_ seconds: TimeInterval) -> Int { Int((seconds * 1000).rounded()) }
 
-    private static func observeMode(_ args: Arguments) throws -> String {
+    static func observeMode(_ args: Arguments) throws -> String {
         let mode = try args.optionalString("observe")?.lowercased() ?? "tree"
         guard ["tree", "screenshot", "both", "none"].contains(mode) else {
             throw SCError.invalidArgument("observe must be one of tree, screenshot, both, none")

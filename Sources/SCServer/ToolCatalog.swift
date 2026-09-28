@@ -23,10 +23,14 @@ enum ToolCatalog {
         "click", "drag", "type_text", "set_value", "press_key", "scroll", "perform_action", "select_text", "paste",
     ]
 
+    /// Browser actions that return an observation of their tab (see `observe`).
+    static let observingBrowserTools: Set<String> = [
+        "browser_click", "browser_type", "browser_press_key", "browser_scroll", "browser_navigate",
+    ]
+
     /// Actions that take a `caption` for the agent cursor.
-    static let captionedTools: Set<String> = observingTools.union([
-        "batch", "browser_click", "browser_type", "browser_press_key", "browser_scroll", "browser_navigate",
-        "browser_command",
+    static let captionedTools: Set<String> = observingTools.union(observingBrowserTools).union([
+        "batch", "browser_command",
     ])
 
     /// Every callable tool. `act` is `batch` under another name and description, sharing its schema so that
@@ -304,13 +308,14 @@ enum ToolCatalog {
             ),
             Tool(
                 name: "browser_navigate",
-                description: "Load a URL in an agent tab.",
+                description:
+                    "Load a URL in an agent tab. Returns the page once it settles (observation, like browser_snapshot's).",
                 inputSchema: schema(["tab_id": tabID, "url": string("URL to load.")], required: ["tab_id", "url"])
             ),
             Tool(
                 name: "browser_snapshot",
                 description:
-                    "Read an agent tab as a compact accessibility outline; interactive nodes carry [ref] markers for browser_click and browser_type. Waits briefly for content the page is still rendering. Call again after the page changes.",
+                    "Read an agent tab as a compact accessibility outline; interactive nodes carry [ref] markers for browser_click and browser_type. Waits briefly for content the page is still rendering. Your first read of a tab (browser_open counts) returns the whole outline; later reads return only what changed since your previous read or action (is_diff=true): lines starting with + are new or changed, lines starting with - are gone, and \"(no changes)\" means the page is the same. A large change returns the whole outline again. The browser actions already return this diff, so call this for the whole outline (full=true) or after waiting for the page.",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
@@ -323,7 +328,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_click",
                 description:
-                    "Click an element in an agent tab by ref from browser_snapshot (preferred), or at x,y CSS pixels in the viewport.",
+                    "Click an element in an agent tab by ref from browser_snapshot (preferred), or at x,y CSS pixels in the viewport. Returns what changed on the page once it settles (observation, a diff like browser_snapshot's), so you rarely need to read the tab again.",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
@@ -335,7 +340,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_type",
                 description:
-                    "Type text into the element with ref, or into the focused element. submit=true presses Enter afterwards.",
+                    "Type text into the element with ref, or into the focused element. submit=true presses Enter afterwards. Returns what changed on the page once it settles (observation, a diff like browser_snapshot's).",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
@@ -346,7 +351,8 @@ enum ToolCatalog {
             ),
             Tool(
                 name: "browser_press_key",
-                description: "Send a key or chord to an agent tab, e.g. \"enter\", \"escape\", \"tab\", \"cmd+a\".",
+                description:
+                    "Send a key or chord to an agent tab, e.g. \"enter\", \"escape\", \"tab\", \"cmd+a\". Returns what changed on the page once it settles (observation, a diff like browser_snapshot's).",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
@@ -355,7 +361,8 @@ enum ToolCatalog {
             ),
             Tool(
                 name: "browser_scroll",
-                description: "Scroll an agent tab's page.",
+                description:
+                    "Scroll an agent tab's page. Returns what changed on the page once it settles (observation, a diff like browser_snapshot's).",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
@@ -398,11 +405,17 @@ enum ToolCatalog {
                         "Returned after the action: tree (what changed since your last read of this window), both (tree and screenshot), screenshot, or none when chaining blind.",
                         enumValues: ["tree", "both", "screenshot", "none"], default: "tree")
                 }
+                if observingBrowserTools.contains(tool.name) {
+                    props["observe"] = string(
+                        "Returned after the action: tree (what changed since your last read of this tab), both (tree and screenshot), screenshot, or none when chaining blind.",
+                        enumValues: ["tree", "both", "screenshot", "none"], default: "tree")
+                }
                 if observingTools.contains(tool.name) || tool.name == "batch" {
                     props["expect"] = expect
                 }
                 if tool.name == "browser_snapshot" {
-                    props["full"] = boolean("Full outline; false enables session-local diffs.", default: true)
+                    props["full"] = boolean(
+                        "Return the whole outline instead of a diff from your previous read of this tab.", default: false)
                 }
                 if !["status", "list_apps", "list_windows", "browser_instances", "browser_status"].contains(tool.name) {
                     props["session_id"] = string("Explicit session; omit for compatibility clients.")

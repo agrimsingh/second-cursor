@@ -3,7 +3,9 @@ import SCShared
 
 extension ToolRouter {
     func runBrowser(_ name: String, _ args: Arguments) async throws -> ToolOutput {
-        if ["browser_click", "browser_type", "browser_press_key", "browser_scroll", "browser_navigate"].contains(name) {
+        let observing = ToolCatalog.observingBrowserTools.contains(name)
+        let mode = observing ? try Self.observeMode(args) : "none"
+        if observing {
             await showCaption(args)
         }
         switch name {
@@ -43,11 +45,11 @@ extension ToolRouter {
 
         case "browser_navigate":
             let tab = try await browser.navigate(tabID: try args.int("tab_id"), url: try args.string("url"))
-            return ToolOutput(json: ["tab": Shape.tab(tab)])
+            return await observed(["tab": Shape.tab(tab)], tabID: try args.int("tab_id"), mode: mode, load: true)
 
         case "browser_snapshot":
             let params = try JSONSerialization.data(withJSONObject: [
-                "tabId": args.int("tab_id"), "full": args.bool("full", default: true),
+                "tabId": args.int("tab_id"), "full": args.bool("full", default: false),
                 "structured": args.bool("structured", default: false),
             ])
             var json = try JSONSerialization.jsonObject(with: await browser.command("tab.snapshot",params:params)) as? [String:Any] ?? [:]
@@ -67,7 +69,7 @@ extension ToolRouter {
             } else {
                 throw SCError.invalidArgument("Pass ref, or both x and y")
             }
-            return ToolOutput(json: try await reported("tab.click", params))
+            return await observed(try await reported("tab.click", params), tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_type":
             var params: [String: Any] = [
@@ -75,18 +77,19 @@ extension ToolRouter {
                 "submit": try args.bool("submit", default: false),
             ]
             params["ref"] = try args.optionalString("ref")
-            return ToolOutput(json: try await reported("tab.type", params))
+            return await observed(try await reported("tab.type", params), tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_press_key":
-            return ToolOutput(
-                json: try await reported("tab.pressKey", ["tabId": try args.int("tab_id"), "keys": try args.string("keys")]))
+            let result = try await reported(
+                "tab.pressKey", ["tabId": try args.int("tab_id"), "keys": try args.string("keys")])
+            return await observed(result, tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_scroll":
-            return ToolOutput(
-                json: try await reported("tab.scroll", [
-                    "tabId": try args.int("tab_id"), "direction": try args.direction().rawValue,
-                    "amount": max(try args.int("amount", default: 3), 1),
-                ]))
+            let result = try await reported("tab.scroll", [
+                "tabId": try args.int("tab_id"), "direction": try args.direction().rawValue,
+                "amount": max(try args.int("amount", default: 3), 1),
+            ])
+            return await observed(result, tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_screenshot":
             let shot = try await browser.screenshot(tabID: try args.int("tab_id"))
@@ -110,6 +113,41 @@ extension ToolRouter {
             with: await browser.command(method, params: JSONSerialization.data(withJSONObject: params))) as? [String: Any]
         guard let events = reply?["events"] else { return Shape.ok }
         return Shape.ok.merging(["events": events]) { $1 }
+    }
+
+    /// Adds `observation` to a browser action's result, like attachObservation for native actions: the tab read once
+    /// it settles, as a diff against this session's last read, which it replaces. The action already happened, so a
+    /// failed read is reported as `observation_error` rather than thrown; with `both`, a failed capture keeps the tree.
+    /// Events queued while the page settled come back on the read and join the action's.
+    /// `load`: the action was a page load, after which an idle network means nothing more is coming.
+    private func observed(_ result: [String: Any], tabID: Int, mode: String, load: Bool = false) async -> ToolOutput {
+        var json = result
+        do {
+            switch mode {
+            case "tree", "both":
+                let params = try JSONSerialization.data(withJSONObject: ["tabId": tabID, "full": false, "load": load])
+                var observation = try JSONSerialization.jsonObject(
+                    with: await browser.command("tab.snapshot", params: params)) as? [String: Any] ?? [:]
+                if let events = observation.removeValue(forKey: "events") as? [Any] {
+                    json["events"] = (json["events"] as? [Any] ?? []) + events
+                }
+                json["observation"] = observation
+                guard mode == "both" else { return ToolOutput(json: json) }
+                let shot = try await browser.screenshot(tabID: tabID)
+                observation["screenshot"] = Shape.screenshot(shot)
+                json["observation"] = observation
+                return ToolOutput(json: json, images: [shot])
+            case "screenshot":
+                let shot = try await browser.screenshot(tabID: tabID)
+                json["observation"] = Shape.screenshot(shot)
+                return ToolOutput(json: json, images: [shot])
+            default:
+                return ToolOutput(json: json)
+            }
+        } catch {
+            json["observation_error"] = Self.message(for: error)
+            return ToolOutput(json: json)
+        }
     }
 
     /// The extension draws the caption beside its in-page cursor (browser_command carries its own). Best effort:

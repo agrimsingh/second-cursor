@@ -28,6 +28,8 @@ function state(id) {
     });
   return events.get(id);
 }
+/** The JavaScript dialog open in the tab, if any. */
+export const openDialog = (tabId) => state(tabId).dialog;
 export function recordEvent(source, method, p) {
   const s = state(source.tabId);
   if (method === "Runtime.consoleAPICalled") {
@@ -817,6 +819,7 @@ export async function extended(p) {
       accept: p.accept,
       promptText: p.prompt_text ?? "",
     });
+    state(tabId).dialog = null;
     return ok();
   }
   if (op === "upload") {
