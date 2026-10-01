@@ -18,6 +18,11 @@ Ways this can fail, and the scenarios that catch them:
 - ocr_ms or ocr_count missing, or ocr_count disagreeing with what was merged (canvas_words, textedit_not_duplicated).
 - `scope` with `ocr` shows text from outside the scope (canvas_words).
 - Recognition is too slow on a large window to be worth calling (large_textedit_timing records ocr_ms).
+- A read right after an action captures the frame from before the app repainted: custom-drawn apps (Ableton) change
+  what accessibility sees first and repaint later. Or a capture well after the action still waits for a repaint, as
+  every capture within 2 s of an action used to. Or a read after a pixel click waits 250 ms for the app to answer
+  when it already did while the click held focus (canvas_reads_after_actions, with the fixture repainting 140 ms
+  after its tree changes).
 - The fixture takes focus or shows on the user's screen: it is a background accessory window that opens on the agent
   display (checked when it starts); the harness checks the frontmost app, Space and cursor after every scenario.
 - The first recognition on a Mac waits minutes for Vision to compile its model: the read must still come back within
@@ -123,10 +128,11 @@ class Canvas:
     """The custom-drawn fixture (sc-focus-probe --canvas): a background window that opens on the agent display, so it
     never shows on the user's screen."""
 
-    def __init__(self, ctx, word="Hello Canvas"):
+    def __init__(self, ctx, word="Hello Canvas", paint_delay_ms=None):
         self.state_path = ctx.scratch / "canvas-state.json"
+        delay = ["--paint-delay-ms", str(paint_delay_ms)] if paint_delay_ms else []
         self.process = subprocess.Popen([str(probe_binary()), "--canvas", word, "--state", str(self.state_path),
-                                         "--origin", agent_origin(ctx)],
+                                         "--origin", agent_origin(ctx), *delay],
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         ctx.cleanups.append(self.stop)
         deadline = time.time() + 15
@@ -260,6 +266,49 @@ def ocr_diffs(ctx):
               and not re.search(r"^[+-]\s*\[", changed["tree"], re.M), changed["tree"])
     ctx.check("its diff_base is the click's observation", changed.get("diff_base") == clicked["observation"]["snapshot_id"],
               (changed.get("diff_base"), clicked["observation"].get("snapshot_id")))
+
+
+@scenario
+def canvas_reads_after_actions(ctx):
+    canvas = Canvas(ctx, paint_delay_ms=140)
+    wid = canvas.wid
+    instance = ctx.run.instance
+
+    def phases(tool, mark):
+        time.sleep(0.3)
+        lines = [t for t in instance.timings(mark) if t["tool"] == tool]
+        return lines[-1]["phases"] if lines else None
+
+    tree = ctx.call("get_window_state", window_id=wid, full=True, ocr=True)["tree"]
+    transport = element_index(tree, "AXButton", "Transport")
+    ctx.require("the Transport button is in the outline", transport is not None, tree)
+    # An accessibility press returns once the app has handled it, so only the repaint wait stands between the press
+    # and a capture of the old frame.
+    pressed = ctx.call("click", window_id=wid, element_index=transport, observe="none")
+    ctx.require("the press went through accessibility and toggled the status",
+                pressed.get("route") == "ax_press" and canvas.read()["words"][3]["text"] == "Playing",
+                (pressed, canvas.read()))
+    read = ctx.call("get_window_state", window_id=wid, ocr=True)
+    signs = [(t["sign"], t["text"]) for t in text_lines(read["tree"])]
+    ctx.check("an ocr read right after the press sees the canvas repainted 140 ms after its tree changed: "
+              "-Stopped +Playing", ("-", "Stopped") in signs and ("+", "Playing") in signs, read["tree"])
+
+    word = canvas.word("Playing")
+    point = {"x": word["x"] + word["width"] / 2, "y": word["y"] + word["height"] / 2}
+    ctx.call("click", window_id=wid, observe="none", **point)
+    mark = len(instance.timings())
+    ctx.call("get_window_state", window_id=wid)
+    read_phases = phases("get_window_state", mark)
+    ctx.check("a read right after a pixel click does not wait for an answer the app gave while the click was still "
+              "running (no settle_unanswered)", read_phases is not None and "settle_unanswered" not in read_phases,
+              read_phases)
+
+    time.sleep(0.5)
+    mark = len(instance.timings())
+    ctx.call("screenshot", window_id=wid)
+    shot = phases("screenshot", mark)
+    ctx.check("a screenshot 0.5 s after the action does not wait for a repaint again",
+              shot is not None and "paint" not in shot, shot)
 
 
 CONTROL = "Plan\u200bning grid"

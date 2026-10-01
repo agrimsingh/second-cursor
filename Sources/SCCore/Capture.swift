@@ -21,6 +21,39 @@ enum Capture {
     /// The window's own pixels and its size in points. `maxEdge` nil keeps the display's backing resolution, for
     /// text recognition, which misreads small text on a scaled-down image.
     static func image(_ wid: CGWindowID, maxEdge: Int?) async throws -> (CGImage, CGSize) {
+        if let window = listing.window(wid), let shot = try? await image(window, maxEdge: maxEdge) { return shot }
+        return try await image(try await listedWindow(wid), maxEdge: maxEdge)
+    }
+
+    /// Listing shareable content takes 40-80 ms, longer than the shot. A listed window can be shot again while it is
+    /// where it was listed: its size and pixel scale still hold.
+    private final class Listing: @unchecked Sendable {
+        private let lock = NSLock()
+        private var windows: [CGWindowID: SCWindow] = [:]
+        private var listed = Date.distantPast
+
+        func window(_ wid: CGWindowID) -> SCWindow? {
+            lock.lock()
+            let window = Date().timeIntervalSince(listed) < 30 ? windows[wid] : nil
+            lock.unlock()
+            guard let window, let bounds = WindowList.record(wid)?.bounds,
+                  abs(bounds.minX - window.frame.minX) < 0.5, abs(bounds.minY - window.frame.minY) < 0.5,
+                  abs(bounds.width - window.frame.width) < 0.5, abs(bounds.height - window.frame.height) < 0.5
+            else { return nil }
+            return window
+        }
+
+        func store(_ content: SCShareableContent) {
+            lock.lock()
+            windows = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { first, _ in first })
+            listed = Date()
+            lock.unlock()
+        }
+    }
+
+    private static let listing = Listing()
+
+    private static func listedWindow(_ wid: CGWindowID) async throws -> SCWindow {
         // Always attempt the ScreenCaptureKit call: it is what makes macOS list the app under
         // Screen Recording and show the prompt; a preflight-only check never registers the app.
         let content: SCShareableContent
@@ -32,7 +65,13 @@ enum Capture {
             if !CGPreflightScreenCaptureAccess() { throw SCError.permissionDenied("Screen Recording") }
             throw SCError.actionFailed("Could not list shareable windows: \(error.localizedDescription)")
         }
+        listing.store(content)
         guard let window = content.windows.first(where: { $0.windowID == wid }) else { throw SCError.windowNotFound(wid) }
+        return window
+    }
+
+    private static func image(_ window: SCWindow, maxEdge: Int?) async throws -> (CGImage, CGSize) {
+        let wid = window.windowID
         let points = CGSize(width: max(1, window.frame.width.rounded()), height: max(1, window.frame.height.rounded()))
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let configuration = SCStreamConfiguration()

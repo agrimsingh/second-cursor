@@ -28,10 +28,13 @@ enum Pointer {
     private static let touchSubtype: Int64 = 3
     private static let offscreen = Location(screen: CGPoint(x: -1, y: -1), local: CGPoint(x: -1, y: -1))
 
+    /// Each of these returns when its first event that can change anything (a press or a wheel tick) went out: the
+    /// app's answer can come before the call returns.
+    @discardableResult
     static func click(pid: pid_t, wid: CGWindowID, window: AXUIElement? = nil, at location: Location, button: MouseButton, count: Int,
-                      flags: CGEventFlags = []) {
+                      flags: CGEventFlags = []) -> Date {
         let both = !isBareSurface(pid: pid, wid: wid, window: window, at: location.screen)
-        withFocus(pid: pid, wid: wid) {
+        return withFocus(pid: pid, wid: wid) {
             switch button {
             case .left: leftClick(pid: pid, wid: wid, at: location, count: count, flags: flags, both: both)
             case .right: buttonClick(pid: pid, wid: wid, at: location, count: count, button: .right, flags: flags, both: both)
@@ -42,10 +45,11 @@ enum Pointer {
 
     /// Down at `from`, interpolated drags, up at `to`. Drags carry the same window addressing as
     /// clicks, so selection, note drawing and slider moves work without the real cursor.
+    @discardableResult
     static func drag(pid: pid_t, wid: CGWindowID, window: AXUIElement? = nil, from: Location, to: Location,
-                     flags: CGEventFlags = [], steps: Int = 16) {
+                     flags: CGEventFlags = [], steps: Int = 16) -> Date {
         let both = !isBareSurface(pid: pid, wid: wid, window: window, at: from.screen)
-        withFocus(pid: pid, wid: wid) {
+        return withFocus(pid: pid, wid: wid) {
             let source = CGEventSource(stateID: .hidSystemState)
             let group = clickGroupID()
             func post(_ type: CGEventType, _ location: Location, clickState: Int64, delayMs: UInt32) {
@@ -59,6 +63,7 @@ enum Pointer {
             post(.mouseMoved, from, clickState: 0, delayMs: 15)
             post(.leftMouseDown, offscreen, clickState: 1, delayMs: 1)
             post(.leftMouseUp, offscreen, clickState: 1, delayMs: 100)
+            let pressed = Date()
             post(.leftMouseDown, from, clickState: 1, delayMs: 40)
             let count = max(steps, 2)
             for step in 1...count {
@@ -67,25 +72,27 @@ enum Pointer {
                 post(.leftMouseDragged, Location(screen: lerp(from.screen, to.screen), local: lerp(from.local, to.local)), clickState: 1, delayMs: 12)
             }
             post(.leftMouseUp, to, clickState: 1, delayMs: 0)
+            return pressed
         }
     }
 
     /// SkyLight delivery is asynchronous: the target needs ~40 ms to take its synthetic focus, and keeps
     /// it ~100 ms after the last event so Chromium's renderer hop consumes the mouse-up before it goes.
-    private static func withFocus(pid: pid_t, wid: CGWindowID, _ body: () -> Void) {
+    private static func withFocus<T>(pid: pid_t, wid: CGWindowID, _ body: () -> T) -> T {
         let handoff = SkyLight.focusWithoutRaise(pid: pid, wid: wid)
         if handoff != nil { usleep(40_000) }
-        body()
+        let result = body()
         if let handoff {
             usleep(100_000)
             SkyLight.restore(handoff)
         }
+        return result
     }
 
     /// Stamped mouseMoved, then a down/up primer at (-1,-1) that satisfies Chromium's
     /// user-activation gate (and absorbs AppKit's first-click) without hitting any element,
     /// then the real pairs.
-    private static func leftClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, flags: CGEventFlags, both: Bool) {
+    private static func leftClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, flags: CGEventFlags, both: Bool) -> Date {
         let source = CGEventSource(stateID: .hidSystemState)
         let group = clickGroupID()
         let pairs = min(max(count, 1), 3)
@@ -95,27 +102,32 @@ enum Pointer {
             (.leftMouseDown, offscreen, 1, 1, 1),
             (.leftMouseUp, offscreen, 2, 1, 100),
         ]
+        let firstPress = steps.count
         for pair in 1...pairs {
             steps.append((.leftMouseDown, location, 3, Int64(pair), 1))
             steps.append((.leftMouseUp, location, 3, Int64(pair), pair < pairs ? 80 : 0))
         }
-        for step in steps {
+        var pressed = Date()
+        for (index, step) in steps.enumerated() {
             guard let event = CGEvent(mouseEventSource: source, mouseType: step.type, mouseCursorPosition: step.location.screen, mouseButton: .left)
             else { continue }
             stamp(event, pid: pid, wid: wid, location: step.location, clickState: step.clickState, buttonNumber: 0, group: group)
             SkyLight.setField(event, Field.mouseEventNumber, step.phase)
             event.flags = step.location.screen == offscreen.screen ? [] : flags
+            if index == firstPress { pressed = Date() }
             deliver(event, pid: pid, both: both)
             if step.delayMs > 0 { usleep(step.delayMs * 1000) }
         }
+        return pressed
     }
 
-    private static func buttonClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, button: CGMouseButton, flags: CGEventFlags, both: Bool) {
+    private static func buttonClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, button: CGMouseButton, flags: CGEventFlags, both: Bool) -> Date {
         let source = CGEventSource(stateID: .hidSystemState)
         let group = clickGroupID()
         let (down, up, number): (CGEventType, CGEventType, Int64) = button == .right
             ? (.rightMouseDown, .rightMouseUp, 1) : (.otherMouseDown, .otherMouseUp, 2)
         postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: group, both: both)
+        let pressed = Date()
         for pair in 1...min(max(count, 1), 3) {
             for type in [down, up] {
                 guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: location.screen, mouseButton: button)
@@ -126,12 +138,15 @@ enum Pointer {
                 usleep(type == down ? 28_000 : 80_000)
             }
         }
+        return pressed
     }
 
     /// `ticks` wheel notches at `location`; positive `dy` reveals content above, positive `dx` content to the left.
-    static func scroll(pid: pid_t, wid: CGWindowID, at location: Location, dx: Int32, dy: Int32, ticks: Int) {
+    @discardableResult
+    static func scroll(pid: pid_t, wid: CGWindowID, at location: Location, dx: Int32, dy: Int32, ticks: Int) -> Date {
         let source = CGEventSource(stateID: .hidSystemState)
         postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: clickGroupID(), both: true)
+        let ticked = Date()
         for _ in 0..<max(ticks, 1) {
             guard let event = CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
             else { continue }
@@ -144,6 +159,7 @@ enum Pointer {
             deliver(event, pid: pid, both: true)
             usleep(30_000)
         }
+        return ticked
     }
 
     /// A window that never saw a move keeps stale cursor-tracking state and ignores the next down.

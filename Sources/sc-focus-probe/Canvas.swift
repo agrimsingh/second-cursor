@@ -1,10 +1,12 @@
 // Canvas mode for e2e/ocr.py: a custom-drawn window, like a DAW or a game, whose text accessibility cannot see.
-//   usage: sc-focus-probe --canvas <word> --state <path> [--origin x,y] [--front]
+//   usage: sc-focus-probe --canvas <word> --state <path> [--origin x,y] [--front] [--paint-delay-ms n]
 // The canvas draws <word> and a few more at known places and exposes no accessibility children. Beside it sit an
 // accessibility button whose caption is only drawn ("Loop", labelled "Transport") and a real label ("Tempo 128").
 // Writes {"pid","window","words","button","label","clicks"} atomically to <path> at launch and after every click,
 // with every rect and click in window-local points (top-left origin). A click toggles "Stopped" and "Playing", so a
-// click delivered twice would leave it where it was.
+// click delivered twice would leave it where it was. With --paint-delay-ms, like Ableton, a click first changes what
+// accessibility sees (the label reads "Tempo 128 · Playing", with a value-changed notification) and repaints the
+// canvas only that much later.
 // It never activates and stays out of the Dock. It opens at --origin (global points, top-left: tests pass a point on
 // the agent display, so it never shows on the user's screen), else small at the bottom left behind other windows.
 import AppKit
@@ -42,11 +44,16 @@ private final class DrawnButton: NSView {
         .font: NSFont.systemFont(ofSize: 20), .foregroundColor: NSColor.black,
     ]
 
+    var onPress: (() -> Void)?
+
     override var isFlipped: Bool { true }
     override func isAccessibilityElement() -> Bool { true }
     override func accessibilityRole() -> NSAccessibility.Role? { .button }
     override func accessibilityLabel() -> String? { "Transport" }
-    override func accessibilityPerformPress() -> Bool { true }
+    override func accessibilityPerformPress() -> Bool {
+        onPress?()
+        return true
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor(white: 0.85, alpha: 1).setFill()
@@ -71,12 +78,14 @@ final class Canvas: NSObject, NSApplicationDelegate {
 
     private let origin: CGPoint?
     private let front: Bool
+    private let paintDelay: TimeInterval?
 
-    init(word: String, statePath: String?, origin: CGPoint?, front: Bool) {
+    init(word: String, statePath: String?, origin: CGPoint?, front: Bool, paintDelay: TimeInterval? = nil) {
         self.word = word
         self.statePath = statePath
         self.origin = origin
         self.front = front
+        self.paintDelay = paintDelay
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -89,11 +98,10 @@ final class Canvas: NSObject, NSApplicationDelegate {
         ]
         canvas.onClick = { [unowned self] point in
             clicks.append(["x": point.x, "y": window.frame.height - point.y])
-            canvas.words[3].text = canvas.words[3].text == "Stopped" ? "Playing" : "Stopped"
-            canvas.needsDisplay = true
-            write()
+            toggle()
         }
         content.addSubview(canvas)
+        button.onPress = { [unowned self] in toggle() }
         button.frame = NSRect(x: 280, y: 170, width: 130, height: 44)
         content.addSubview(button)
         label = NSTextField(labelWithString: "Tempo 128")
@@ -113,6 +121,19 @@ final class Canvas: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    private func toggle() {
+        canvas.words[3].text = canvas.words[3].text == "Stopped" ? "Playing" : "Stopped"
+        if let paintDelay {
+            label.stringValue = "Tempo 128 · \(canvas.words[3].text)"
+            label.sizeToFit()
+            NSAccessibility.post(element: label!, notification: .valueChanged)
+            DispatchQueue.main.asyncAfter(deadline: .now() + paintDelay) { self.canvas.needsDisplay = true }
+        } else {
+            canvas.needsDisplay = true
+        }
+        write()
+    }
 
     /// Window-local points, top-left origin, as Second Cursor reports frames.
     private func entry(_ text: String, _ rect: CGRect, in view: NSView) -> [String: Any] {

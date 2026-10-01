@@ -157,7 +157,8 @@ let avoid = value("--avoid").flatMap { text -> CGRect? in
 let app = NSApplication.shared
 let probe: NSApplicationDelegate
 if let word = value("--canvas") {
-    probe = Canvas(word: word, statePath: statePath, origin: origin, front: arguments.contains("--front"))
+    probe = Canvas(word: word, statePath: statePath, origin: origin, front: arguments.contains("--front"),
+                   paintDelay: value("--paint-delay-ms").flatMap(Double.init).map { $0 / 1000 })
     app.setActivationPolicy(.accessory)
 } else if arguments.contains("--clicks") {
     probe = Clicks(statePath: statePath, origin: origin)

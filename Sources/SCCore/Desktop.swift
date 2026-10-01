@@ -41,15 +41,18 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// The latest action on each window, and what has happened since: reads settle once and captures wait for a
     /// repaint once per action.
     private struct Activity {
-        let started: Date
         let at: Date
-        /// An accessibility call returns once the app has handled it, so notifications during it are its answer.
-        /// Input sent as events is handled after it returns, so only later notifications count.
-        let synchronous: Bool
+        /// Notifications after this are the app's answer. An accessibility call returns once the app has handled it,
+        /// so it is when the call started. Pointer input is handled as it arrives, while the call still runs (a click
+        /// holds its focus handoff 100 ms past the last event), so it is when the first press or wheel tick went out.
+        /// Other events are handled after the call returns.
+        let answers: Date
         var settled = false
         var painted = false
     }
     private var activity: [CGWindowID: Activity] = [:]
+    /// When each window's pointer input went out, kept until its action is marked.
+    private var delivered: [CGWindowID: Date] = [:]
     private static let synchronousRoutes: Set<String> = [
         "ax_press", "ax_value", "ax_selected_text", "ax_selection", "ax_action", "ax_scroll_page", "ax_scrollbar",
     ]
@@ -205,15 +208,21 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     }
 
     /// Custom-drawn apps (Ableton, games) update their accessibility tree before they repaint, so a capture right
-    /// after the tree settles can show the previous frame. Once per action, give the window a frame's worth of time.
+    /// after the tree settles can show the previous frame. Once per action, a capture waits until the window has had
+    /// `repaintTime` since its last change: the action, or the app's latest notification after it.
     private func capture(_ wid: CGWindowID) async throws -> Screenshot {
         await paintWait(wid)
         return try await Capture.window(wid)
     }
 
+    private static let repaintTime: TimeInterval = 0.15
+
     private func paintWait(_ wid: CGWindowID) async {
-        guard claimPaintWait(wid) else { return }
-        await Timing.measureAsync("paint") { try? await Task.sleep(nanoseconds: 150_000_000) }
+        guard var changed = claimPaintWait(wid) else { return }
+        if let pid = WindowList.record(wid)?.pid, let last = changes.state(pid)?.last, last > changed { changed = last }
+        let remaining = Self.repaintTime - Date().timeIntervalSince(changed)
+        guard remaining > 0 else { return }
+        await Timing.measureAsync("paint") { try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000)) }
     }
 
     public func click(windowID: UInt32, target: ClickTarget, button: MouseButton, count: Int, modifiers: [String]) async throws -> ActionResult {
@@ -413,9 +422,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         }
         showCursor(record, .drag(from: Point(x: record.bounds.minX + from.x, y: record.bounds.minY + from.y),
                                  to: Point(x: record.bounds.minX + to.x, y: record.bounds.minY + to.y)))
-        Pointer.drag(pid: record.pid, wid: record.id, window: record.isOnScreen ? try? resolver.resolve(pid: record.pid, wid: record.id) : nil,
-                     from: Self.location(record, local: CGPoint(x: from.x, y: from.y)),
-                     to: Self.location(record, local: CGPoint(x: to.x, y: to.y)), flags: flags)
+        noteDelivered(record.id, at: Pointer.drag(
+            pid: record.pid, wid: record.id, window: record.isOnScreen ? try? resolver.resolve(pid: record.pid, wid: record.id) : nil,
+            from: Self.location(record, local: CGPoint(x: from.x, y: from.y)),
+            to: Self.location(record, local: CGPoint(x: to.x, y: to.y)), flags: flags))
         return ActionResult(route: "skylight_drag")
     }
 
@@ -480,8 +490,16 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     // MARK: Settling
 
     private func markAction(on wid: CGWindowID, started: Date, route: String) {
+        let at = Date()
         lock.lock()
-        activity[wid] = Activity(started: started, at: Date(), synchronous: Self.synchronousRoutes.contains(route))
+        let input = delivered.removeValue(forKey: wid).flatMap { $0 >= started ? $0 : nil }
+        activity[wid] = Activity(at: at, answers: input ?? (Self.synchronousRoutes.contains(route) ? started : at))
+        lock.unlock()
+    }
+
+    private func noteDelivered(_ wid: CGWindowID, at time: Date) {
+        lock.lock()
+        delivered[wid] = time
         lock.unlock()
     }
 
@@ -500,14 +518,14 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         return !entry.settled
     }
 
-    /// True at most once per action, for a window acted on in the last 2 s.
-    private func claimPaintWait(_ wid: CGWindowID) -> Bool {
+    /// When the window was acted on, at most once per action, for a window acted on in the last 2 s.
+    private func claimPaintWait(_ wid: CGWindowID) -> Date? {
         lock.lock()
         defer { lock.unlock() }
-        guard var entry = activity[wid], Date().timeIntervalSince(entry.at) < 2, !entry.painted else { return false }
+        guard var entry = activity[wid], Date().timeIntervalSince(entry.at) < 2, !entry.painted else { return nil }
         entry.painted = true
         activity[wid] = entry
-        return true
+        return entry.at
     }
 
     /// Waits until the app has finished reacting to `action` (default: the window's latest action), so an observation
@@ -535,7 +553,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// Waits for the app's first notification after the action (input events and menus are handled a little later,
     /// so up to 250 ms), then until it has posted nothing for 60 ms, and never less than 30 ms after the action.
     private func settle(_ pid: pid_t, after action: Activity, cap: TimeInterval) -> Bool {
-        let answers = action.synchronous ? action.started : action.at
+        let answers = action.answers
         let deadline = action.at.addingTimeInterval(cap)
         let started = Date()
         var answered = false
@@ -979,7 +997,6 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 if !items.isEmpty { pb.writeObjects(items) }
             }
             let result: ActionResult
-            let started = Date()
             do {
                 result = try self.performKey(windowID, chord: Keyboard.parse("cmd+v"))
             } catch {
@@ -990,7 +1007,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             // An unconfirmed press or queued keystrokes may read the clipboard later; restoring now could paste
             // the user's own clipboard into the app instead.
             if result.verified == true {
-                self.settleNow(windowID, after: Activity(started: started, at: Date(), synchronous: false))
+                let pasted = Date()
+                self.settleNow(windowID, after: Activity(at: pasted, answers: pasted))
                 restore()
             } else {
                 note += (note.hasSuffix(" ") ? "" : "; ")
@@ -1041,8 +1059,9 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             throw SCError.invalidArgument("Point (\(local.x), \(local.y)) is outside window \(record.id) (\(Int(record.bounds.width))x\(Int(record.bounds.height)))")
         }
         showCursor(record, .click(at: Point(x: record.bounds.minX + local.x, y: record.bounds.minY + local.y), count: count))
-        Pointer.click(pid: record.pid, wid: record.id, window: record.isOnScreen ? try? resolver.resolve(pid: record.pid, wid: record.id) : nil,
-                      at: Self.location(record, local: local), button: button, count: count, flags: flags)
+        noteDelivered(record.id, at: Pointer.click(
+            pid: record.pid, wid: record.id, window: record.isOnScreen ? try? resolver.resolve(pid: record.pid, wid: record.id) : nil,
+            at: Self.location(record, local: local), button: button, count: count, flags: flags))
         return ActionResult(route: "skylight_pointer")
     }
 
@@ -1105,7 +1124,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         case .right: (-3, 0)
         }
         showCursor(record, .scroll(at: Point(x: record.bounds.minX + local.x, y: record.bounds.minY + local.y)))
-        Pointer.scroll(pid: record.pid, wid: record.id, at: Self.location(record, local: local), dx: dx, dy: dy, ticks: amount)
+        noteDelivered(record.id, at: Pointer.scroll(pid: record.pid, wid: record.id, at: Self.location(record, local: local),
+                                                    dx: dx, dy: dy, ticks: amount))
         return ActionResult(route: "skylight_wheel")
     }
 
