@@ -56,6 +56,9 @@ public struct SCConfig: Codable, Sendable {
     /// Append each tool call's duration and the time each phase took (settling, the cursor, the tree walk, capture,
     /// the browser round trip) to logs/timings.jsonl. Results are unchanged.
     public var recordTimings: Bool?
+    /// "rules" condenses full window and page reads of 80 lines or more (footers and side panels hidden, long lists cut
+    /// to their first chunk), each hidden run returned by `expand`; "off" (nil) returns them whole.
+    public var condenseOutlines: String?
 
     public init(port: Int, token: String, blockedBundleIDs: [String], confirmationRequiredTools: [String]) {
         self.port = port

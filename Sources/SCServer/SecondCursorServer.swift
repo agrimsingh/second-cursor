@@ -51,7 +51,7 @@ public final class SecondCursorServer: @unchecked Sendable {
     public func start(config: SCConfig) async throws {
         let router = ToolRouter(desktop: desktop, agentDisplay: agentDisplay, browser: browser, config: config,
                                 connectionCount: { [listener] in listener.activeConnectionCount })
-        let tools = ToolCatalog.advertised(surface: config.toolSurface)
+        let tools = ToolCatalog.advertised(surface: config.toolSurface, condensing: config.condenseOutlines == "rules")
         // browser_repl's description is all its client needs; the desktop instructions would only mislead.
         let instructions = config.toolSurface == "repl" ? nil : Self.instructions
         let pipeline = StandardValidationPipeline(validators: [

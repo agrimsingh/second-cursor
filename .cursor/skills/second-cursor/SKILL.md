@@ -25,6 +25,8 @@ If tools fail with "not running" or permission errors, run `SecondCursor doctor`
 
 To find one element in a big window (a button, field or row), call `find_elements` with `text` and/or `role` instead of reading the whole outline again: it searches your latest observation, including elements a truncated outline left out, and returns their `[index]` lines.
 
+A full read of a big window or page can come condensed: long lists keep their first rows, and the rest collapse into `… N lines hidden (expand "r3")` lines. Hidden elements stay actionable by index or ref, and `find_elements` searches them. To read a hidden part, pass its id as `expand` to the same read tool instead of reading again.
+
 Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`, and on tabs those open (a result's `events` names them).
 
 When `browser_repl` is listed, use it for multi-step work in a browser tab (going through a list, filling a form, repeating an action per row): one script with a Playwright-compatible `page` loops over the page's controls in a call, where discrete browser tools take one call per click. Read the page again after actions that change it (a list that reorders, pages, or gains items), and handle the errors it throws: a covered or ambiguous target is refused, never clicked blindly.

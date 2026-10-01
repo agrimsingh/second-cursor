@@ -23,6 +23,7 @@ final class ToolRouter: Sendable {
     let sessions: Sessions
     let repl: BrowserREPL
     let connectionCount: @Sendable () -> Int
+    let hiddenParts: HiddenParts?
     private let timingLog: TimingLog?
     private static let toolNames = Set(ToolCatalog.tools.map(\.name))
 
@@ -32,6 +33,7 @@ final class ToolRouter: Sendable {
     ) {
         self.connectionCount = connectionCount
         self.timingLog = config.recordTimings == true ? TimingLog() : nil
+        self.hiddenParts = config.condenseOutlines == "rules" ? HiddenParts() : nil
         self.desktop = desktop
         self.agentDisplay = agentDisplay
         self.browser = browser

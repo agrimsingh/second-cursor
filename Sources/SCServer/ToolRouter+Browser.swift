@@ -45,18 +45,27 @@ extension ToolRouter {
 
         case "browser_open":
             let data=try await browser.command("tabs.open",params:JSONSerialization.data(withJSONObject:["url":args.string("url")]))
-            return ToolOutput(json:try JSONSerialization.jsonObject(with:data) as? [String:Any] ?? [:])
+            var json = try JSONSerialization.jsonObject(with:data) as? [String:Any] ?? [:]
+            if var observation = json["observation"] as? [String: Any], let tab = (json["tab"] as? [String: Any])?["id"] as? Int {
+                condense(&observation, tabID: tab)
+                json["observation"] = observation
+            }
+            return ToolOutput(json: json)
 
         case "browser_navigate":
             let tab = try await browser.navigate(tabID: try args.int("tab_id"), url: try args.string("url"))
             return await observed([:], base: ["tab": Shape.tab(tab)], tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_snapshot":
+            if let expanded = try expandedParts(args, target: "tab:\(try args.int("tab_id"))", noun: "tab") {
+                return ToolOutput(json: ["outline": expanded.text, "expanded": expanded.ids, "is_diff": false])
+            }
             let params = try JSONSerialization.data(withJSONObject: [
                 "tabId": args.int("tab_id"), "full": args.bool("full", default: false),
                 "structured": args.bool("structured", default: false),
             ])
             var json = try JSONSerialization.jsonObject(with: await browser.command("tab.snapshot",params:params)) as? [String:Any] ?? [:]
+            condense(&json, tabID: try args.int("tab_id"))
             var images: [Screenshot] = []
             if try args.bool("include_screenshot",default:false) {
                 let shot = try await browser.screenshot(tabID:args.int("tab_id")); images=[shot]; json["screenshot"]=Shape.screenshot(shot)
@@ -171,6 +180,13 @@ extension ToolRouter {
             json["observation_error"] = Self.message(for: error)
             return ToolOutput(json: json)
         }
+    }
+
+    /// Only reads are condensed: an action's observation shows what the action revealed, which can sit in a part the
+    /// rules would hide (a menu opened far down a list, on a page that re-renders whole).
+    private func condense(_ read: inout [String: Any], tabID: Int) {
+        guard let hiddenParts, read["is_diff"] as? Bool != true, let outline = read["outline"] as? String else { return }
+        read["outline"] = hiddenParts.condense(outline, style: .browser, target: "tab:\(tabID)", tool: "browser_snapshot")
     }
 
     private static func screenshot(_ value: Any?) -> Screenshot? {

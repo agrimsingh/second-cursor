@@ -48,12 +48,23 @@ enum ToolCatalog {
     /// What tools/list shows: the single-action tools and batch, ("compact") act in their place, ("full") browser_repl
     /// as well, or ("repl") browser_repl alone. Models offered both browser_repl and the discrete browser tools mixed
     /// them and ran slower than with either, so browser_repl is listed only when asked for.
-    static func advertised(surface: String?) -> [Tool] {
+    /// `expand` is listed only when reads are condensed (`condenseOutlines`), since nothing is hidden otherwise.
+    static func advertised(surface: String?, condensing: Bool = false) -> [Tool] {
         if surface == "repl" { return tools.filter { $0.name == "browser_repl" } }
         let hidden: Set<String> = surface == "compact" ? compactHiddenTools.union(["browser_repl"])
             : surface == "full" ? ["act"] : ["act", "browser_repl"]
-        return tools.filter { !hidden.contains($0.name) }
+        return tools.filter { !hidden.contains($0.name) }.map { tool in
+            guard !condensing, case .object(var schema) = tool.inputSchema, case .object(var properties)? = schema["properties"],
+                  properties.removeValue(forKey: "expand") != nil
+            else { return tool }
+            schema["properties"] = .object(properties)
+            return Tool(name: tool.name, description: tool.description, inputSchema: .object(schema), annotations: tool.annotations)
+        }
     }
+
+    private static let expand = stringArray(
+        "Ids of hidden parts of a condensed read (its '… N lines hidden (expand \"r3\")' lines) to return whole, as they "
+            + "were read, without reading again.")
 
     private static let actDescription =
         "Act on one window: run a list of steps strictly in order, then get one observation after the UI settles. This is the way to act, with one step or many: put every step you already know in one call (pressing a known series of buttons, filling known fields, typing followed by a shortcut), and end the list before any step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet); then look at the observation and send the next list. Each step is a tool name (click, type_text, press_key, set_value, scroll, drag, perform_action, wait) plus that action's arguments. Element indexes come from get_window_state or find_elements and are not refreshed between steps. Pixel steps (x/y) take coordinate_space and stop the list if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the list stops at the first failure. The observation is a diff like get_window_state unless full=true."
@@ -125,6 +136,7 @@ enum ToolCatalog {
                         "ocr": boolean(
                             "Also recognize the text drawn in the window (on device) and merge what the outline lacks. Use it when you can see text the outline does not have: custom-drawn apps (DAWs, games), canvases, images of text. Text already in the outline is left out; text on an element is added to its line as ocr=\"...\"; other text becomes a line such as text \"Export\" (412,88 40x14), which has no index: click it with x/y at the center of its frame. Returns ocr_ms and ocr_count, or ocr_error with the outline when recognition fails. Costs a few hundred ms, more on large windows.",
                             default: false),
+                        "expand": expand,
                     ]),
                 annotations: .init(readOnlyHint: true)
             ),
@@ -326,6 +338,7 @@ enum ToolCatalog {
                         "include_screenshot": boolean("Attach a PNG of the viewport.", default: false),
                         "structured": boolean(
                             "Also return an elements JSON array on full reads, for code consumers.", default: false),
+                        "expand": expand,
                     ], required: ["tab_id"]),
                 annotations: .init(readOnlyHint: true)
             ),

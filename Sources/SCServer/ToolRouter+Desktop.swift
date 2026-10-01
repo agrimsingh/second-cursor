@@ -110,6 +110,9 @@ extension ToolRouter {
             return try await runBatch(args)
 
         case "get_window_state":
+            if let expanded = try expandedParts(args, target: "window:\(try args.windowID())", noun: "window") {
+                return ToolOutput(json: ["tree": expanded.text, "expanded": expanded.ids, "is_diff": false])
+            }
             let structured = try args.bool("structured", default: false)
             let scope = try args.scope()
             let options = SnapshotOptions(
@@ -122,9 +125,12 @@ extension ToolRouter {
                 ocr: try args.bool("ocr", default: false)
             )
             let snapshot = try await desktop.windowState(windowID: try args.windowID(), options: options)
-            return ToolOutput(
-                json: await snapshotJSON(snapshot, structured: structured),
-                images: snapshot.screenshot.map { [$0] } ?? [])
+            var json = await snapshotJSON(snapshot, structured: structured)
+            if let hiddenParts, !snapshot.isDiff, snapshot.scope == nil, snapshot.scopeLabel == nil {
+                json["tree"] = hiddenParts.condense(
+                    snapshot.tree, style: .native, target: "window:\(snapshot.window.id)", tool: "get_window_state")
+            }
+            return ToolOutput(json: json, images: snapshot.screenshot.map { [$0] } ?? [])
 
         case "find_elements":
             let text = try args.optionalString("text")?.trimmingCharacters(in: .whitespacesAndNewlines)

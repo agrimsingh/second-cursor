@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """A live-site version of e2e/jev_prune.py: a model finds multi-pack cat food on Shopee Singapore that arrives in
-1-2 days, directly or through the Jev pruning proxy.
+1-2 days, directly, through the Jev pruning proxy (pruned), or through the proxy with the rules the server's
+condenseOutlines: "rules" applies (rules). The rules go through the proxy because this run targets the user's installed
+app, whose config and version the run must not change.
 
 It always targets the user's installed app: Shopee refuses the isolated headless test browser, so the agent's tabs
 open in the user's logged-in Chrome, in the Second Cursor tab group. Runs are read-only: the prompt forbids the cart,
@@ -15,7 +17,7 @@ Ways the comparison can mislead:
   - The score trusts what the agent reports; the call transcript in agent/ shows what it read.
   - The proxy knows the goal because the harness gives it GOAL.
 
-Usage:  python3 e2e/jev_shopee.py --arms direct:M,pruned:M [--repeat N] [--timeout S]
+Usage:  python3 e2e/jev_shopee.py --arms direct:M,pruned:M,rules:M [--repeat N] [--timeout S]
 Output: e2e/artifacts/shopee-<ts>-<arm>/ report.md, shopee.json (answer, scores, timing, tokens), agent/, and for
         pruned arms prune/ and jev.jsonl; with more than one run, e2e/artifacts/shopee-compare-<ts>.md
 """
@@ -26,7 +28,7 @@ import time
 import urllib.request
 
 import run
-from jev_prune import Condenser, CondensingProxy, JevKeep, condensing_note, condensing_stats
+from jev_prune import Condenser, CondensingProxy, JevKeep, RuleKeep, condensing_note, condensing_stats
 from jev_triage import SERVER, Jev, jev_key, option, run_agent
 from run import SCENARIOS, Skip
 
@@ -100,8 +102,9 @@ def trial(kind, model, timeout):
             headers={"Authorization": f"Bearer {ctx.mcp.token}", "Content-Type": "application/json"}), timeout=15)
 
         prompt = PROMPT.format(server=SERVER, url=START, goal=GOAL)
-        if kind == "pruned":
-            condenser = Condenser(JevKeep(Jev(key, ctx.run.dir / "jev.jsonl"), GOAL), ctx.run.dir / "condensed")
+        if kind in ("pruned", "rules"):
+            keep = JevKeep(Jev(key, ctx.run.dir / "jev.jsonl"), GOAL) if kind == "pruned" else RuleKeep()
+            condenser = Condenser(keep, ctx.run.dir / "condensed")
             with CondensingProxy(ctx.mcp.url, condenser) as proxy:
                 result = run_agent(ctx, model, prompt, START, timeout, mcp_url=proxy.url)
             result.update(condensing_stats(condenser, proxy))
@@ -145,8 +148,8 @@ def compare(rows):
 
 def parse_arm(spec):
     kind, _, model = spec.partition(":")
-    if kind not in ("direct", "pruned"):
-        raise SystemExit(f"unknown arm {spec!r}: use direct:<model> or pruned:<model>")
+    if kind not in ("direct", "pruned", "rules"):
+        raise SystemExit(f"unknown arm {spec!r}: use direct:<model>, pruned:<model> or rules:<model>")
     return kind, model or "grok-4.7-medium-fast"
 
 

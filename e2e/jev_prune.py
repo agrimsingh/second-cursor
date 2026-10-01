@@ -15,6 +15,8 @@ Arms, each against a fresh test instance: cursor-agent -p with model M and MCP t
              the goal needs it.
   rules:M    The same with RuleKeep: no model and no goal; footers and side panels hidden, long lists cut to their
              first chunk.
+  product:M  The same rules built into the server (config condenseOutlines: "rules", Sources/SCServer/
+             OutlineCondenser.swift), with no proxy.
 Each run of hidden chunks becomes one '… N lines hidden (expand "r3")' line; browser_snapshot with expand returns
 those lines from the read they were hidden in, so the model can look inside one part without taking everything back.
 
@@ -25,7 +27,7 @@ Ways the comparison can mislead, and what the run does about each:
   - A model that skims picks a look-alike: the score counts every setting that changed besides the four in EXPECTED.
   - One run is noise: --repeat N, with the arms alternating in each round.
 
-Usage:  python3 e2e/jev_prune.py --arms direct:M,jev:M,rules:M [--repeat N] [--timeout S]
+Usage:  python3 e2e/jev_prune.py --arms direct:M,jev:M,rules:M,product:M [--repeat N] [--timeout S]
 Key:    TYPESAFE_API_KEY, or ~/.config/typesafe/key (jev arms)
 Output: e2e/artifacts/prune-<ts>-<arm>/ report.md, transcript.jsonl, prune.json (score, timing, tokens), agent/ (as in
         jev_triage), and for condensed arms condensed/ (every outline before and after) and, for jev, jev.jsonl; with
@@ -33,6 +35,7 @@ Output: e2e/artifacts/prune-<ts>-<arm>/ report.md, transcript.jsonl, prune.json 
 """
 import http.server
 import json
+import re
 import sys
 import threading
 import time
@@ -363,6 +366,26 @@ def condensing_stats(condenser, proxy):
             "keep_s": round(sum(s["keep_s"] for s in stats), 1)}
 
 
+def product_stats(agent_dir):
+    """condensing_stats for the server's own condensing, from the agent's calls and the headers of what they returned."""
+    expands, headers = 0, []
+    for line in (agent_dir / "agent.jsonl").read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "tool_call":
+            continue
+        call = json.dumps(event.get("tool_call") or {})
+        if event.get("subtype") == "started":
+            expands += '\\"expand\\"' in call or '"expand"' in call
+        elif event.get("subtype") == "completed":
+            headers += re.findall(r"\(condensed: (\d+) of (\d+) lines shown", call)
+    return {"condensed_outlines": len(headers), "expand_requests": expands,
+            "outline_lines": sum(int(total) for _, total in headers),
+            "shown_lines": sum(int(shown) for shown, _ in headers), "keep_s": 0}
+
+
 def score(changes, answer):
     done = {key: changes.get(key) == value for key, value in EXPECTED.items()}
     found_amount = INVOICE_AMOUNT in answer
@@ -385,6 +408,9 @@ def trial(kind, model, timeout):
             prompt = PROMPT.format(server=SERVER, url=url, goal=GOAL)
             if kind == "direct":
                 result = run_agent(ctx, model, prompt, url, timeout)
+            elif kind == "product":
+                result = run_agent(ctx, model, prompt, url, timeout)
+                result.update(product_stats(ctx.run.dir / "agent"))
             else:
                 if kind == "jev":
                     key = jev_key()
@@ -442,8 +468,8 @@ def compare(rows):
 
 def parse_arm(spec):
     kind, _, model = spec.partition(":")
-    if kind not in ("direct", "jev", "rules"):
-        raise SystemExit(f"unknown arm {spec!r}: use direct:<model>, jev:<model> or rules:<model>")
+    if kind not in ("direct", "jev", "rules", "product"):
+        raise SystemExit(f"unknown arm {spec!r}: use direct:<model>, jev:<model>, rules:<model> or product:<model>")
     return kind, model or "grok-4.7-medium-fast"
 
 
@@ -454,7 +480,10 @@ if __name__ == "__main__":
     for _ in range(repeat):
         for kind, model in arms:
             SCENARIOS[:] = [trial(kind, model, timeout)]
-            attempt = run.Run(config_overrides={"approvals": "allow", "appApproval": "off"}, browser=True)
+            config = {"approvals": "allow", "appApproval": "off"}
+            if kind == "product":
+                config["condenseOutlines"] = "rules"
+            attempt = run.Run(config_overrides=config, browser=True)
             renamed = attempt.dir.with_name(f"prune-{attempt.dir.name}-{kind}-{model}")
             attempt.dir.rename(renamed)
             attempt.dir = renamed
