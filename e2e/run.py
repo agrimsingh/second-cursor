@@ -472,7 +472,11 @@ class Context:
                              on_agent_display=on_agent_display)
         pid = launched["app"]["pid"]
         self.kill_on_exit(pid)
-        return self.wait_for_window("TextEdit", pid=pid, title=filename)
+        window = self.wait_for_window("TextEdit", pid=pid, title=filename)
+        if on_agent_display and not window.get("on_agent_display") and observe()["main_space_full_screen"]:
+            raise Skip("the user is viewing a full-screen app, so the new window opened on a desktop Space macOS "
+                       "won't let it leave (see launch_on_hidden_space); rerun from a desktop Space")
+        return window
 
     def tree(self, window_id, **opts):
         """Always the full tree: scenarios parse indexes from it. Diffs are exercised by tree_diffs."""
