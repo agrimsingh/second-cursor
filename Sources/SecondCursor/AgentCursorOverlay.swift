@@ -97,7 +97,10 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
     }
 
     /// Like Codex: the action waits until the user can see the cursor land, but never longer than this.
-    static let arrivalTimeout: TimeInterval = 1.5
+    static let arrivalTimeout: TimeInterval = 0.4
+    /// How long any move or appearance takes to reach its target, whatever the distance: long enough to follow by
+    /// eye, short enough that the action waiting on it barely slows. extension/cursor.js uses the same.
+    private static let glide: TimeInterval = 0.15
 
     func activity() -> AgentActivityStatus {
         lock.lock()
@@ -264,7 +267,7 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         if appearing {
             appear()
             if let caption { showPill(caption) }
-            arrival = 0.18
+            arrival = Self.glide
         } else {
             arrival = travel(from: start, to: target)
         }
@@ -287,7 +290,7 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 0
         fade.toValue = 1
-        fade.duration = 0.18
+        fade.duration = Self.glide
         cursor.add(fade, forKey: "appear-fade")
         guard !reduceMotion else { return }
         let grow = Self.spring("transform.scale", response: 0.42, damping: 0.86)
@@ -312,12 +315,12 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         let duration: CFTimeInterval
         let arrival: TimeInterval
         if distance < 200 {
-            let spring = Self.spring("position", response: 0.2, damping: 0.86)
+            let spring = Self.spring("position", response: Self.glide, damping: 0.86)
             spring.fromValue = NSValue(point: start)
             spring.toValue = NSValue(point: target)
             duration = spring.duration
             // An underdamped spring first reaches its target after about one response period.
-            arrival = 0.2
+            arrival = Self.glide
             cursor.add(spring, forKey: "move")
         } else {
             let arc = CAKeyframeAnimation(keyPath: "position")
@@ -326,7 +329,7 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
             path.addQuadCurve(to: target, control: arcControl(from: start, to: target))
             arc.path = path
             arc.calculationMode = .paced
-            arc.duration = min(max(0.28 + distance / 4000, 0.28), 0.5)
+            arc.duration = Self.glide
             arc.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 0.9, 0.35, 1)
             duration = arc.duration
             arrival = arc.duration

@@ -79,7 +79,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         default: return cursor.present(event)
         }
         Timing.measure("cursor") {
-            cursor.present(Self.target(for: point, in: record))
+            cursor.present(Timing.measure("cursor_anchor") { Self.target(for: point, in: record) })
             cursor.present(event)
         }
     }

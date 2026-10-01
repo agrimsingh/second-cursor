@@ -16,9 +16,10 @@ Ways this can fail, each caught below:
 - One session's turn end removes presence that another session still owns, or closing a session leaves it behind.
 - The menu bar item does not follow the same lifecycle ("Agent active: <app>" while working, "Idle" after), or it
   and the `status` tool's `agent_activity` disagree about where the arrow is.
-- A pointer action waits longer than the arrow's travel: arrival never fires, so every action sits out the 1.5 s
-  timeout; a drag waits for its own animation; a click re-runs the appear animation while the arrow rests on screen;
-  or a keyboard action waits at all.
+- A pointer action waits longer than the arrow's travel: arrival never fires, so every action sits out the 0.4 s
+  timeout; a long move takes longer than the 0.15 s glide; a click that does not move the arrow waits anyway; a drag
+  waits for its own animation; a click re-runs the appear animation while the arrow rests on screen; or a keyboard
+  action waits at all.
 - The arrow shows where the user cannot see its window: over another app's window covering the target; or it stays
   hidden once the window is uncovered; or a covered action still waits for the arrow; or covering the window also
   hides presence (status and the menu bar must still say the agent is active).
@@ -400,15 +401,26 @@ def cursor_arrival_timing(ctx):
     require_visible(ctx)
     ctx.call("click", window_id=wid, x=far[0], y=far[1], observe="none")
     require_visible(ctx, "the far corner of the text area")
+    first = len(ctx.run.instance.timings())
+    # The first goes nowhere: the arrow already rests at the far corner.
     resting = [timed("click", x=p[0], y=p[1]) for p in (far, local, far, local, far, local)]
     drag = timed("drag", from_x=local[0], from_y=local[1], to_x=far[0], to_y=far[1])
     typing = timed("type_text", text="Z")
-    numbers = f"appearing={appearing:.3f}s resting={[round(s, 3) for s in resting]} drag={drag:.3f}s type={typing:.3f}s"
+    time.sleep(0.3)
+    # The click's wait for the arrow alone, apart from the pointer path's own sleeps and its noise.
+    waits = [(t["phases"].get("cursor", 0) - t["phases"].get("cursor_anchor", 0)) / 1000
+             for t in ctx.run.instance.timings(first) if t["tool"] == "click"]
+    numbers = (f"appearing={appearing:.3f}s resting={[round(s, 3) for s in resting]} drag={drag:.3f}s "
+               f"type={typing:.3f}s arrow waits={[round(s, 3) for s in waits]}")
     print(f"      {numbers}")
     # The pointer path itself sleeps ~0.26 s per click and ~0.49 s per drag. A click then waits for the arrow to
-    # land: at most 0.5 s for the long far<->local arcs, 0.18 s to appear. The drag starts where the arrow rests.
-    ctx.check("a click waits for the arrow to land, not for the 1.5 s timeout (median < 0.85 s, max < 1.2 s)",
-              statistics.median(resting) < 0.85 and max(resting) < 1.2, numbers)
+    # land, 0.15 s however far it goes, or to appear. The drag starts where the arrow rests.
+    ctx.check("a click waits for the arrow to land (~0.15 s), not for the 0.4 s timeout: arrow wait median "
+              "0.1-0.25 s, every one under 0.39 s", len(waits) == 6 and 0.1 <= statistics.median(waits) < 0.25
+              and max(waits) < 0.39, numbers)
+    ctx.check("a click that does not move the arrow does not wait for it (< 0.06 s)", bool(waits) and waits[0] < 0.06,
+              numbers)
+    ctx.check("so a click on a resting arrow takes under 0.75 s (median)", statistics.median(resting) < 0.75, numbers)
     ctx.check("the first click waits only for the appear animation (< 0.6 s)", appearing < 0.6, numbers)
     ctx.check("a drag does not wait for its own drag animation (< 0.8 s)", drag < 0.8, numbers)
     ctx.check("a keyboard action is not held up by the arrow (< 0.5 s)", typing < 0.5, numbers)

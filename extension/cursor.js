@@ -6,7 +6,7 @@ import { withTimeout } from "./errors.js";
 const WORLD = "SecondCursorOverlay";
 const IDLE_MS = 60000;
 // Pointer input waits for the cursor to arrive, at most this long.
-const WAIT_MS = 1500;
+const WAIT_MS = 400;
 // A caption arrives just before its action; the action, not the caption, decides where the cursor appears.
 const CAPTION_GRACE_MS = 250;
 
@@ -345,6 +345,9 @@ function overlayProgram(c) {
     add(pill, "caret", "span");
     document.documentElement.append(host);
 
+    // Seconds for any move or appearance to reach its target, whatever the distance; the native overlay uses the same.
+    // A spring first reaches its target after about one response period.
+    const GLIDE = 0.15;
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
     const ease = (u) => (u < 0.5 ? 2 * u * u : 1 - 2 * (1 - u) * (1 - u));
     const now = () => performance.now();
@@ -394,9 +397,9 @@ function overlayProgram(c) {
       o.moving = true;
       if (reduced) Object.assign(o, { kind: "linear", dur: 0.12 });
       else if (slide) Object.assign(o, { kind: "slide", dur: 0.25 });
-      else if (d < 200) Object.assign(o, { kind: "spring", r: 0.2 });
       else {
-        Object.assign(o, { kind: "spring", r: clamp(0.28 + d / 4000, 0.28, 0.5) });
+        Object.assign(o, { kind: "spring", r: GLIDE });
+        if (d < 200) return;
         // A quarter of the distance off the midpoint, on the side that stays on screen, bowing upward if both do.
         const { w, h } = viewport();
         const mid = { x: (from.x + target.x) / 2, y: (from.y + target.y) / 2 };
@@ -633,7 +636,7 @@ function overlayProgram(c) {
         arrive();
       } else if (target.x !== o.to.x || target.y !== o.to.y || !o.moving) aim(target);
       // Decided before a drag's second leg starts: the drag waits for its first leg, an appear for its fade-in.
-      const wait = !c.wait || document.visibilityState !== "visible" ? 0 : appearing ? 180 : o.arrived ? 0 : 1500;
+      const wait = !c.wait || document.visibilityState !== "visible" ? 0 : appearing ? GLIDE * 1000 : o.arrived ? 0 : 400;
       if (c.then) {
         o.queue = [c.then];
         if (o.arrived) arrive();
