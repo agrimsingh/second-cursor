@@ -2,13 +2,21 @@
 """Latency of the calls an agent makes most, timed at the client against a test instance (server work plus localhost
 HTTP). Uses only arguments every build understands, so two builds can be compared:
 
-    SC_E2E_APP=build/SecondCursor.app python3 e2e/latency.py [latency | browser_latency] [--rounds N]
+    SC_E2E_APP=build/SecondCursor.app python3 e2e/latency.py [latency | browser_latency] [--rounds N] [--cursor]
 
 Writes latency.json (medians and every sample, in ms, plus observation sizes) next to the usual report, and
 browser-latency.json for browser actions: each one's latency and whether its own observation already showed the
 page's reaction (a faster action that returns before a slow page renders only moves the wait to the next read).
+
+Builds that record timings (recordTimings, on in every test instance) also get, per call, the server's own time, the
+client's time on top of it (HTTP, JSON), and the median of each phase the server timed (settling, the cursor, the tree
+walk, capture, the browser round trip and the extension's phases inside it, as ext.*).
+
+--cursor draws the agent cursor on the agent display (cursorOnAgentDisplay), so native calls wait for its glide as
+they do on the user's screen. Without it nothing on the agent display draws a cursor: that measures the server alone.
 """
 import json
+import os
 import pathlib
 import re
 import statistics
@@ -20,19 +28,82 @@ from run import FixtureServer, Run, SCENARIOS, Skip, ToolError, scenario, elemen
 
 SCENARIOS.clear()
 ROUNDS = int(sys.argv[sys.argv.index("--rounds") + 1]) if "--rounds" in sys.argv else 7
+CURSOR = "--cursor" in sys.argv
+EXTENSION = os.environ.get("SC_E2E_EXTENSION") or "extension"
+
+
+class Phases:
+    """The server's timing line for each timed call. Lines are written off the call path, in call order, so the
+    line for the call just made is the newest one once it is there; a build that records nothing is noticed on the
+    first call and skipped from then on."""
+
+    def __init__(self, ctx):
+        self.instance = ctx.run.instance
+        self.supported = self.instance is not None
+        self.seen = len(self.instance.timings()) if self.supported else 0
+        self.by_label = {}
+        self.first = True
+
+    def take(self, label, tool, client_ms):
+        if not self.supported:
+            return
+        deadline = time.time() + (2 if self.first else 0.5)
+        lines = []
+        while time.time() < deadline:
+            lines = self.instance.timings(self.seen)
+            if lines and lines[-1]["tool"] == tool:
+                break
+            time.sleep(0.005)
+        self.seen += len(lines)
+        found = bool(lines) and lines[-1]["tool"] == tool
+        if self.first and not found:
+            self.supported = False
+        self.first = False
+        if found:
+            self.by_label.setdefault(label, []).append({**lines[-1], "client_ms": client_ms})
+
+    def summary(self):
+        """Per label: median server ms, median client ms on top of it, and each phase's median (a phase missing from
+        a sample counts as 0 there)."""
+        out = {}
+        for label, rows in self.by_label.items():
+            names = sorted({name for row in rows for name in row["phases"]})
+            out[label] = {
+                "server_ms": statistics.median(row["ms"] for row in rows),
+                "client_overhead_ms": statistics.median(row["client_ms"] - row["ms"] for row in rows),
+                "phases_ms": {name: round(statistics.median(row["phases"].get(name, 0) for row in rows), 1)
+                              for name in names},
+            }
+        return out
+
+    @staticmethod
+    def describe(entry, top=6):
+        phases = sorted(entry["phases_ms"].items(), key=lambda kv: -kv[1])
+        shown = ", ".join(f"{name} {ms:.0f}" for name, ms in phases[:top] if ms >= 1)
+        return f"server {entry['server_ms']:.0f} ms (+{entry['client_overhead_ms']:.0f} client): {shown}"
+
+
+def report_phases(ctx, phases):
+    summary = phases.summary()
+    for label, entry in summary.items():
+        ctx.check(f"{label}: {Phases.describe(entry)}", True, entry)
+    return summary
 
 
 @scenario
 def latency(ctx):
     samples, sizes = {}, {}
+    phases = Phases(ctx)
 
     def timed(label, tool, **args):
         started = time.perf_counter()
         data, _ = ctx.mcp.call(tool, **args)
-        samples.setdefault(label, []).append(round((time.perf_counter() - started) * 1000, 1))
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        samples.setdefault(label, []).append(elapsed)
+        phases.take(label, tool, elapsed)
         return data
 
-    # Off the user's screen, so no call waits for the agent cursor to land: this measures the server.
+    # On the agent display, so the user's screen is untouched; --cursor draws the arrow there anyway.
     wid = links_document(ctx, "latency.html", on_agent_display=True)["id"]
     calc = ctx.call("launch_app", app="Calculator", new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(calc["app"]["pid"])
@@ -60,9 +131,8 @@ def latency(ctx):
         timed("click observe=tree", "click", window_id=calc_wid, element_index=seven)
         timed("press_key observe=tree", "press_key", window_id=calc_wid, keys="escape")
         timed("click observe=none, then screenshot", "click", window_id=calc_wid, element_index=seven, observe="none")
-        started = time.perf_counter()
-        ctx.mcp.call("screenshot", window_id=calc_wid)
-        samples.setdefault("screenshot right after an action", []).append(round((time.perf_counter() - started) * 1000, 1))
+        timed("screenshot right after an action", "screenshot", window_id=calc_wid)
+        timed("screenshot, idle Calculator", "screenshot", window_id=calc_wid)
         ctx.call("get_window_state", window_id=calc_wid)
 
         scrolled = timed("scroll observe=tree (links doc)", "scroll", window_id=wid,
@@ -70,11 +140,12 @@ def latency(ctx):
         sizes.setdefault("scroll observation (links doc)", []).append(len((scrolled.get("observation") or {}).get("tree", "")))
 
     medians = {label: statistics.median(values) for label, values in samples.items()}
-    (ctx.run.dir / "latency.json").write_text(json.dumps(
-        {"app": str(ctx.run.instance.app) if ctx.run.instance else ctx.run.target, "rounds": ROUNDS,
-         "median_ms": medians, "samples_ms": samples, "sizes_chars": sizes}, indent=2))
     for label, value in medians.items():
         ctx.check(f"{label}: median {value:.0f} ms", True, samples[label])
+    summary = report_phases(ctx, phases)
+    (ctx.run.dir / "latency.json").write_text(json.dumps(
+        {"app": str(ctx.run.instance.app) if ctx.run.instance else ctx.run.target, "rounds": ROUNDS, "cursor": CURSOR,
+         "median_ms": medians, "samples_ms": samples, "sizes_chars": sizes, "server": summary}, indent=2))
     scroll_sizes = sizes["scroll observation (links doc)"]
     ctx.check(f"scroll observation: median {statistics.median(scroll_sizes):.0f} chars "
               f"(full tree {sizes['get_window_state full (links doc)']})", True, scroll_sizes)
@@ -101,10 +172,14 @@ def browser_latency(ctx):
         name, search, agree = ref('textbox "Name"'), ref('textbox "Search"'), ref('checkbox "Agree"')
         details, add, noop, load = (ref(f'button "{label}"') for label in ("Details", "Add row", "Nothing", "Load"))
 
+        phases = Phases(ctx)
+
         def timed(label, tool, reaction=None, **args):
             started = time.perf_counter()
             data, _ = ctx.mcp.call(tool, tab_id=tid, **args)
-            samples.setdefault(label, []).append(round((time.perf_counter() - started) * 1000, 1))
+            elapsed = round((time.perf_counter() - started) * 1000, 1)
+            samples.setdefault(label, []).append(elapsed)
+            phases.take(label, tool, elapsed)
             if reaction:
                 observed = (data.get("observation") or {}).get("outline", "")
                 seen.setdefault(label, []).append(bool(re.search(reaction, observed)))
@@ -123,12 +198,14 @@ def browser_latency(ctx):
 
     medians = {label: statistics.median(values) for label, values in samples.items()}
     shown = {label: f"{sum(values)}/{len(values)}" for label, values in seen.items()}
-    (ctx.run.dir / "browser-latency.json").write_text(json.dumps(
-        {"app": str(ctx.run.instance.app) if ctx.run.instance else ctx.run.target, "rounds": ROUNDS,
-         "median_ms": medians, "reaction_in_own_observation": shown, "samples_ms": samples}, indent=2))
     for label, value in medians.items():
         ctx.check(f"{label}: median {value:.0f} ms" + (f", reaction shown {shown[label]}" if label in shown else ""),
                   True, samples[label])
+    summary = report_phases(ctx, phases)
+    (ctx.run.dir / "browser-latency.json").write_text(json.dumps(
+        {"app": str(ctx.run.instance.app) if ctx.run.instance else ctx.run.target, "rounds": ROUNDS,
+         "extension": str(EXTENSION), "median_ms": medians, "reaction_in_own_observation": shown,
+         "samples_ms": samples, "server": summary}, indent=2))
     for label in ("type into a search box (results ~450 ms later)", "click a button whose content loads 400 ms later"):
         ctx.check(f"{label}: its own observation shows the late content every time", all(seen[label]), shown[label])
     toggle = medians["click an aria-expanded toggle"]
@@ -140,6 +217,6 @@ def browser_latency(ctx):
 
 
 if __name__ == "__main__":
-    run = Run()
+    run = Run({"cursorOnAgentDisplay": True} if CURSOR else None)
     run.run([a for a in sys.argv[1:] if not a.isdigit()])
     sys.exit(1 if any(r["status"] == "FAIL" for r in run.results) else 0)

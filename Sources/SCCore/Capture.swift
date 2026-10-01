@@ -14,7 +14,7 @@ enum Capture {
     /// most `maxEdge`. `scale` is image pixels per window point. Works for occluded windows and windows on other Spaces.
     static func window(_ wid: CGWindowID) async throws -> Screenshot {
         let (image, points) = try await image(wid, maxEdge: maxEdge)
-        return Screenshot(pngData: try png(image), width: image.width, height: image.height,
+        return Screenshot(pngData: try Timing.measure("capture_encode") { try png(image) }, width: image.width, height: image.height,
                           scale: Double(image.width) / Double(points.width))
     }
 
@@ -25,7 +25,9 @@ enum Capture {
         // Screen Recording and show the prompt; a preflight-only check never registers the app.
         let content: SCShareableContent
         do {
-            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            content = try await Timing.measureAsync("capture_list") {
+                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            }
         } catch {
             if !CGPreflightScreenCaptureAccess() { throw SCError.permissionDenied("Screen Recording") }
             throw SCError.actionFailed("Could not list shareable windows: \(error.localizedDescription)")
@@ -46,7 +48,9 @@ enum Capture {
         configuration.showsCursor = false
         configuration.ignoreShadowsSingleWindow = true
         do {
-            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+            let image = try await Timing.measureAsync("capture_shot") {
+                try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+            }
             return (image, points)
         } catch {
             throw SCError.actionFailed("Could not capture window \(wid): \(error.localizedDescription)")

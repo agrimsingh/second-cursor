@@ -19,6 +19,7 @@ import {
 
 import { extended, openDialog, recordEvent, withDialog } from "./extended.js";
 import { closeSession, endTurn } from "./tabs.js";
+import * as timing from "./timing.js";
 
 const HOST = "dev.secondcursor.host";
 const VERSION = chrome.runtime.getManifest().version;
@@ -85,21 +86,23 @@ const handlers = {
         `A JavaScript dialog is open in tab ${tabId}; answer it with browser_command operation=dialog, then read the page`,
       );
     // Like Codex, the cursor is on the tab from the moment the agent works in it, not only once it acts.
-    await attach(tabId);
+    await timing.timed(tabId, "attach", () => attach(tabId));
     show(tabId, session_id);
     await settled(tabId);
     const key = `${session_id}:${tabId}`;
     const previous = observations.get(key);
-    const snapshot = await structuredSnapshot(tabId);
+    const snapshot = await timing.timed(tabId, "collect", () => structuredSnapshot(tabId));
     const id = crypto.randomUUID();
     observations.set(key, { id, outline: snapshot.outline });
     let outline = snapshot.outline;
     let is_diff = false;
     if (full === false && previous) {
+      const diffStarted = performance.now();
       const changed = changedLines(
         previous.outline.split("\n"),
         outline.split("\n"),
       );
+      timing.add(tabId, "diff", performance.now() - diffStarted);
       const diff =
         changed && (changed.length ? changed.join("\n") : "(no changes)");
       // Large edits return the full tree.
@@ -141,7 +144,7 @@ const handlers = {
   },
   "tab.screenshot": async ({ tabId }) => {
     await requireAgentTab(tabId);
-    return await screenshot(tabId);
+    return await timing.timed(tabId, "screenshot", () => screenshot(tabId));
   },
 };
 
@@ -200,8 +203,11 @@ let port = null;
 let retryTimer = null;
 let retryDelay = MIN_RETRY_MS;
 
-async function dispatch(activePort, { id, method, params }) {
+async function dispatch(activePort, { id, method, params, receivedAt }) {
   let reply;
+  const started = performance.now();
+  const timingKey = params?.tabId ?? "browser";
+  const phases = params?.timings ? timing.begin(timingKey) : null;
   try {
     const handler = handlers[method];
     if (!handler)
@@ -245,6 +251,11 @@ async function dispatch(activePort, { id, method, params }) {
     const events = REPORTING.has(method) ? takeReports(params.session_id ?? "legacy") : [];
     if (events.length) reply.result = { ...reply.result, events };
     if (acts) noteAction(params.tabId, dispatchedAt);
+    if (phases)
+      reply.result = {
+        ...reply.result,
+        timings: { ...phases, queue: started - receivedAt, total: performance.now() - started },
+      };
   } catch (error) {
     reply = {
       id,
@@ -253,6 +264,8 @@ async function dispatch(activePort, { id, method, params }) {
         message: error.message ?? String(error),
       },
     };
+  } finally {
+    if (phases) timing.end(timingKey, phases);
   }
   try {
     activePort.postMessage(reply);
@@ -272,6 +285,7 @@ function scheduleRetry() {
 
 const queues = new Map();
 function enqueue(activePort, message) {
+  message.receivedAt = performance.now();
   const key = message.params?.tabId ?? "browser";
   const next = (queues.get(key) ?? Promise.resolve()).then(() =>
     dispatch(activePort, message),

@@ -113,7 +113,9 @@ final class ExtensionLink: @unchecked Sendable {
 
     func call(_ method: String, _ params: [String: Any], timeout: TimeInterval = 60) async throws -> [String: Any] {
         let key = (Execution.context.browserID ?? "default") + ":" + String(describing: params["tabId"] ?? "browser")
+        let queued = DispatchTime.now().uptimeNanoseconds
         return try await scheduler.run(key: key) {
+            Execution.context.timings?.add("browser_queue", ms: Timing.since(queued))
             if method == "extended", params["operation"] as? String == "batch" {
                 guard let steps = params["steps"] as? [[String: Any]], steps.count <= 50 else {
                     throw SCError.invalidArgument("Batch requires at most 50 steps")
@@ -144,6 +146,9 @@ final class ExtensionLink: @unchecked Sendable {
         params["session_id"] = Execution.context.sessionID
         params["deadline"] = Execution.context.deadline.map { $0.timeIntervalSince1970 * 1000 }
         params["observation_id"] = Execution.context.observationID
+        let timings = Execution.context.timings
+        if timings != nil { params["timings"] = true }
+        let sent = DispatchTime.now().uptimeNanoseconds
         let reply = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Reply, Error>) in
             lock.lock()
             pending[id] = Pending(connectionID: connection.id, continuation: continuation)
@@ -158,7 +163,17 @@ final class ExtensionLink: @unchecked Sendable {
                     id, .failure(SCError.actionFailed("Browser call \(method) timed out after \(Int(timeout))s")))
             }
         }
-        return reply.value
+        guard let timings else { return reply.value }
+        let roundTrip = Timing.since(sent)
+        timings.add("bridge", ms: roundTrip)
+        timings.add("bridge." + method, ms: roundTrip)
+        var value = reply.value
+        if let phases = value.removeValue(forKey: "timings") as? [String: Any] {
+            for (phase, ms) in phases {
+                if let ms = (ms as? NSNumber)?.doubleValue { timings.add("ext." + phase, ms: ms) }
+            }
+        }
+        return value
     }
 
     private func reserveCall() throws -> (Connection, Int) {

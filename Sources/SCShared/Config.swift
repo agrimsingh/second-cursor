@@ -17,6 +17,7 @@ public enum SCPaths {
 
     public static let configURL = supportDir.appendingPathComponent("config.json")
     public static let actionLogURL = logsDir.appendingPathComponent("actions.jsonl")
+    public static let timingLogURL = logsDir.appendingPathComponent("timings.jsonl")
     /// Presence of this file means the user paused the agent. Checked before every action.
     public static let pauseFlagURL = supportDir.appendingPathComponent("paused")
 
@@ -52,6 +53,9 @@ public struct SCConfig: Codable, Sendable {
     /// Draw the agent cursor for windows on the agent display, as if the user could see it, so e2e/cursor.py can run
     /// there instead of on the user's screen. Honored only when `SC_HOME` is set (disposable test instances).
     public var cursorOnAgentDisplay: Bool?
+    /// Append each tool call's duration and the time each phase took (settling, the cursor, the tree walk, capture,
+    /// the browser round trip) to logs/timings.jsonl. Results are unchanged.
+    public var recordTimings: Bool?
 
     public init(port: Int, token: String, blockedBundleIDs: [String], confirmationRequiredTools: [String]) {
         self.port = port
@@ -166,17 +170,38 @@ public final class ActionLog: @unchecked Sendable {
     public func record(_ entry: ActionLogEntry) {
         queue.sync {
             guard let line = try? JSONEncoder().encode(entry) else { return }
-            try? SCPaths.ensureDirectories()
-            if let handle = try? FileHandle(forWritingTo: SCPaths.actionLogURL) {
-                defer { try? handle.close() }
-                handle.seekToEndOfFile()
-                handle.write(line)
-                handle.write("\n".data(using: .utf8)!)
-            } else {
-                var data = line
-                data.append("\n".data(using: .utf8)!)
-                try? data.write(to: SCPaths.actionLogURL)
-            }
+            Self.append(line, to: SCPaths.actionLogURL)
+        }
+    }
+
+    static func append(_ line: Data, to url: URL) {
+        try? SCPaths.ensureDirectories()
+        var data = line
+        data.append(0x0A)
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            handle.seekToEndOfFile()
+            handle.write(data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
+/// One line per tool call when `recordTimings` is on. Written off the call's path, unlike the action log.
+public final class TimingLog: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "dev.secondcursor.timinglog")
+    public init() {}
+
+    public func record(tool: String, ms: Double, ok: Bool, phases: [String: Double]) {
+        let rounded = phases.mapValues { ($0 * 10).rounded() / 10 }
+        let entry: [String: Any] = [
+            "time": ISO8601DateFormatter().string(from: Date()), "tool": tool, "ms": (ms * 10).rounded() / 10, "ok": ok,
+            "phases": rounded,
+        ]
+        queue.async {
+            guard let line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
+            ActionLog.append(line, to: SCPaths.timingLogURL)
         }
     }
 }

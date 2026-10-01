@@ -261,6 +261,19 @@ class TestInstance:
         return self.home / "logs/actions.jsonl"
 
     @property
+    def timing_log(self):
+        """One line per tool call (recordTimings): {"tool", "ms", "ok", "phases": {phase: ms}}. Builds from before
+        the setting existed write nothing."""
+        return self.home / "logs/timings.jsonl"
+
+    def timings(self, start=0):
+        """Timing lines from line `start` on. Lines are written off the call path, so a caller that needs the line
+        for the call it just made waits briefly for it."""
+        if not self.timing_log.exists():
+            return []
+        return [json.loads(line) for line in self.timing_log.read_text().splitlines()[start:] if line.strip()]
+
+    @property
     def base_url(self):
         return f"http://127.0.0.1:{self.port}"
 
@@ -293,7 +306,8 @@ class TestInstance:
         if threading.current_thread() is threading.main_thread() and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
         self.config = {"port": free_port(), "token": secrets.token_hex(16), "blockedBundleIDs": DEFAULT_BLOCKED_BUNDLE_IDS,
-                       "confirmationRequiredTools": [], "appApproval": "off", "approvals": "allow", **self.overrides}
+                       "confirmationRequiredTools": [], "appApproval": "off", "approvals": "allow",
+                       "recordTimings": True, **self.overrides}
         self.port, self.token = self.config["port"], self.config["token"]
         self.url = f"{self.base_url}/mcp"
         self.mcp = MCP(self.url, self.token, timeout=5)

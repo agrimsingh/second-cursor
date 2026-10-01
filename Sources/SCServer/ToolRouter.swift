@@ -23,6 +23,7 @@ final class ToolRouter: Sendable {
     let sessions: Sessions
     let repl: BrowserREPL
     let connectionCount: @Sendable () -> Int
+    private let timingLog: TimingLog?
     private static let toolNames = Set(ToolCatalog.tools.map(\.name))
 
     init(
@@ -30,6 +31,7 @@ final class ToolRouter: Sendable {
         config: SCConfig, connectionCount: @escaping @Sendable () -> Int = { 0 }
     ) {
         self.connectionCount = connectionCount
+        self.timingLog = config.recordTimings == true ? TimingLog() : nil
         self.desktop = desktop
         self.agentDisplay = agentDisplay
         self.browser = browser
@@ -44,6 +46,15 @@ final class ToolRouter: Sendable {
     }
 
     func call(name called: String, arguments: [String: Value]) async -> CallTool.Result {
+        guard let timingLog else { return await route(called, arguments, timings: nil) }
+        let timings = CallTimings()
+        let started = DispatchTime.now().uptimeNanoseconds
+        let result = await route(called, arguments, timings: timings)
+        timingLog.record(tool: called, ms: Timing.since(started), ok: result.isError != true, phases: timings.phasesMS)
+        return result
+    }
+
+    private func route(_ called: String, _ arguments: [String: Value], timings: CallTimings?) async -> CallTool.Result {
         // act is batch for clients that see the compact tool surface; one code path keeps their gates, logging and
         // parameters identical.
         let name = called == "act" ? "batch" : called
@@ -62,7 +73,9 @@ final class ToolRouter: Sendable {
         do {
             guard Self.toolNames.contains(name) else { throw SCError.invalidArgument("Unknown tool: \(name)") }
             if let malformedArguments { throw malformedArguments }
+            let resolveStarted = DispatchTime.now().uptimeNanoseconds
             raw = try await resolveAppTarget(name, raw)
+            timings?.add("resolve", ms: Timing.since(resolveStarted))
             let args = Arguments(raw)
             let session = try args.optionalString("session_id") ?? "legacy"
             if name == "session" {
@@ -108,6 +121,7 @@ final class ToolRouter: Sendable {
                 return Self.success(ToolOutput(json: try sessions.info(id, session: session)))
             }
             var admitted = false
+            let gatesStarted = DispatchTime.now().uptimeNanoseconds
             do {
                 let owner = try await checkGates(name, args)
                 var configuredTools = [name]
@@ -127,20 +141,23 @@ final class ToolRouter: Sendable {
                 var app = try await appNeedingApproval(name, args, owner: owner)
                 if let target = app, appApprovals.isApproved(target, session: session) { app = nil }
                 if app != nil || !grants.isEmpty {
+                    let approvalStarted = DispatchTime.now().uptimeNanoseconds
                     try await approve(
                         ApprovalRequest(app: app, grants: grants, session: session),
                         deadline: deadline, stillAllowed: { [sessions] in sessions.mayApprove(operation) })
+                    timings?.add("approval", ms: Timing.since(approvalStarted))
                 }
                 // Record admission only after approval. Refusals are recorded once below.
                 _ = try await admit(name, args)
                 admitted = true
                 noteActivity(name, args, owner: owner, session: session)
+                timings?.add("gates", ms: Timing.since(gatesStarted) - (timings?.phasesMS["approval"] ?? 0))
                 let mutating = ToolCatalog.actionTools.contains(name)
                 let target = mutating ? try args.optionalInt("window_id").map { "window:\($0)" } : nil
                 let context = ExecutionContext(
                     sessionID: session, observationID: try args.optionalString("observation_id"),
                     browserID: try args.optionalString("browser_id"), deadline: deadline,
-                    browserApprovals: browserApprovals
+                    browserApprovals: browserApprovals, timings: timings
                 ) { [sessions] in
                     if name != "status" { try sessions.dispatch(operation, target: target) }
                 }
@@ -165,7 +182,10 @@ final class ToolRouter: Sendable {
                         throw error
                     }
                 }
-                return Self.success(output)
+                let encodeStarted = DispatchTime.now().uptimeNanoseconds
+                let result = Self.success(output)
+                timings?.add("encode", ms: Timing.since(encodeStarted))
+                return result
             } catch is CallDeadlineExceeded {
                 sessions.keepForReconciliation(operation)
                 return Self.failure(

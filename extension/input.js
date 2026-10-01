@@ -4,6 +4,7 @@ import { BridgeError, sleep, withTimeout } from "./errors.js";
 import { parseChord } from "./keys.js";
 import { isolatedFrame } from "./snapshot.js";
 import { expectQuickReaction } from "./tabs.js";
+import { timed } from "./timing.js";
 
 // Long enough for a field that checks what was typed after a short debounce.
 const PLAIN_FIELD_REACT_MS = 300;
@@ -151,15 +152,18 @@ async function refTarget(tabId, ref) {
 
 export async function click(tabId, { ref, x, y }) {
   let point;
-  if (ref != null && ref !== "") point = await reachablePoint(`Ref ${ref}`, () => refTarget(tabId, ref));
+  if (ref != null && ref !== "")
+    point = await timed(tabId, "locate", () => reachablePoint(`Ref ${ref}`, () => refTarget(tabId, ref)));
   else if (Number.isFinite(x) && Number.isFinite(y)) point = { x, y };
   else throw new BridgeError("invalid_argument", "click needs a ref or both x and y");
 
-  await pointTo(tabId, point, 1);
+  await timed(tabId, "cursor", () => pointTo(tabId, point, 1));
   const mouse = (params) => cdp(tabId, "Input.dispatchMouseEvent", { x: point.x, y: point.y, modifiers: 0, ...params });
-  await mouse({ type: "mouseMoved", button: "none", buttons: 0 });
-  await mouse({ type: "mousePressed", button: "left", buttons: 1, clickCount: 1 });
-  await mouse({ type: "mouseReleased", button: "left", buttons: 0, clickCount: 1 });
+  await timed(tabId, "input", async () => {
+    await mouse({ type: "mouseMoved", button: "none", buttons: 0 });
+    await mouse({ type: "mousePressed", button: "left", buttons: 1, clickCount: 1 });
+    await mouse({ type: "mouseReleased", button: "left", buttons: 0, clickCount: 1 });
+  });
 }
 
 // Where a text cursor would sit in a field: near its left edge, vertically centered.

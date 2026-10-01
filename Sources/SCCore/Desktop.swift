@@ -78,8 +78,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         case let .drag(from, _): point = from
         default: return cursor.present(event)
         }
-        cursor.present(Self.target(for: point, in: record))
-        cursor.present(event)
+        Timing.measure("cursor") {
+            cursor.present(Self.target(for: point, in: record))
+            cursor.present(event)
+        }
     }
 
     private func queue(for pid: pid_t) -> DispatchQueue {
@@ -93,9 +95,11 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     private func run<T>(on queue: DispatchQueue, _ work: @escaping () throws -> T) async throws -> T {
         let context = Execution.context
+        let enqueued = DispatchTime.now().uptimeNanoseconds
         return try await withCheckedThrowingContinuation { continuation in
             queue.async { continuation.resume(with: Result {
-                try Execution.$context.withValue(context) { try context.beforeDispatch(); return try work() }
+                context.timings?.add("queue", ms: Timing.since(enqueued))
+                return try Execution.$context.withValue(context) { try context.beforeDispatch(); return try work() }
             }) }
         }
     }
@@ -172,7 +176,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         var ocrMS: Int?
         if options.ocr {
             if needsSettle(windowID) { await settle(windowID: windowID) }
-            if claimPaintWait(windowID) { try? await Task.sleep(nanoseconds: 150_000_000) }
+            await paintWait(windowID)
             let started = Date()
             // Leaves time within the call's deadline for the tree walk.
             let budget = max(0, min(15, (Execution.context.deadline?.timeIntervalSinceNow ?? 60) - 3))
@@ -182,6 +186,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 ocrError = (error as? LocalizedError)?.errorDescription ?? "\(error)"
             }
             ocrMS = Int(Date().timeIntervalSince(started) * 1000)
+            Execution.context.timings?.add("ocr", ms: Double(ocrMS ?? 0))
         }
         var snapshot = try await run(windowID: windowID) {
             if self.needsSettle(windowID) { self.settleNow(windowID) }
@@ -202,8 +207,13 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// Custom-drawn apps (Ableton, games) update their accessibility tree before they repaint, so a capture right
     /// after the tree settles can show the previous frame. Once per action, give the window a frame's worth of time.
     private func capture(_ wid: CGWindowID) async throws -> Screenshot {
-        if claimPaintWait(wid) { try? await Task.sleep(nanoseconds: 150_000_000) }
+        await paintWait(wid)
         return try await Capture.window(wid)
+    }
+
+    private func paintWait(_ wid: CGWindowID) async {
+        guard claimPaintWait(wid) else { return }
+        await Timing.measureAsync("paint") { try? await Task.sleep(nanoseconds: 150_000_000) }
     }
 
     public func click(windowID: UInt32, target: ClickTarget, button: MouseButton, count: Int, modifiers: [String]) async throws -> ActionResult {
@@ -268,7 +278,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                     }
                     self.watchChanges(step.windowID)
                     let started = Date()
-                    let result = try self.perform(step)
+                    let result = try Timing.measure("perform") { try self.perform(step) }
                     self.markAction(on: step.windowID, started: started, route: result.route)
                     results.append(BatchStepResult(tool: step.tool, ok: true, result: result))
                 } catch {
@@ -364,7 +374,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             try self.validateObservation(windowID)
             self.watchChanges(windowID)
             let started = Date()
-            let result = try work()
+            let result = try Timing.measure("perform", work)
             self.markAction(on: windowID, started: started, route: result.route)
             return result
         }
@@ -517,9 +527,9 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         // An app that has never posted a notification may not post them at all.
         if let action, changes.watch(pid: record.pid, windowID: wid, window: window),
            let state = changes.state(record.pid), state.count > 0 {
-            return settle(record.pid, after: action, cap: cap)
+            return Timing.measure("settle") { settle(record.pid, after: action, cap: cap) }
         }
-        return pollSettle(window, cap: cap)
+        return Timing.measure("settle_poll") { pollSettle(window, cap: cap) }
     }
 
     /// Waits for the app's first notification after the action (input events and menus are handled a little later,
@@ -527,12 +537,17 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     private func settle(_ pid: pid_t, after action: Activity, cap: TimeInterval) -> Bool {
         let answers = action.synchronous ? action.started : action.at
         let deadline = action.at.addingTimeInterval(cap)
+        let started = Date()
+        var answered = false
+        // The wait for an app that never answers, apart from settling: what a shorter first-reply wait would save.
+        defer { if !answered { Execution.context.timings?.add("settle_unanswered", ms: Date().timeIntervalSince(started) * 1000) } }
         while let state = changes.state(pid) {
             let until = if let last = state.last, last > answers {
                 max(action.at.addingTimeInterval(0.03), last.addingTimeInterval(0.06))
             } else {
                 action.at.addingTimeInterval(0.25)
             }
+            answered = state.last.map { $0 > answers } ?? false
             if Date() >= until { return true }
             if Date() >= deadline { return false }
             changes.wait(pid, after: state.count, until: min(until, deadline))
@@ -601,9 +616,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     private func windows(matching query: String?) -> [WindowInfo] {
         let needle = query?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
-        let all = WindowList.all()
+        let (all, onScreen) = Timing.measure("window_list") { (WindowList.all(), WindowList.onScreenIDs()) }
         resolver.forget(windowsNotIn: Set(all.map(\.id)))
-        let onScreen = WindowList.onScreenIDs()
         var listed: [pid_t: [CGWindowID: AXUIElement]?] = [:]
         var result: [WindowInfo] = []
         for record in all where WindowList.isAppWindow(record) && record.pid != getpid() {
@@ -616,7 +630,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             if listed.index(forKey: record.pid) == nil {
                 let element = AXUIElementCreateApplication(record.pid)
                 AXUIElementSetMessagingTimeout(element, 0.5)
-                listed[record.pid] = resolver.listedWindows(element)
+                listed[record.pid] = Timing.measure("ax_windows") { resolver.listedWindows(element) }
             }
             let appWindows = listed[record.pid] ?? nil
             let window = appWindows?[record.id] ?? resolver.cached(pid: record.pid, wid: record.id)
@@ -624,8 +638,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             // A window its app answered without, shown nowhere and on no Space a display hides, is one the app keeps
             // but no longer shows (closed to the background, as Electron apps do): nothing can read it, and listing it
             // sends an agent back to list_windows for a window that stays unreadable.
-            if !onScreenNow, window == nil, appWindows != nil, !Spaces.isHidden(record.id) { continue }
-            var info = windowInfo(record, window: window)
+            if !onScreenNow, window == nil, appWindows != nil, Timing.measure("spaces", { !Spaces.isHidden(record.id) }) {
+                continue
+            }
+            var info = Timing.measure("window_info") { windowInfo(record, window: window) }
             info.isOnScreen = onScreenNow
             result.append(info)
         }
@@ -678,8 +694,11 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     private func snapshot(_ wid: CGWindowID, options: SnapshotOptions, recognized: [RecognizedText]?) throws -> WindowSnapshot {
         let record = try record(wid)
-        let window = try resolver.resolve(pid: record.pid, wid: wid)
-        changes.watch(pid: record.pid, windowID: wid, window: window)
+        let window = try Timing.measure("ax_resolve") {
+            let window = try resolver.resolve(pid: record.pid, wid: wid)
+            changes.watch(pid: record.pid, windowID: wid, window: window)
+            return window
+        }
         let frame = window.frame ?? record.bounds
         let tree = tree(for: wid, pid: record.pid)
         let id = String(UUID().uuidString.prefix(8)).lowercased()
@@ -707,7 +726,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 if tree.snapshotID == nil { tree.snapshotID = id }
             }
             var builder = TreeBuilder(maxNodes: maxNodes)
-            builder.build(subtreeOf: root.element, key: root.key, inWebArea: root.inWebArea)
+            Timing.measure("walk") { builder.build(subtreeOf: root.element, key: root.key, inWebArea: root.inWebArea) }
             var out = TreeRenderer.scoped(scope: handle, windowOrigin: frame.origin, nodes: builder.nodes,
                                           table: tree.table, maxElements: max(limit, 2000))
             let shown = out.body.count - 1
@@ -731,14 +750,18 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
         var builder = TreeBuilder(maxNodes: maxNodes)
         let app = AXUIElementCreateApplication(record.pid)
-        let menuBar = options.includeMenuBar ? app.element(kAXMenuBarAttribute) : nil
-        builder.build(window: window, menuBar: menuBar)
+        Timing.measure("walk") {
+            let menuBar = options.includeMenuBar ? app.element(kAXMenuBarAttribute) : nil
+            builder.build(window: window, menuBar: menuBar)
+        }
         let title = window.string(kAXTitleAttribute) ?? record.title
-        var out = TreeRenderer.full(title: title, size: frame.size, windowOrigin: frame.origin, nodes: builder.nodes,
-                                    table: tree.table, maxElements: limit)
+        var out = Timing.measure("render") {
+            TreeRenderer.full(title: title, size: frame.size, windowOrigin: frame.origin, nodes: builder.nodes,
+                              table: tree.table, maxElements: limit)
+        }
         let layout = OutlineLayout(nodes: builder.nodes, shown: out.body.count - 1, origin: frame.origin,
                                    window: (title, frame.size))
-        out.appendOrientation(focused: app.element(kAXFocusedUIElementAttribute))
+        Timing.measure("orientation") { out.appendOrientation(focused: app.element(kAXFocusedUIElementAttribute)) }
         if builder.truncated, out.footer == nil { out.footer = TreeRenderer.walkLimitFooter }
         tree.table.retain(keys: Set(builder.nodes.map(\.key)))
         let base = tree.snapshotID
@@ -756,7 +779,9 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             if recognized != nil, let text = tree.recognized, let layout = tree.layout {
                 (previous, previousKeys, _) = TextRecognition.merge(text, lines: previous, keys: previousKeys, layout: layout)
             }
-            diff = TreeRenderer.diff(previous: previous, previousKeys: previousKeys, current: lines, currentKeys: keys)
+            diff = Timing.measure("diff") {
+                TreeRenderer.diff(previous: previous, previousKeys: previousKeys, current: lines, currentKeys: keys)
+            }
         }
         tree.snapshotID = id
         tree.lines = out.lines
@@ -773,7 +798,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             }
         }
         var result = WindowSnapshot(
-            window: windowInfo(record, window: window), snapshotID: id, tree: diff ?? lines.joined(separator: "\n"),
+            window: Timing.measure("window_info") { windowInfo(record, window: window) }, snapshotID: id,
+            tree: diff ?? lines.joined(separator: "\n"),
             elementCount: out.indexedCount, truncated: out.truncated || builder.truncated,
             isDiff: diff != nil, diffBase: diff != nil ? base : nil
         )
@@ -787,7 +813,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     private func labelledContainer(_ label: String, in window: AXUIElement, windowID: CGWindowID,
                                    maxNodes: Int) throws -> (SnapshotElement, String) {
         var builder = TreeBuilder(maxNodes: maxNodes)
-        builder.build(window: window, menuBar: nil)
+        Timing.measure("walk") { builder.build(window: window, menuBar: nil) }
         let nodes = builder.nodes
         func hasChildren(_ i: Int) -> Bool { i + 1 < nodes.count && nodes[i + 1].indent > nodes[i].indent }
         let exact = nodes.indices.filter { nodes[$0].label == label }

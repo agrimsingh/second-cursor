@@ -1,6 +1,7 @@
 import { attach, cdp, networkIdle } from "./cdp.js";
 import { removeCursor, show } from "./cursor.js";
 import { BridgeError, sleep } from "./errors.js";
+import { add as addTiming, timed } from "./timing.js";
 
 const GROUP_TITLE = "Second Cursor";
 // Matches the native lease: a claimed personal tab is released after this long without use.
@@ -250,7 +251,7 @@ export async function settleAround(
   };
   chrome.tabs.onUpdated.addListener(listener);
   try {
-    const result = await action();
+    const result = await timed(tabId, "action", action);
     const began = Date.now();
     while (Date.now() - began < timeoutMs) {
       const tab = await chrome.tabs.get(tabId).catch(() => null);
@@ -259,6 +260,7 @@ export async function settleAround(
       else if (sawLoading || Date.now() - began > quietMs) break;
       await sleep(50);
     }
+    addTiming(tabId, sawLoading ? "after_action_load" : "after_action", Date.now() - began);
     return result;
   } finally {
     chrome.tabs.onUpdated.removeListener(listener);
@@ -344,15 +346,24 @@ export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs 
   const began = Date.now();
   const { at: actedAt = 0, load = false, reactMs: quick } = lastAction.get(tabId) ?? {};
   const reactWithin = Math.min(reactMs, quick ?? reactMs);
-  while (Date.now() - began < timeoutMs) {
-    const state = await settleProbe(tabId);
-    if (!state) return;
-    const sinceAction = Date.now() - actedAt;
-    let awaitingReaction = sinceAction < reactWithin && (!state.mutated || state.quiet >= sinceAction);
-    // The idle signal covers the page's first load only, so actions keep the fixed window.
-    if (awaitingReaction && load && (await networkIdle(tabId).catch(() => false))) awaitingReaction = false;
-    if (state.ready === "complete" && state.quiet >= quietMs && !awaitingReaction) return;
-    await sleep(awaitingReaction ? 50 : Math.min(100, Math.max(20, quietMs - state.quiet)));
+  // Split out the wait for a reaction that has not started from the wait for the page to go quiet.
+  let reacting = 0;
+  try {
+    while (Date.now() - began < timeoutMs) {
+      const state = await settleProbe(tabId);
+      if (!state) return;
+      const sinceAction = Date.now() - actedAt;
+      let awaitingReaction = sinceAction < reactWithin && (!state.mutated || state.quiet >= sinceAction);
+      // The idle signal covers the page's first load only, so actions keep the fixed window.
+      if (awaitingReaction && load && (await networkIdle(tabId).catch(() => false))) awaitingReaction = false;
+      if (state.ready === "complete" && state.quiet >= quietMs && !awaitingReaction) return;
+      const pause = awaitingReaction ? 50 : Math.min(100, Math.max(20, quietMs - state.quiet));
+      if (awaitingReaction) reacting += pause;
+      await sleep(pause);
+    }
+  } finally {
+    addTiming(tabId, "settled", Date.now() - began);
+    if (reacting) addTiming(tabId, "settled_awaiting_reaction", reacting);
   }
 }
 
@@ -378,8 +389,8 @@ export async function openTab(rawUrl, session = "legacy") {
   (await ownership())[tab.id] = { session, created: true, mode: "ephemeral" };
   await saveOwnership();
   await chrome.tabs.update(tab.id, { autoDiscardable: false }).catch(() => {});
-  await addToGroup(tab);
-  await settleAround(tab.id, async () => {}, { quietMs: 0, timeoutMs: 20000 });
+  await timed(tab.id, "group", () => addToGroup(tab));
+  await timed(tab.id, "load", () => settleAround(tab.id, async () => {}, { quietMs: 0, timeoutMs: 20000 }));
   await attach(tab.id);
   show(tab.id, session);
   noteAction(tab.id, Date.now(), true);

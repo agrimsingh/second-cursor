@@ -9,11 +9,14 @@ Import:  launch(sc_home=..., app=...) -> Browser; Browser.stop() kills Chrome, d
 CLI:     e2e/start-browser.py [--sc-home DIR] [--app BUNDLE]
          Prints {"pid", "profile", "log"} and leaves Chrome running; without --sc-home it connects to
          the instance named by the inherited SC_HOME, else the user's app.
+Env:     SC_E2E_EXTENSION=DIR loads the extension from DIR instead of the repo's extension/ (a saved
+         baseline, for before/after timing runs).
 """
 
 import argparse, json, os, pathlib, shutil, signal, subprocess, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+EXTENSION = pathlib.Path(os.environ.get("SC_E2E_EXTENSION") or ROOT / "extension").expanduser().resolve()
 INSTALLED_APP = pathlib.Path.home() / "Applications/SecondCursor.app"
 HOST_NAME = "dev.secondcursor.host"
 EXTENSION_ID = "nfjjbnelcophiemlajgbmahaejppblog"
@@ -128,8 +131,8 @@ def launch(sc_home=None, app=None, restore_manifest=True):
             "--no-first-run",
             "--no-default-browser-check",
             f"--user-data-dir={profile}",
-            f"--load-extension={ROOT}/extension",
-            f"--disable-extensions-except={ROOT}/extension",
+            f"--load-extension={EXTENSION}",
+            f"--disable-extensions-except={EXTENSION}",
             "--remote-debugging-port=0",
             "about:blank",
         ],
