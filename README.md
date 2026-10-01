@@ -96,7 +96,7 @@ Second Cursor runs no model of its own. Whatever client you connect brings one, 
 | --- | --- |
 | Status | `status` |
 | Apps and windows | `list_apps`, `list_windows`, `launch_app`, `get_window_state`, `find_elements`, `screenshot` |
-| Sessions | `session`, `bind_target`, `operation_status`, `cancel_operation` |
+| Sessions (for hosts; callable but not in `tools/list`, like the `session_id`, `operation_id`, `observation_id` and `timeout_ms` arguments) | `session`, `bind_target`, `operation_status`, `cancel_operation` |
 | Editing | `inspect_element`, `select_text`, `paste` |
 | Extended browser | `browser_instances`, `browser_command` (DOM, dialogs, files, exports, screenshots, history, assets) |
 | Browser REPL (opt-in, `toolSurface: "full"`) | `browser_repl`: persistent JavaScript with a Playwright-compatible `page` ([details](docs/api.md#browser-repl)) |

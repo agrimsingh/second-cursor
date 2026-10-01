@@ -20,6 +20,11 @@ Ways the feature could fail, written down before the code:
 12. The compact surface advertises the wrong tools, hides act or find_elements, makes hidden tools uncallable, or gives
     act a schema that drifts from batch's; /api and /mcp list different tools.
 13. The full surface advertises act, or omits find_elements.
+14. tools/list grows back past its budget, or still lists what only hosts use: session_id, operation_id,
+    observation_id or timeout_ms on a tool (wait_for's and browser_repl's timeout_ms are the model's), or the session
+    and operation tools.
+15. A host parameter left out of tools/list stops working: an unlisted session cannot be created or own a tab, an
+    operation_id retry clicks again, a superseded observation_id or an expired timeout_ms lets the click through.
 
 Usage:  SC_E2E_APP=build/SecondCursor.app python3 e2e/find.py [scenario ...]
 Output: e2e/artifacts/<run-id>/ (report.md, results.json, transcript.jsonl, screenshots/)
@@ -39,6 +44,11 @@ SCENARIOS.clear()
 LINE = re.compile(r'^\[(\d+)\] (AX\w+) "((?:[^"\\]|\\.)*)"')
 FRAME = re.compile(r"\((-?\d+),(-?\d+) (\d+)x(\d+)\)")
 HIDDEN_IN_COMPACT = {"click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "batch"}
+HOST_TOOLS = {"session", "bind_target", "operation_status", "cancel_operation"}
+HOST_PARAMETERS = {"session_id", "operation_id", "observation_id", "timeout_ms"}
+# The default surface measured 63.8k characters before host parameters were hidden and expect, observe and caption
+# were described in full only on click and batch (browser_click for the browser).
+LISTING_BUDGET = 42000
 
 
 def parse(line):
@@ -337,6 +347,43 @@ def full_surface(ctx):
 
 
 @scenario
+def host_parameters(ctx):
+    """Failure modes 14 and 15. The browser carries the parameter checks, so they run on any Space."""
+    tools = ctx.mcp.rpc("tools/list")["tools"]
+    size = len(json.dumps(tools))
+    ctx.check(f"tools/list is at most {LISTING_BUDGET} characters", size <= LISTING_BUDGET, size)
+    names = {t["name"] for t in tools}
+    ctx.check("the session and operation tools are not listed", not (HOST_TOOLS & names), sorted(HOST_TOOLS & names))
+    leaked = sorted(f'{t["name"]}.{p}' for t in tools for p in t["inputSchema"].get("properties", {})
+                    if p in HOST_PARAMETERS and not (p == "timeout_ms" and t["name"] in ("wait_for", "browser_repl")))
+    ctx.check("no listed tool takes session_id, operation_id, observation_id or timeout_ms", not leaked, leaked)
+    wait_for = next(t for t in tools if t["name"] == "wait_for")["inputSchema"]["properties"]
+    ctx.check("wait_for keeps its timeout_ms", "timeout_ms" in wait_for, sorted(wait_for))
+
+    if not ctx.call("browser_status").get("connected"):
+        raise harness.Skip("Chrome extension not connected")
+    sid = ctx.call("session", action="create")["session_id"]
+    ctx.cleanups.append(lambda: ctx.mcp.call("session", action="close", session_id=sid))
+    with harness.FixtureServer() as base:
+        tab = ctx.call("browser_open", url=f"{base}/covered.html", session_id=sid)["tab"]["id"]
+        ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tab, session_id=sid))
+        first = ctx.call("browser_snapshot", tab_id=tab, session_id=sid, full=True)
+        target = re.search(r'\[(e\d+)\] button "Label: Spam"', first["outline"])[1]
+        clicks = lambda: re.search(r"clicks=\d+", ctx.call("browser_snapshot", tab_id=tab, session_id=sid, full=True)["outline"])[0]
+        tabs = ctx.call("browser_tabs", session_id=sid).get("tabs", [])
+        ctx.check("an unlisted session is created and owns the tab it opened", any(t["id"] == tab for t in tabs), tabs)
+
+        for _ in range(2):
+            ctx.call("browser_click", tab_id=tab, ref=target, session_id=sid, operation_id=f"host-{sid}")
+        ctx.check("an operation_id retry returns the first outcome without clicking again", clicks() == "clicks=1", clicks())
+        stale = refused(ctx, "browser_click", tab_id=tab, ref=target, session_id=sid, observation_id=first["snapshot_id"])
+        ctx.check("a superseded observation_id is refused", stale is not None and "Stale" in stale, stale)
+        expired = refused(ctx, "browser_click", tab_id=tab, ref=target, session_id=sid, timeout_ms=1)
+        ctx.check("a 1 ms timeout_ms expires before the click is sent", expired is not None, expired)
+        ctx.check("neither reached the page", clicks() == "clicks=1", clicks())
+
+
+@scenario
 def compact_surface(ctx):
     if ctx.run.instance is None:
         raise harness.Skip("needs disposable test instances")
@@ -353,7 +400,7 @@ def compact_surface(ctx):
     ctx.check("compact advertises act and find_elements", {"act", "find_elements"} <= names, sorted(names))
     ctx.check("and hides the single-action tools and batch", not (HIDDEN_IN_COMPACT & names), sorted(HIDDEN_IN_COMPACT & names))
     kept = {"status", "list_windows", "launch_app", "get_window_state", "screenshot", "select_text", "paste",
-            "inspect_element", "session"}
+            "inspect_element"}
     ctx.check("everything else stays", kept <= names, sorted(kept - names))
     ctx.check("/api lists the same tools as /mcp", api_tool_names(inst) == names, sorted(api_tool_names(inst) ^ names))
     ctx.check("act's schema is batch's", tools.get("act", {}).get("inputSchema") == main_tools["batch"]["inputSchema"])

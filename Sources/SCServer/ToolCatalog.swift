@@ -49,18 +49,28 @@ enum ToolCatalog {
     /// as well, or ("repl") browser_repl alone. Models offered both browser_repl and the discrete browser tools mixed
     /// them and ran slower than with either, so browser_repl is listed only when asked for.
     /// `expand` is listed only when reads are condensed (`condenseOutlines`), since nothing is hidden otherwise.
+    /// Sessions, retries and deadlines (docs/api.md) are for hosts, which pass them in code; a model never needs them,
+    /// so they are left out of every surface and stay accepted.
     static func advertised(surface: String?, condensing: Bool = false) -> [Tool] {
-        if surface == "repl" { return tools.filter { $0.name == "browser_repl" } }
         let hidden: Set<String> = surface == "compact" ? compactHiddenTools.union(["browser_repl"])
             : surface == "full" ? ["act"] : ["act", "browser_repl"]
-        return tools.filter { !hidden.contains($0.name) }.map { tool in
-            guard !condensing, case .object(var schema) = tool.inputSchema, case .object(var properties)? = schema["properties"],
-                  properties.removeValue(forKey: "expand") != nil
+        let listed = surface == "repl" ? tools.filter { $0.name == "browser_repl" }
+            : tools.filter { !hidden.contains($0.name) && !hostTools.contains($0.name) }
+        return listed.map { tool in
+            guard case .object(var schema) = tool.inputSchema, case .object(var properties)? = schema["properties"]
             else { return tool }
+            var dropped = hostParameters
+            // wait_for's timeout_ms bounds its wait, and browser_repl's a script the model wrote.
+            if ["wait_for", "browser_repl"].contains(tool.name) { dropped.remove("timeout_ms") }
+            if !condensing { dropped.insert("expand") }
+            for key in dropped { properties.removeValue(forKey: key) }
             schema["properties"] = .object(properties)
             return Tool(name: tool.name, description: tool.description, inputSchema: .object(schema), annotations: tool.annotations)
         }
     }
+
+    private static let hostParameters: Set<String> = ["session_id", "operation_id", "observation_id", "timeout_ms"]
+    private static let hostTools: Set<String> = ["session", "bind_target", "operation_status", "cancel_operation"]
 
     private static let expand = stringArray(
         "Ids of hidden parts of a condensed read (its '… N lines hidden (expand \"r3\")' lines) to return whole, as they "
@@ -411,7 +421,11 @@ enum ToolCatalog {
                 if browserScoped { props["browser_id"] = string("Instance from browser_instances.") }
                 if windowScopedTools.contains(tool.name) {
                     props["app"] = string(
-                        "App name or bundle id, instead of window_id. Reads and screenshots use the app's main window; actions, inspect_element and scoped reads use the window of that app you observed last.")
+                        tool.name == "get_window_state"
+                            ? "App name or bundle id, instead of window_id. Reads and screenshots use the app's main window; actions, inspect_element and scoped reads use the window of that app you observed last."
+                            : ["screenshot", "wait_for"].contains(tool.name)
+                                ? "App name or bundle id, instead of window_id: that app's main window."
+                                : "App name or bundle id, instead of window_id: the window of that app you observed last.")
                 }
                 if ["click", "drag", "scroll"].contains(tool.name) {
                     props["coordinate_space"] = string(
@@ -420,20 +434,26 @@ enum ToolCatalog {
                 }
                 if captionedTools.contains(tool.name) {
                     props["caption"] = string(
-                        "Optional: a few words shown to the user beside the agent's cursor while this runs, e.g. \"Opening the Export menu\". Present tense, under 60 characters.")
+                        ["click", "batch", "browser_click"].contains(tool.name)
+                            ? "Optional: a few words shown to the user beside the agent's cursor while this runs, e.g. \"Opening the Export menu\". Present tense, under 60 characters."
+                            : "Optional: a few words shown beside the agent's cursor while this runs, as in click.")
                 }
                 if observingTools.contains(tool.name) {
                     props["observe"] = string(
-                        "Returned after the action: tree (what changed since your last read of this window), both (tree and screenshot), screenshot, or none when chaining blind.",
+                        tool.name == "click"
+                            ? "Returned after the action: tree (what changed since your last read of this window), both (tree and screenshot), screenshot, or none when chaining blind."
+                            : "As in click.",
                         enumValues: ["tree", "both", "screenshot", "none"], default: "tree")
                 }
                 if observingBrowserTools.contains(tool.name) {
                     props["observe"] = string(
-                        "Returned after the action: tree (what changed since your last read of this tab), both (tree and screenshot), screenshot, or none when chaining blind.",
+                        tool.name == "browser_click"
+                            ? "Returned after the action: tree (what changed since your last read of this tab), both (tree and screenshot), screenshot, or none when chaining blind."
+                            : "As in browser_click.",
                         enumValues: ["tree", "both", "screenshot", "none"], default: "tree")
                 }
                 if observingTools.contains(tool.name) || tool.name == "batch" {
-                    props["expect"] = expect
+                    props["expect"] = ["click", "batch"].contains(tool.name) ? expect : expectPointer
                 }
                 if tool.name == "browser_snapshot" {
                     props["full"] = boolean(
@@ -564,6 +584,12 @@ enum ToolCatalog {
         "description":
             "Optional check that the action worked, instead of reading the window again: text somewhere in the window, or element_index having exactly value. It is checked once before the action, then waited for after it (for batch, after the last step). The result's expect says verified, preexisting (it already held before the action), or failed with what was seen instead; failed is not an error.",
         "properties": .object(conditionFields),
+    ]
+
+    private static let expectPointer: Value = [
+        "type": "object",
+        "description":
+            "Optional check that the action worked, as in click: {text} or {element_index, value}, with optional gone and timeout_ms.",
     ]
 
     /// Flat on each step rather than nested under args: Gemini through Cursor stringifies a free-form nested
