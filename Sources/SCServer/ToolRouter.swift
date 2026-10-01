@@ -296,7 +296,9 @@ final class ToolRouter: Sendable {
             app = AppGuard.windowTarget(owner).name
         } else if name == "launch_app" {
             app = try? args.string("app")
-        } else if name.hasPrefix("browser_"), !["browser_status", "browser_instances"].contains(name) {
+        } else if (name.hasPrefix("browser_") && !["browser_status", "browser_instances"].contains(name))
+            || Self.isTabBatch(name, args)
+        {
             // The extension draws the browser cursor and its caption inside the tab.
             desktop.noteAgentActivity(session: session, windowID: nil, app: "Chrome", showArrow: false, caption: nil)
             return
@@ -393,7 +395,7 @@ final class ToolRouter: Sendable {
                 await desktop.listApps(includeNotRunning: true)
             }
         }
-        if ToolCatalog.windowScopedTools.contains(name) {
+        if ToolCatalog.windowScopedTools.contains(name), !Self.isTabBatch(name, args) {
             return try appGuard.checkWindow(try args.windowID())
         }
         return nil

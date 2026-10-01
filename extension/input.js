@@ -133,9 +133,23 @@ function refError(ref, error) {
 const center = (quad) => ({ x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4, y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4 });
 const shift = (point, offset) => ({ x: point.x + offset.x, y: point.y + offset.y });
 
+/**
+ * Throws unless the ref's node is in the page. The page a tab left can stay alive in the back/forward cache, where its
+ * nodes still report boxes and take focus, so a click or typing would land on whatever the current page has there.
+ * Such a node cannot be resolved into the page.
+ */
+async function requireLive(send, id, ref) {
+  const objectGroup = "second-cursor-ref";
+  await send("DOM.resolveNode", { backendNodeId: id, objectGroup }).then(
+    () => send("Runtime.releaseObjectGroup", { objectGroup }).catch(() => {}),
+    () => { throw gone(ref); },
+  );
+}
+
 async function refTarget(tabId, ref) {
   const { id, send, owners } = resolve(tabId, ref);
   let local;
+  await requireLive(send, id, ref);
   try {
     for (const owner of owners) await owner.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: owner.id });
     await send("DOM.scrollIntoViewIfNeeded", { backendNodeId: id });
@@ -193,6 +207,7 @@ async function suggests(send, id) {
 export async function type(tabId, { ref, text, submit }) {
   if (ref != null && ref !== "") {
     const { id, send, owners } = resolve(tabId, ref);
+    await requireLive(send, id, ref);
     await send("DOM.focus", { backendNodeId: id }).catch((error) => {
       throw refError(ref, error);
     });

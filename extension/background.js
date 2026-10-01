@@ -123,17 +123,17 @@ const handlers = {
   "tab.click": async (params) => {
     const { tabId, ref, x, y } = params;
     await requireAgentTab(tabId);
-    return act(params, () => click(tabId, { ref, x, y }), {});
+    return act(params, () => click(tabId, { ref, x, y }), { quietMs: INPUT_NAVIGATION_MS });
   },
   "tab.type": async (params) => {
     const { tabId, ref, text, submit } = params;
     await requireAgentTab(tabId);
-    return act(params, () => type(tabId, { ref, text, submit }), { quietMs: submit ? 300 : 0 });
+    return act(params, () => type(tabId, { ref, text, submit }), { quietMs: submit ? INPUT_NAVIGATION_MS : 0 });
   },
   "tab.pressKey": async (params) => {
     const { tabId, keys } = params;
     await requireAgentTab(tabId);
-    return act(params, () => pressKey(tabId, keys), {});
+    return act(params, () => pressKey(tabId, keys), { quietMs: INPUT_NAVIGATION_MS });
   },
   "tab.scroll": async (params) => {
     const { tabId, direction, amount } = params;
@@ -147,18 +147,24 @@ const handlers = {
 };
 
 const OBSERVING = new Set(["tree", "both", "screenshot"]);
+// A navigation that input starts in its own event handler (a link, a form submit, location set in the handler) shows
+// as loading within a few ms of the input. Later ones (after a timer or a request) are waited for by the next read.
+const INPUT_NAVIGATION_MS = 100;
 
 /**
  * Runs an input action. A call that observes the page (`observe` tree, both or screenshot) reads it in the same
  * message once it settles: settled() waits for the page's reaction, and for a navigation the action started, so the
  * action waits for nothing first. Without a read the next call may act at once, so the action waits out any navigation
- * it starts (settleAround with `settleOptions`; null for input that cannot navigate). A dialog the action opens
- * answers the call before any read, which could not run until the dialog is answered.
+ * it starts (settleAround with `settleOptions`; null for input that cannot navigate), and the next read waits for its
+ * reaction as an observing action's would. A dialog the action opens answers the call before any read, which could
+ * not run until the dialog is answered.
  */
 async function act(params, action, settleOptions) {
   const { tabId, observe, session_id } = params;
   if (!OBSERVING.has(observe)) {
+    const at = Date.now();
     await (settleOptions ? settleAround(tabId, action, settleOptions) : action());
+    noteAction(tabId, at);
     return {};
   }
   const at = Date.now();

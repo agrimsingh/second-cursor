@@ -1676,7 +1676,8 @@ def browser_click_navigation(ctx):
     - A click handler that navigates 200 ms later, changing nothing first, is read before it goes.
     - One that changes the page at once and navigates 150 ms later is read as soon as that change goes quiet.
     - A slow load holds the read long after the page arrived (up to the 10 s a load may take).
-    - With observe="none" the click returns mid-navigation, and the next read shows the old page or a blank one.
+    - With observe="none" the click returns mid-navigation, and the next read shows the old page or a blank one; or
+      the click returns before a handler that navigates 200 ms later, and the next read does not wait for it.
     - observe="both" loses the screenshot, or the tree, when both come from the click's message.
     """
     if not ctx.call("browser_status").get("connected"):
@@ -1716,6 +1717,10 @@ def browser_click_navigation(ctx):
         click("Plain link", observe="none")
         read = ctx.call("browser_snapshot", tab_id=tid)
         ctx.check('with observe="none" the read right after the click shows the new page', arrived(read), read)
+        click("Go in 200 ms", role="button", observe="none")
+        read = ctx.call("browser_snapshot", tab_id=tid)
+        ctx.check('with observe="none" and a handler that navigates 200 ms later, the next read shows the new page',
+                  arrived(read), read)
 
         data, _ = click("Plain link", observe="both")
         observation = data.get("observation") or {}

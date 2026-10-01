@@ -67,7 +67,10 @@ enum ToolCatalog {
             + "were read, without reading again.")
 
     private static let actDescription =
-        "Act on one window: run a list of steps strictly in order, then get one observation after the UI settles. This is the way to act, with one step or many: put every step you already know in one call (pressing a known series of buttons, filling known fields, typing followed by a shortcut), and end the list before any step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet); then look at the observation and send the next list. Each step is a tool name (click, type_text, press_key, set_value, scroll, drag, perform_action, wait) plus that action's arguments. Element indexes come from get_window_state or find_elements and are not refreshed between steps. Pixel steps (x/y) take coordinate_space and stop the list if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the list stops at the first failure. The observation is a diff like get_window_state unless full=true."
+        "Act on one window: run a list of steps strictly in order, then get one observation after the UI settles. This is the way to act, with one step or many: put every step you already know in one call (pressing a known series of buttons, filling known fields, typing followed by a shortcut), and end the list before any step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet); then look at the observation and send the next list. Each step is a tool name (click, type_text, press_key, set_value, scroll, drag, perform_action, wait) plus that action's arguments. Element indexes come from get_window_state or find_elements and are not refreshed between steps. Pixel steps (x/y) take coordinate_space and stop the list if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the list stops at the first failure. The observation is a diff like get_window_state unless full=true. \(tabBatch)"
+
+    private static let tabBatch =
+        "With tab_id instead of window_id, the steps act in that agent tab: browser_click (ref, or x and y), browser_type (text, optional ref and submit), browser_press_key, browser_scroll and wait, with refs from the tab's latest outline (not refreshed between steps, so end the list where a step re-renders what later steps target); the observation is the tab's diff."
 
     private static let catalog: [Tool] =
         ([
@@ -155,10 +158,11 @@ enum ToolCatalog {
             Tool(
                 name: "batch",
                 description:
-                    "Run several actions on one window in a single call, strictly in order, then return one observation after the UI settles. Batch predictable sequences where you already know every step: pressing a known series of buttons, filling known fields, typing followed by a shortcut, keyboard navigation. Do not batch past a step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet): end the batch there and look at the observation, or call get_window_state. Element indexes come from get_window_state and are not refreshed between steps. Pixel steps (x/y clicks, drags, scrolls at a point) take coordinate_space like the standalone tools, and stop the batch if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the batch stops at the first failure. The observation is a diff like get_window_state unless full=true.",
+                    "Run several actions on one window in a single call, strictly in order, then return one observation after the UI settles. Batch predictable sequences where you already know every step: pressing a known series of buttons, filling known fields, typing followed by a shortcut, keyboard navigation. Do not batch past a step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet): end the batch there and look at the observation, or call get_window_state. Element indexes come from get_window_state and are not refreshed between steps. Pixel steps (x/y clicks, drags, scrolls at a point) take coordinate_space like the standalone tools, and stop the batch if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the batch stops at the first failure. The observation is a diff like get_window_state unless full=true. \(tabBatch)",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
+                        "tab_id": integer("Agent tab id from browser_open, instead of window_id: the steps act in that tab."),
                         "steps": .object([
                             "type": "array",
                             "minItems": .int(1),
@@ -173,7 +177,8 @@ enum ToolCatalog {
                                             "Step action.",
                                             enumValues: [
                                                 "click", "type_text", "press_key", "set_value", "scroll", "drag",
-                                                "perform_action", "wait",
+                                                "perform_action", "wait", "browser_click", "browser_type",
+                                                "browser_press_key", "browser_scroll",
                                             ])
                                     ]) { $1 }),
                                 "required": .array(["tool"]),
@@ -584,6 +589,8 @@ enum ToolCatalog {
         "action": string("perform_action: accessibility action name."),
         "ms": integer("wait: milliseconds."),
         "caption": string("Shown beside the agent's cursor from this step on, replacing the batch's caption."),
+        "ref": string("browser_click, browser_type: element ref from the tab's outline, such as e12."),
+        "submit": ["type": "boolean", "description": "browser_type: press Enter after typing."],
     ]
 
     private static let windowID = integer("Window id from list_windows or launch_app. Omit to target app instead.")

@@ -107,7 +107,7 @@ extension ToolRouter {
             return try await launchApp(args)
 
         case "batch":
-            return try await runBatch(args)
+            return Self.isTabBatch(name, args) ? try await runTabBatch(args) : try await runBatch(args)
 
         case "get_window_state":
             if let expanded = try expandedParts(args, target: "window:\(try args.windowID())", noun: "window") {
@@ -617,7 +617,7 @@ extension ToolRouter {
 
     /// Accepts args as an object, a JSON string, or fields beside tool. A malformed args value must fail
     /// loudly: silently dropping it makes the step report a missing argument instead.
-    private static func stepArguments(_ raw: [String: Value], index: Int, tool: String) throws -> [String: Value] {
+    static func stepArguments(_ raw: [String: Value], index: Int, tool: String) throws -> [String: Value] {
         var merged = raw.filter { $0.key != "tool" && $0.key != "args" }
         guard let value = raw["args"], !value.isNull else { return merged }
         guard let object = Arguments.nestedObject(value) else {

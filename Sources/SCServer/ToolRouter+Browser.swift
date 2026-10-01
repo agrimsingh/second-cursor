@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 import SCShared
 
 extension ToolRouter {
@@ -119,6 +120,140 @@ extension ToolRouter {
         }
     }
 
+    /// Step names a tab batch takes, with the native names models carry over, and the extension method each sends.
+    private static let tabSteps: [String: (tool: String, method: String)] = [
+        "browser_click": ("browser_click", "tab.click"), "click": ("browser_click", "tab.click"),
+        "browser_type": ("browser_type", "tab.type"), "type_text": ("browser_type", "tab.type"),
+        "browser_press_key": ("browser_press_key", "tab.pressKey"), "press_key": ("browser_press_key", "tab.pressKey"),
+        "browser_scroll": ("browser_scroll", "tab.scroll"), "scroll": ("browser_scroll", "tab.scroll"),
+        "wait": ("wait", "wait"),
+    ]
+
+    private struct TabStep {
+        let tool: String
+        let method: String
+        let params: [String: Any]
+        let waitMS: Int
+        let logDetail: String?
+        let caption: String?
+    }
+
+    static func isTabBatch(_ name: String, _ args: Arguments) -> Bool {
+        name == "batch" && !(args.raw["tab_id"]?.isNull ?? true)
+    }
+
+    /// `batch` with tab_id: every step is parsed before any runs, then each is sent as its own action without a read
+    /// (one that navigates still waits for the load), and the tab is read once after the last. Each step passes the
+    /// pause gate and gets its own action log line, like a native batch's.
+    func runTabBatch(_ args: Arguments) async throws -> ToolOutput {
+        let tabID = try args.int("tab_id")
+        guard args.raw["window_id"]?.isNull ?? true else {
+            throw SCError.invalidArgument("Pass tab_id or window_id, not both: a batch acts in one tab or one window")
+        }
+        guard args.raw["expect"]?.isNull ?? true else {
+            throw SCError.invalidArgument("expect checks a window; for a tab, read the batch's observation")
+        }
+        let rawSteps = try args.objects("steps")
+        guard !rawSteps.isEmpty else { throw SCError.invalidArgument("steps must contain at least one step") }
+        guard rawSteps.count <= 50 else { throw SCError.invalidArgument("A batch holds at most 50 steps") }
+        let steps = try rawSteps.enumerated().map { try Self.tabStep($0.element, index: $0.offset, tabID: tabID) }
+        let mode = try Self.observeMode(args)
+        let stopOnError = try args.bool("stop_on_error", default: true)
+        await showCaption(args)
+
+        var results: [[String: Any]] = []
+        var events: [Any] = []
+        var stopped = false
+        for (index, step) in steps.enumerated() {
+            var result: [String: Any] = ["index": index, "tool": step.tool]
+            guard !stopped else {
+                result["ok"] = false
+                result["skipped"] = true
+                results.append(result)
+                continue
+            }
+            do {
+                if PauseState.isPaused {
+                    log.record(ActionLogEntry(
+                        tool: step.tool, target: "tab_id=\(tabID)", detail: "refused: \(Self.message(for: SCError.paused))"))
+                    throw SCError.paused
+                }
+                log.record(ActionLogEntry(tool: step.tool, target: "tab_id=\(tabID)", detail: step.logDetail))
+                if let caption = step.caption { await showCaption(caption, tabID: tabID) }
+                if step.method == "wait" {
+                    try await Task.sleep(nanoseconds: UInt64(step.waitMS) * 1_000_000)
+                } else {
+                    let reply = try await acted(step.method, step.params, "none")
+                    events += reply["events"] as? [Any] ?? []
+                }
+                result["ok"] = true
+            } catch {
+                result["ok"] = false
+                result["error"] = Self.message(for: error)
+                stopped = stopOnError
+            }
+            results.append(result)
+        }
+        var base: [String: Any] = [
+            "steps": results, "completed": results.filter { $0["ok"] as? Bool == true }.count,
+            "stopped_early": results.contains { $0["skipped"] != nil }, "tab_id": tabID,
+        ]
+        if mode == "none" { base["observation"] = NSNull() }
+        return await observed(
+            events.isEmpty ? [:] : ["events": events], base: base, tabID: tabID, mode: mode,
+            full: try args.bool("full", default: false))
+    }
+
+    private static func tabStep(_ raw: [String: Value], index: Int, tabID: Int) throws -> TabStep {
+        let named = try Arguments(raw).string("tool").lowercased()
+        guard let (tool, method) = tabSteps[named] else {
+            throw SCError.invalidArgument(
+                "Step \(index): with tab_id, tool must be one of browser_click, browser_type, browser_press_key, "
+                    + "browser_scroll, wait")
+        }
+        let args = Arguments(try stepArguments(raw, index: index, tool: named))
+        guard args.raw["element_index"] == nil, args.raw["window_id"] == nil else {
+            throw SCError.invalidArgument(
+                "Step \(index) (\(tool)): a tab batch targets elements by ref from the tab's outline, not element_index")
+        }
+        func required(_ key: String) throws -> String {
+            guard let value = try args.optionalString(key) else {
+                throw SCError.invalidArgument("Step \(index) (\(tool)): \(key) is required")
+            }
+            return value
+        }
+        var params: [String: Any] = ["tabId": tabID]
+        var waitMS = 0
+        switch tool {
+        case "browser_click":
+            if let ref = try args.optionalString("ref") {
+                params["ref"] = ref
+            } else if let x = try args.optionalDouble("x"), let y = try args.optionalDouble("y") {
+                params["x"] = x
+                params["y"] = y
+            } else {
+                throw SCError.invalidArgument("Step \(index) (browser_click): pass ref, or both x and y")
+            }
+        case "browser_type":
+            params["text"] = try required("text")
+            params["submit"] = try args.bool("submit", default: false)
+            params["ref"] = try args.optionalString("ref")
+        case "browser_press_key":
+            params["keys"] = try required("keys")
+        case "browser_scroll":
+            params["direction"] = try args.direction().rawValue
+            params["amount"] = max(try args.int("amount", default: 3), 1)
+        default:
+            guard let ms = try args.optionalInt("ms") ?? args.optionalInt("milliseconds") else {
+                throw SCError.invalidArgument("Step \(index) (wait): ms is required")
+            }
+            waitMS = max(ms, 0)
+        }
+        return TabStep(
+            tool: tool, method: method, params: params, waitMS: waitMS, logDetail: args.logDetail,
+            caption: try args.optionalString("caption"))
+    }
+
     /// Sends an input action with the observation the call wants, which the extension reads in the same message once
     /// the page settles.
     private func acted(_ method: String, _ params: [String: Any], _ mode: String) async throws -> [String: Any] {
@@ -135,9 +270,9 @@ extension ToolRouter {
     /// happened, so a failed read is reported as `observation_error` rather than thrown; with `both`, a failed capture
     /// keeps the tree. An extension that did not read in the action's message (one from before observe, or an action a
     /// dialog interrupted) is asked for the read separately.
-    private func observed(_ reply: [String: Any], base: [String: Any] = Shape.ok, tabID: Int, mode: String) async
-        -> ToolOutput
-    {
+    private func observed(
+        _ reply: [String: Any], base: [String: Any] = Shape.ok, tabID: Int, mode: String, full: Bool = false
+    ) async -> ToolOutput {
         var json = base
         if let events = reply["events"] { json["events"] = events }
         guard mode != "none" else { return ToolOutput(json: json) }
@@ -157,7 +292,7 @@ extension ToolRouter {
         do {
             switch mode {
             case "tree", "both":
-                let params = try JSONSerialization.data(withJSONObject: ["tabId": tabID, "full": false])
+                let params = try JSONSerialization.data(withJSONObject: ["tabId": tabID, "full": full])
                 var observation = try JSONSerialization.jsonObject(
                     with: await browser.command("tab.snapshot", params: params)) as? [String: Any] ?? [:]
                 if let events = observation.removeValue(forKey: "events") as? [Any] {
@@ -200,9 +335,13 @@ extension ToolRouter {
     /// The extension draws the caption beside its in-page cursor (browser_command carries its own). Best effort:
     /// an extension that predates captions refuses the method, and the action still runs.
     private func showCaption(_ args: Arguments) async {
-        let caption = (try? args.optionalString("caption")).flatMap { $0 }.map(Self.caption) ?? ""
-        guard let tab = try? args.int("tab_id"),
-              let params = try? JSONSerialization.data(withJSONObject: ["tabId": tab, "caption": caption])
+        guard let tab = try? args.int("tab_id") else { return }
+        await showCaption((try? args.optionalString("caption")).flatMap { $0 }, tabID: tab)
+    }
+
+    private func showCaption(_ caption: String?, tabID: Int) async {
+        guard let params = try? JSONSerialization.data(
+            withJSONObject: ["tabId": tabID, "caption": caption.map(Self.caption) ?? ""])
         else { return }
         _ = try? await browser.command("cursor.caption", params: params)
     }
