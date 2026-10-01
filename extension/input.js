@@ -6,8 +6,11 @@ import { isolatedFrame } from "./snapshot.js";
 import { expectQuickReaction } from "./tabs.js";
 import { timed } from "./timing.js";
 
-// Long enough for a field that checks what was typed after a short debounce.
-const PLAIN_FIELD_REACT_MS = 300;
+// Long enough for a field that checks what was typed (or was left, on Tab) after a short debounce.
+const QUICK_REACT_MS = 300;
+// Moving focus or dismissing something starts no request worth waiting for. Arrow keys can switch a tab whose panel
+// loads, and page keys can scroll in more results, so they keep the full wait.
+const FOCUS_KEYS = new Set(["Tab", "Escape"]);
 
 const gone = (ref) => new BridgeError("invalid_argument", `Ref ${ref} is no longer on the page; take a new browser_snapshot`);
 
@@ -193,7 +196,7 @@ export async function type(tabId, { ref, text, submit }) {
     await send("DOM.focus", { backendNodeId: id }).catch((error) => {
       throw refError(ref, error);
     });
-    if (text && !submit && !(await suggests(send, id).catch(() => true))) expectQuickReaction(tabId, PLAIN_FIELD_REACT_MS);
+    if (text && !submit && !(await suggests(send, id).catch(() => true))) expectQuickReaction(tabId, QUICK_REACT_MS);
     pointTo(tabId, async () => {
       const { model } = await send("DOM.getBoxModel", { backendNodeId: id });
       return shift(fieldPoint(model.border), await frameOffset(owners));
@@ -206,6 +209,7 @@ export async function type(tabId, { ref, text, submit }) {
 export async function pressKey(tabId, keys) {
   const { modifiers, key, command } = parseChord(keys);
   show(tabId);
+  if (FOCUS_KEYS.has(key.key) && modifiers.every((m) => m.key === "Shift")) expectQuickReaction(tabId, QUICK_REACT_MS);
   const send = (params) => cdp(tabId, "Input.dispatchKeyEvent", params);
   let bits = 0;
   for (const m of modifiers) {

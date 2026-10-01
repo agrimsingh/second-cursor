@@ -214,6 +214,10 @@ def browser_latency(ctx):
     plain = medians["type into a plain field"]
     ctx.check("typing into a field that shows no suggestions does not wait for them (median under 800 ms)", plain < 800,
               plain)
+    tab = medians["press Tab"]
+    ctx.check("Tab, which only moves focus, does not wait for a request (median under 700 ms, not the 1.2 s wait)",
+              tab < 700, tab)
+    ctx.check("and its own observation shows where focus went every time", all(seen["press Tab"]), shown["press Tab"])
 
 
 if __name__ == "__main__":

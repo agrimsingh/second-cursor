@@ -1662,6 +1662,65 @@ def browser_settled_reads(ctx):
 
 
 @scenario
+def browser_click_navigation(ctx):
+    """A click that navigates answers with the page it navigated to. The click's own message reads the page, so
+    nothing but that read stands between the click and the next page.
+
+    Ways this can fail, each checked against e2e/fixtures/navigate.html:
+    - The click's observation is the page it left: the read ran before the navigation began (a plain link), or before
+      the new page arrived (a link whose response takes 2.5 s, longer than a read's usual 2 s wait).
+    - A click handler that navigates 200 ms later, changing nothing first, is read before it goes.
+    - One that changes the page at once and navigates 150 ms later is read as soon as that change goes quiet.
+    - A slow load holds the read long after the page arrived (up to the 10 s a load may take).
+    - With observe="none" the click returns mid-navigation, and the next read shows the old page or a blank one.
+    - observe="both" loses the screenshot, or the tree, when both come from the click's message.
+    """
+    if not ctx.call("browser_status").get("connected"):
+        raise Skip("Chrome extension not connected")
+    with FixtureServer() as base:
+        start = f"{base}/navigate.html"
+        tid = ctx.call("browser_open", url=start)["tab"]["id"]
+        ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
+
+        def click(name, role="link", **args):
+            ctx.call("browser_navigate", tab_id=tid, url=start, observe="none")
+            outline = ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]
+            match = re.search(rf'\[(\w+)\] {role} "{name}"', outline)
+            ctx.require(f'the start page has {role} "{name}"', match, outline[:600])
+            started = time.time()
+            data = ctx.call("browser_click", tab_id=tid, ref=match.group(1), **args)
+            return data, time.time() - started
+
+        def arrived(observation):
+            url = (observation or {}).get("tab", {}).get("url", "").split("?")[0]
+            return "arrived" in (observation or {}).get("outline", "") and url.endswith("/next.html")
+
+        data, _ = click("Plain link")
+        ctx.check("a link's click answers with the page it opened", arrived(data.get("observation")),
+                  data.get("observation"))
+        data, took = click("Slow link")
+        ctx.check("a link whose page takes 2.5 s to answer: the click waits for that page",
+                  arrived(data.get("observation")), data.get("observation"))
+        ctx.check("and not much longer (< 4.5 s)", took < 4.5, f"{took:.2f}s")
+        data, _ = click("Go in 200 ms", role="button")
+        ctx.check("a handler that navigates 200 ms after the click, changing nothing first: the click answers with "
+                  "the new page", arrived(data.get("observation")), data.get("observation"))
+        data, _ = click("Show progress, then go", role="button")
+        ctx.check("a handler that changes the page, then navigates 150 ms later: the click answers with the new page",
+                  arrived(data.get("observation")), data.get("observation"))
+
+        click("Plain link", observe="none")
+        read = ctx.call("browser_snapshot", tab_id=tid)
+        ctx.check('with observe="none" the read right after the click shows the new page', arrived(read), read)
+
+        data, _ = click("Plain link", observe="both")
+        observation = data.get("observation") or {}
+        ctx.check('observe="both" answers with the new page and its screenshot',
+                  arrived(observation) and observation.get("screenshot", {}).get("width", 0) > 0,
+                  {k: v for k, v in observation.items() if k != "outline"})
+
+
+@scenario
 def browser_compact_outline(ctx):
     """The outline a model reads for a page: every control and visible text, in as few tokens as possible.
 

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Second Cursor fixture — navigate</title></head>
+<body>
+  <h1>Start page</h1>
+  <p><a href="next.html">Plain link</a></p>
+  <p><a href="next.html?delay_ms=2500">Slow link</a></p>
+  <p><button id="later">Go in 200 ms</button></p>
+  <p><button id="busy">Show progress, then go</button></p>
+  <p id="status">idle</p>
+  <script>
+    // A click handler that navigates a moment later, changing nothing on the page first.
+    document.getElementById("later").addEventListener("click", () => setTimeout(() => { location.href = "next.html"; }, 200));
+    // One that shows progress at once, then navigates once its quiet window has nearly run out.
+    document.getElementById("busy").addEventListener("click", () => {
+      document.getElementById("status").textContent = "working";
+      setTimeout(() => { location.href = "next.html"; }, 150);
+    });
+  </script>
+</body>
+</html>

@@ -120,33 +120,63 @@ const handlers = {
       diff_base: is_diff ? previous.id : null,
     };
   },
-  "tab.click": async ({ tabId, ref, x, y }) => {
+  "tab.click": async (params) => {
+    const { tabId, ref, x, y } = params;
     await requireAgentTab(tabId);
-    await settleAround(tabId, () => click(tabId, { ref, x, y }));
-    return {};
+    return act(params, () => click(tabId, { ref, x, y }), {});
   },
-  "tab.type": async ({ tabId, ref, text, submit }) => {
+  "tab.type": async (params) => {
+    const { tabId, ref, text, submit } = params;
     await requireAgentTab(tabId);
-    await settleAround(tabId, () => type(tabId, { ref, text, submit }), {
-      quietMs: submit ? 300 : 0,
-    });
-    return {};
+    return act(params, () => type(tabId, { ref, text, submit }), { quietMs: submit ? 300 : 0 });
   },
-  "tab.pressKey": async ({ tabId, keys }) => {
+  "tab.pressKey": async (params) => {
+    const { tabId, keys } = params;
     await requireAgentTab(tabId);
-    await settleAround(tabId, () => pressKey(tabId, keys));
-    return {};
+    return act(params, () => pressKey(tabId, keys), {});
   },
-  "tab.scroll": async ({ tabId, direction, amount }) => {
+  "tab.scroll": async (params) => {
+    const { tabId, direction, amount } = params;
     await requireAgentTab(tabId);
-    await scroll(tabId, direction, amount);
-    return {};
+    return act(params, () => scroll(tabId, direction, amount), null);
   },
   "tab.screenshot": async ({ tabId }) => {
     await requireAgentTab(tabId);
     return await timing.timed(tabId, "screenshot", () => screenshot(tabId));
   },
 };
+
+const OBSERVING = new Set(["tree", "both", "screenshot"]);
+
+/**
+ * Runs an input action. A call that observes the page (`observe` tree, both or screenshot) reads it in the same
+ * message once it settles: settled() waits for the page's reaction, and for a navigation the action started, so the
+ * action waits for nothing first. Without a read the next call may act at once, so the action waits out any navigation
+ * it starts (settleAround with `settleOptions`; null for input that cannot navigate). A dialog the action opens
+ * answers the call before any read, which could not run until the dialog is answered.
+ */
+async function act(params, action, settleOptions) {
+  const { tabId, observe, session_id } = params;
+  if (!OBSERVING.has(observe)) {
+    await (settleOptions ? settleAround(tabId, action, settleOptions) : action());
+    return {};
+  }
+  const at = Date.now();
+  const blocked = await withDialog(tabId, async () => {
+    await timing.timed(tabId, "action", action);
+  });
+  if (blocked?.dialog_open) return blocked;
+  noteAction(tabId, at);
+  const reply = {};
+  try {
+    if (observe === "screenshot") await settled(tabId);
+    else reply.observation = await handlers["tab.snapshot"]({ tabId, session_id, full: false });
+    if (observe !== "tree") reply.screenshot = await timing.timed(tabId, "screenshot", () => screenshot(tabId));
+  } catch (error) {
+    reply.observation_error = error.message ?? String(error);
+  }
+  return reply;
+}
 
 /**
  * The removed (-) and added (+) lines between two outlines, in order. Lines on a longest common subsequence drop
@@ -250,7 +280,9 @@ async function dispatch(activePort, { id, method, params, receivedAt }) {
     };
     const events = REPORTING.has(method) ? takeReports(params.session_id ?? "legacy") : [];
     if (events.length) reply.result = { ...reply.result, events };
-    if (acts) noteAction(params.tabId, dispatchedAt);
+    // An action that read the page in this message stamped itself before reading (act).
+    if (acts && !(ACTIONS.has(method) && OBSERVING.has(params.observe) && !reply.result?.dialog_open))
+      noteAction(params.tabId, dispatchedAt);
     if (phases)
       reply.result = {
         ...reply.result,

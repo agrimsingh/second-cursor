@@ -49,7 +49,7 @@ extension ToolRouter {
 
         case "browser_navigate":
             let tab = try await browser.navigate(tabID: try args.int("tab_id"), url: try args.string("url"))
-            return await observed(["tab": Shape.tab(tab)], tabID: try args.int("tab_id"), mode: mode)
+            return await observed([:], base: ["tab": Shape.tab(tab)], tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_snapshot":
             let params = try JSONSerialization.data(withJSONObject: [
@@ -73,7 +73,7 @@ extension ToolRouter {
             } else {
                 throw SCError.invalidArgument("Pass ref, or both x and y")
             }
-            return await observed(try await reported("tab.click", params), tabID: try args.int("tab_id"), mode: mode)
+            return await observed(try await acted("tab.click", params, mode), tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_type":
             var params: [String: Any] = [
@@ -81,19 +81,19 @@ extension ToolRouter {
                 "submit": try args.bool("submit", default: false),
             ]
             params["ref"] = try args.optionalString("ref")
-            return await observed(try await reported("tab.type", params), tabID: try args.int("tab_id"), mode: mode)
+            return await observed(try await acted("tab.type", params, mode), tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_press_key":
-            let result = try await reported(
-                "tab.pressKey", ["tabId": try args.int("tab_id"), "keys": try args.string("keys")])
-            return await observed(result, tabID: try args.int("tab_id"), mode: mode)
+            let reply = try await acted(
+                "tab.pressKey", ["tabId": try args.int("tab_id"), "keys": try args.string("keys")], mode)
+            return await observed(reply, tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_scroll":
-            let result = try await reported("tab.scroll", [
+            let reply = try await acted("tab.scroll", [
                 "tabId": try args.int("tab_id"), "direction": try args.direction().rawValue,
                 "amount": max(try args.int("amount", default: 3), 1),
-            ])
-            return await observed(result, tabID: try args.int("tab_id"), mode: mode)
+            ], mode)
+            return await observed(reply, tabID: try args.int("tab_id"), mode: mode)
 
         case "browser_screenshot":
             let shot = try await browser.screenshot(tabID: try args.int("tab_id"))
@@ -110,21 +110,41 @@ extension ToolRouter {
         }
     }
 
-    /// An action answers ok, plus the `[system]` lines the extension queued for the session since its last reply
-    /// (a tab the page opened, a dialog, a download).
-    private func reported(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
-        let reply = try JSONSerialization.jsonObject(
+    /// Sends an input action with the observation the call wants, which the extension reads in the same message once
+    /// the page settles.
+    private func acted(_ method: String, _ params: [String: Any], _ mode: String) async throws -> [String: Any] {
+        var params = params
+        params["observe"] = mode
+        return try JSONSerialization.jsonObject(
             with: await browser.command(method, params: JSONSerialization.data(withJSONObject: params))) as? [String: Any]
-        guard let events = reply?["events"] else { return Shape.ok }
-        return Shape.ok.merging(["events": events]) { $1 }
+            ?? [:]
     }
 
-    /// Adds `observation` to a browser action's result, like attachObservation for native actions: the tab read once
-    /// it settles, as a diff against this session's last read, which it replaces. The action already happened, so a
-    /// failed read is reported as `observation_error` rather than thrown; with `both`, a failed capture keeps the tree.
-    /// Events queued while the page settled come back on the read and join the action's.
-    private func observed(_ result: [String: Any], tabID: Int, mode: String) async -> ToolOutput {
-        var json = result
+    /// An action answers ok, plus the `[system]` lines the extension queued for the session since its last reply
+    /// (a tab the page opened, a dialog, a download), plus `observation`, like attachObservation for native actions:
+    /// the tab read once it settles, as a diff against this session's last read, which it replaces. The action already
+    /// happened, so a failed read is reported as `observation_error` rather than thrown; with `both`, a failed capture
+    /// keeps the tree. An extension that did not read in the action's message (one from before observe, or an action a
+    /// dialog interrupted) is asked for the read separately.
+    private func observed(_ reply: [String: Any], base: [String: Any] = Shape.ok, tabID: Int, mode: String) async
+        -> ToolOutput
+    {
+        var json = base
+        if let events = reply["events"] { json["events"] = events }
+        guard mode != "none" else { return ToolOutput(json: json) }
+        let shot = Self.screenshot(reply["screenshot"])
+        if reply["observation"] != nil || shot != nil || reply["observation_error"] != nil {
+            var images: [Screenshot] = []
+            if mode == "screenshot" {
+                if let shot { json["observation"] = Shape.screenshot(shot) }
+            } else if var observation = reply["observation"] as? [String: Any] {
+                if mode == "both", let shot { observation["screenshot"] = Shape.screenshot(shot) }
+                json["observation"] = observation
+            }
+            if let shot, mode != "tree" { images = [shot] }
+            if let error = reply["observation_error"] { json["observation_error"] = error }
+            return ToolOutput(json: json, images: images)
+        }
         do {
             switch mode {
             case "tree", "both":
@@ -151,6 +171,14 @@ extension ToolRouter {
             json["observation_error"] = Self.message(for: error)
             return ToolOutput(json: json)
         }
+    }
+
+    private static func screenshot(_ value: Any?) -> Screenshot? {
+        guard let object = value as? [String: Any], let encoded = object["data"] as? String,
+              let png = Data(base64Encoded: encoded) else { return nil }
+        return Screenshot(
+            pngData: png, width: (object["width"] as? NSNumber)?.intValue ?? 0,
+            height: (object["height"] as? NSNumber)?.intValue ?? 0, scale: (object["scale"] as? NSNumber)?.doubleValue ?? 1)
     }
 
     /// The extension draws the caption beside its in-page cursor (browser_command carries its own). Best effort:

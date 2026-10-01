@@ -324,6 +324,17 @@ chrome.tabs.onRemoved.addListener((tabId) => settleContexts.delete(tabId));
 const lastAction = new Map();
 chrome.tabs.onRemoved.addListener((tabId) => lastAction.delete(tabId));
 
+// When each tab last began loading a document, and whether it has finished, so a read that follows an action does not
+// return the page the action is navigating away from.
+const loads = new Map();
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status === "loading") loads.set(tabId, { at: Date.now(), done: false });
+  else if (info.status === "complete" && loads.has(tabId)) loads.get(tabId).done = true;
+});
+chrome.tabs.onRemoved.addListener((tabId) => loads.delete(tabId));
+// A load the last action started may take this long before the read gives up waiting for it.
+const ACTION_LOAD_MS = 10000;
+
 /**
  * Input that may make the page fetch and render something (a filter, a search, "load more"), or (`load`) a page load.
  * `at` must be when the input was dispatched: a page that re-renders during the action has already reacted, and
@@ -340,16 +351,32 @@ export function noteAction(tabId, at = Date.now(), load = false) {
  * (or of the load, which counts as one), a page that has not changed since is usually still waiting for a request
  * (search results, a filter, "load more"), so the read waits for the change to start first. While the last action is
  * a load, a page whose network has gone idle has no request left to wait for, so every read stops waiting for one.
+ * A document the action started loading counts as such a load, and is waited for until it finishes (at most
+ * ACTION_LOAD_MS), however long that takes.
  * The first probe of a document starts its clock, so an idle page costs `quietMs` once, and nothing on later reads.
  */
 export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200 } = {}) {
   const began = Date.now();
-  const { at: actedAt = 0, load = false, reactMs: quick } = lastAction.get(tabId) ?? {};
+  const { at: actedAt = 0, reactMs: quick } = lastAction.get(tabId) ?? {};
+  let { load = false } = lastAction.get(tabId) ?? {};
   const reactWithin = Math.min(reactMs, quick ?? reactMs);
+  let deadline = began + timeoutMs;
   // Split out the wait for a reaction that has not started from the wait for the page to go quiet.
   let reacting = 0;
+  let loading = 0;
   try {
-    while (Date.now() - began < timeoutMs) {
+    while (Date.now() < deadline) {
+      const navigation = loads.get(tabId);
+      if (navigation && navigation.at >= actedAt) {
+        load = true;
+        if (!navigation.done && (await chrome.tabs.get(tabId).catch(() => null))?.status === "loading") {
+          deadline = Math.max(deadline, navigation.at + ACTION_LOAD_MS);
+          loading += 50;
+          await sleep(50);
+          continue;
+        }
+        navigation.done = true;
+      }
       const state = await settleProbe(tabId);
       if (!state) return;
       const sinceAction = Date.now() - actedAt;
@@ -364,6 +391,7 @@ export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs 
   } finally {
     addTiming(tabId, "settled", Date.now() - began);
     if (reacting) addTiming(tabId, "settled_awaiting_reaction", reacting);
+    if (loading) addTiming(tabId, "settled_loading", loading);
   }
 }
 
