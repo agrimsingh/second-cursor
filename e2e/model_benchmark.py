@@ -25,7 +25,7 @@ REPO = ROOT.parent
 
 def runner_fingerprint():
     digest = hashlib.sha256()
-    for path in [ROOT / "model_benchmark.py", ROOT / "model_efficiency.py", ROOT / "best_in_class.py", ROOT / "run.py", ROOT / "start-browser.py",
+    for path in [ROOT / "model_benchmark.py", ROOT / "model_efficiency.py", ROOT / "model_sweep.py", ROOT / "best_in_class.py", ROOT / "run.py", ROOT / "start-browser.py",
                  *(ROOT / "benchmarks" / name for name in
                  ("model_adapter.py", "model_host.py", "cursor_model_host.py", "engines.py", "completion_timing.py", "tool_surface.py")),
                  *(ROOT / "cursor_host" / name for name in ("bridge.mjs", "package.json", "package-lock.json"))]:

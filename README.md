@@ -96,7 +96,7 @@ At the end of an agent turn, `SecondCursor --turn-ended --session <id>` resets t
 
 ### Choose a model
 
-Second Cursor runs no model of its own. Whatever client you connect brings one, so pick it in that client. For UI work, medium reasoning effort is usually enough. In real-agent runs on three browser tasks, Grok 4.7 at medium effort was as accurate as at extra-high effort every time. It finished a product search twice as fast, but saved little on long multi-step tasks, where it took more steps.
+Second Cursor runs no model of its own. Whatever client you connect brings one, so pick it in that client. The [initial five-configuration comparison](docs/verification-model-sweep-2026-10-04.md) supports Sol 6.1 medium as a provisional default and Grok 4.5 Fast low for the Cursor SDK route. Both passed all five scheduled trials; Sol was faster on native editing and dialog handling, while Grok was slightly faster on the single form trial. These results include host overhead and use small fixed fixtures, so they do not establish general model intelligence or price/performance.
 
 ## Tools
 
@@ -134,9 +134,9 @@ Desktop and browser acceptance suites run against a disposable test instance. Th
 
 `python3 e2e/model_efficiency.py --model gpt-6.1-sol --reasoning-effort high --rounds 5 --list` previews a separate Second Cursor experiment comparing observations requested by the model with observations supplied upfront. Remove `--list` to run ten fresh Calculator → TextEdit trials in alternating order. Both modes count every observation in time and call budgets, preserve independent outcome checks, and report the model's final-response delay separately when the tool trace proves the completed edit. See [the acceptance criteria](docs/acceptance-model-efficiency.md).
 
-The optional [Cursor model host](e2e/cursor_host/README.md) runs Grok 4.5/4.7 Fast through the same scoped driver and independent judges. It pins the SDK, complete model selection, and separate host identity. Grok 4.7 passed one native pilot; Grok 4.5 passed its transport smoke test. See [verification and limits](docs/verification-cursor-model-host-2026-10-04.md); these results do not establish a model ranking.
+The optional [Cursor model host](e2e/cursor_host/README.md) runs Grok 4.5/4.7 Fast through the same scoped driver and independent judges. It pins the SDK, complete model selection, and separate host identity. `python3 e2e/model_sweep.py --rounds 3 --timeout 90 --list` previews the five-configuration native comparison; remove `--list` to execute it. For the browser screen, use `--rounds 1 --task browser_work_order --task transient_dialog`. This compares the model together with its host, keeps failed and missing trials in the denominator, and reports successful latency per task. See [the experiment contract](docs/acceptance-model-sweep.md) and [results and limits](docs/verification-model-sweep-2026-10-04.md).
 
-Add `--experiment tool-surface` to compare full and compact catalogs with upfront observations enabled in both. The compact catalog represents actions through the complete batch schema and retains all observation tools; the engine still checks each nested action against its original allowlist. Results from the two experiments stay separate.
+Add `--experiment tool-surface` to `model_efficiency.py` to compare full and compact catalogs with upfront observations enabled in both. The compact catalog represents actions through the complete batch schema and retains all observation tools; the engine still checks each nested action against its original allowlist. Results from the two experiments stay separate.
 
 ```bash
 python3 e2e/run.py            # or name scenarios: python3 e2e/run.py textedit_background calculator
