@@ -125,6 +125,76 @@ class HostProtocolTests(unittest.TestCase):
         self.assertFalse(request["allowProviderModelFallback"])
         self.assertEqual([event["type"] for event in events].count("tool"), 1)
 
+    def test_milestones_share_tool_clock_and_never_claim_verified_completion(self):
+        reasoning = {"method": "item/started", "params": {"threadId": "thread-1",
+                     "turnId": "turn-1", "item": {"type": "reasoning", "id": "reason-1"}}}
+        result, _, events = self.run_host([reasoning, tool_call(), completed()])
+        milestones = [event for event in events if event["type"] == "host_milestone"]
+        self.assertEqual([event["name"] for event in milestones], [
+            "host_started", "startup_ready", "thread_ready", "turn_submitted",
+            "first_model_activity", "turn_completed", "final_response_completed", "host_finished"])
+        self.assertEqual(result.milestones_ms,
+                         {event["name"]: event["at_ms"] for event in milestones})
+        self.assertEqual(result.milestones_ms["host_started"], 0)
+        self.assertEqual(result.milestones_ms["host_finished"], result.wall_ms)
+        self.assertEqual(result.as_dict()["milestones_ms"], result.milestones_ms)
+        self.assertEqual([event["at_ms"] for event in milestones],
+                         sorted(event["at_ms"] for event in milestones))
+        tool = next(event for event in events if event["type"] == "tool")
+        self.assertLessEqual(result.milestones_ms["first_model_activity"], tool["start_ms"])
+        self.assertLessEqual(tool["end_ms"], result.milestones_ms["turn_completed"])
+        self.assertTrue(all("verified" not in key for key in result.milestones_ms))
+        self.assertIsNone(result.model_ms)
+
+    def test_buffered_notifications_keep_receipt_times_and_text_events_are_timed(self):
+        clock = [100.0]
+
+        def early_events():
+            yield {"method": "item/agentMessage/delta", "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "delta": "Finished."}}
+            clock[0] += 5
+            yield completed()
+            clock[0] += 5
+
+        with mock.patch.object(host.time, "monotonic", side_effect=lambda: clock[0]):
+            result, _, events = self.run_host([], early_turn_events=early_events())
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.milestones_ms["first_model_activity"], 0)
+        self.assertEqual(result.milestones_ms["turn_completed"], 5000)
+        self.assertEqual(result.milestones_ms["final_response_completed"], 5000)
+        self.assertEqual(result.wall_ms, 10000)
+        self.assertEqual(next(event for event in events if event["type"] == "assistant_delta")["at_ms"], 0)
+        self.assertEqual(next(event for event in events if event["type"] == "assistant")["at_ms"], 5000)
+
+    def test_failed_isolation_emits_no_ready_or_model_activity_milestone(self):
+        result, _, events = self.run_host([tool_call(), completed()], inventory={"data": [{"tools": {"shell": {}}}]})
+        names = {event["name"] for event in events if event["type"] == "host_milestone"}
+        self.assertEqual(result.status, "isolation_error")
+        self.assertEqual(names, {"host_started", "startup_ready", "host_finished"})
+
+    def test_tool_success_without_turn_completion_does_not_emit_final_milestones(self):
+        result, _, events = self.run_host([tool_call()])
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.tool_calls, 1)
+        self.assertNotIn("turn_completed", result.milestones_ms)
+        self.assertNotIn("final_response_completed", result.milestones_ms)
+
+    def test_early_rejected_cross_thread_activity_does_not_emit_model_milestone(self):
+        result, _, events = self.run_host([], early_turn_events=[{
+            "method": "item/agentMessage/delta", "params": {
+                "threadId": "other", "turnId": "turn-1", "delta": "Untrusted."}}])
+        self.assertEqual(result.status, "isolation_error")
+        self.assertFalse(any(event.get("name") == "first_model_activity" for event in events))
+
+    def test_usage_and_assistant_events_have_same_origin_timestamps(self):
+        result, _, events = self.run_host([{"method": "thread/tokenUsage/updated", "params": {
+            "threadId": "thread-1", "turnId": "turn-1", "tokenUsage": {"total": {"inputTokens": 9}}}},
+            completed()])
+        for event in events:
+            if event["type"] in {"host", "usage", "assistant"}:
+                self.assertGreaterEqual(event["at_ms"], 0)
+                self.assertLessEqual(event["at_ms"], result.wall_ms)
+
     def test_wrong_model_or_reasoning_never_reaches_actuator(self):
         for change in ({"model": "fallback"}, {"reasoningEffort": "low"}, {"runtimeWorkspaceRoots": ["/repo"]}):
             with self.subTest(change=change):
@@ -208,6 +278,8 @@ class HostProtocolTests(unittest.TestCase):
             "threadId": "thread-1", "turnId": "turn-1", "item": item}}, completed()])
         self.assertEqual(result.final_response, "Finished.")
         self.assertEqual([event["type"] for event in events].count("assistant"), 1)
+        self.assertEqual(sum(event.get("name") == "final_response_completed" for event in events), 1)
+        self.assertEqual(sum(event.get("name") == "first_model_activity" for event in events), 1)
 
     def test_notifications_before_start_responses_validate_after_binding(self):
         result, _, _ = self.run_host([tool_call(), completed()], early_thread_events=[

@@ -132,6 +132,10 @@ Desktop and browser acceptance suites run against a disposable test instance. Th
 
 `python3 e2e/model_benchmark.py --engine both --model gpt-6.1-sol --reasoning-effort high --rounds 3 --native-placement desktop --max-steps 40 --timeout 300 --list` previews the 24-trial shared model pilot for Second Cursor and Cua Driver; remove `--list` to execute it. The runner uses fresh Codex conversations, fixture-scoped tools, alternating engine order, ordinary desktop native fixtures, and the same pinned headed Chrome for Testing build. This is the `host-background/native-tools` track; seeds identify fixed cases, and cost/model time remain unknown. The earlier browser cohort is invalid for comparison, and Cua's matched-browser binding currently refuses on consent, so no completed matched cohort establishes superiority. See [the benchmark plan](docs/benchmark-plan-2026-10-04.md) and [adapter contract](e2e/benchmarks/README.md).
 
+`python3 e2e/model_efficiency.py --model gpt-6.1-sol --reasoning-effort high --rounds 5 --list` previews a separate Second Cursor experiment comparing observations requested by the model with observations supplied upfront. Remove `--list` to run ten fresh Calculator → TextEdit trials in alternating order. Both modes count every observation in time and call budgets, preserve independent outcome checks, and report the model's final-response delay separately when the tool trace proves the completed edit. See [the acceptance criteria](docs/acceptance-model-efficiency.md).
+
+Add `--experiment tool-surface` to compare full and compact catalogs with upfront observations enabled in both. The compact catalog represents actions through the complete batch schema and retains all observation tools; the engine still checks each nested action against its original allowlist. Results from the two experiments stay separate.
+
 ```bash
 python3 e2e/run.py            # or name scenarios: python3 e2e/run.py textedit_background calculator
 python3 e2e/parity.py         # sessions, editing, browser

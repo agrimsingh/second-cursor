@@ -92,6 +92,14 @@ class EvidenceTests(unittest.TestCase):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_observation_modes_cannot_be_silently_compared(self):
+        first = self.artifact(observation_mode="on-demand")
+        second = self.artifact(observation_mode="upfront")
+        with self.assertRaisesRegex(ValueError, "observation_mode"):
+            gate.validate_comparison([first, second])
+        with self.assertRaisesRegex(ValueError, "observation_mode"):
+            gate.validate_comparison([self.artifact(observation_mode="unknown")])
+
     def artifact(self, **changes):
         config = {"model": "model-snapshot-2026-10-01", "reasoning_effort": "high", "max_steps": 40,
                   "timeout_seconds": 180, "model_host_version": "shared-runner-sha256:abcdef"}

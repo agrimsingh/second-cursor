@@ -93,6 +93,7 @@ class HostResult:
     model_ms: None = None
     error: str | None = None
     isolation: dict[str, Any] = dataclasses.field(default_factory=dict)
+    milestones_ms: dict[str, float] = dataclasses.field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -236,6 +237,8 @@ class CodexModelHost:
     them to an artifact stream instead of printing images to a terminal. The
     model_ms field is deliberately unknown: app-server does not expose measured
     provider-only latency. Wall time minus tool time is not model inference time.
+    Milestones and event at_ms fields use the same origin as tool start/end_ms.
+    They describe observed host progress, never independently verified task success.
     """
     version = staticmethod(host_version)
 
@@ -306,14 +309,25 @@ class CodexModelHost:
         allowed = {tool["name"] for tool in specs}
         isolation: dict[str, Any] = {}
         status, error = "failed", None
-        pending_thread_notifications: list[dict[str, Any]] = []
-        pending_turn_notifications: list[dict[str, Any]] = []
+        milestones: dict[str, float] = {}
+        pending_thread_notifications: list[tuple[dict[str, Any], float]] = []
+        pending_turn_notifications: list[tuple[dict[str, Any], float]] = []
 
         def now_ms() -> float:
             return (time.monotonic() - start) * 1000
 
-        def notify(message: dict[str, Any]) -> None:
+        def milestone(name: str, at_ms: float | None = None) -> None:
+            timestamp = now_ms() if at_ms is None else at_ms
+            milestones[name] = timestamp
+            emit({"type": "host_milestone", "name": name, "at_ms": timestamp})
+
+        def model_activity(at_ms: float) -> None:
+            if turn_id and "first_model_activity" not in milestones:
+                milestone("first_model_activity", at_ms)
+
+        def notify(message: dict[str, Any], observed_ms: float | None = None) -> None:
             nonlocal tool_calls, usage, status, reported_model
+            observed_ms = now_ms() if observed_ms is None else observed_ms
             method, params = message.get("method", ""), message.get("params", {})
             if not isinstance(params, dict):
                 raise HostError("Malformed app-server notification")
@@ -348,6 +362,7 @@ class CodexModelHost:
                 if not isinstance(arguments, dict):
                     raise HostError("Fixture tool arguments must be an object")
                 json.dumps(arguments, allow_nan=False)
+                model_activity(observed_ms)
                 seen_calls.add(call_id)
                 tool_calls += 1
                 call_start = now_ms()
@@ -378,12 +393,15 @@ class CodexModelHost:
                 candidate = params.get("tokenUsage", {}).get("total")
                 if isinstance(candidate, dict):
                     usage = dict(candidate)
-                    emit({"type": "usage", "usage": usage, "source": "app-server/thread/tokenUsage/updated"})
+                    emit({"type": "usage", "usage": usage, "source": "app-server/thread/tokenUsage/updated",
+                          "at_ms": observed_ms})
             elif method in {"item/started", "item/completed"}:
                 item = params.get("item", {})
                 kind = item.get("type")
                 if kind not in {"userMessage", "agentMessage", "reasoning", "dynamicToolCall"}:
                     raise IsolationError(f"Unexpected built-in item type: {kind}")
+                if kind != "userMessage":
+                    model_activity(observed_ms)
                 if kind == "agentMessage" and method == "item/completed":
                     text = item.get("text", "")
                     item_id = item.get("id", str(len(final_messages)))
@@ -391,18 +409,22 @@ class CodexModelHost:
                         final_messages[item_id] = text
                     if item_id not in emitted_messages:
                         emitted_messages.add(item_id)
-                        emit({"type": "assistant", "text": text, "phase": item.get("phase")})
+                        if item_id in final_messages:
+                            milestone("final_response_completed", observed_ms)
+                        emit({"type": "assistant", "text": text, "phase": item.get("phase"),
+                              "at_ms": observed_ms})
             elif method == "item/agentMessage/delta":
-                emit({"type": "assistant_delta", "text": params.get("delta", "")})
+                model_activity(observed_ms)
+                emit({"type": "assistant_delta", "text": params.get("delta", ""), "at_ms": observed_ms})
             # Reasoning contents and generic notifications are intentionally not
             # persisted; only safe trial evidence is emitted.
 
-        def during_start(message: dict[str, Any], pending: list[dict[str, Any]]) -> None:
+        def during_start(message: dict[str, Any], pending: list[tuple[dict[str, Any], float]]) -> None:
             # Notifications may precede the matching thread/start or turn/start
             # response. Defer their validation until the returned ID is bound;
             # never accept a tool/approval request before an active turn exists.
             if "id" not in message:
-                pending.append(message)
+                pending.append((message, now_ms()))
             else:
                 notify(message)
 
@@ -414,6 +436,7 @@ class CodexModelHost:
         signal.signal(signal.SIGALRM, expired)
         signal.setitimer(signal.ITIMER_REAL, self.config.timeout_seconds)
         try:
+            milestone("host_started", 0.0)
             actual_version = host_version(self.config.codex_binary)
             if actual_version != self.config.model_host_version:
                 raise IsolationError("Installed model host does not match pinned version")
@@ -425,6 +448,7 @@ class CodexModelHost:
                 initialized = rpc.request("initialize", {"clientInfo": {"name": "second_cursor_benchmark", "version": "1"},
                                            "capabilities": {"experimentalApi": True}}, deadline, notify)
                 rpc.send({"method": "initialized"})
+                milestone("startup_ready")
                 config = rpc.request("config/read", {"includeLayers": False, "cwd": empty_dir}, deadline, notify)["config"]
                 features = config.get("features", {})
                 if any(features.get(name) is not False and not (
@@ -458,8 +482,8 @@ class CodexModelHost:
                         or reported_model != self.config.model
                         or response.get("reasoningEffort") != self.config.reasoning_effort):
                     raise IsolationError("App-server did not honor isolated thread/model settings")
-                for message in pending_thread_notifications:
-                    notify(message)
+                for message, observed_ms in pending_thread_notifications:
+                    notify(message, observed_ms)
                 pending_thread_notifications.clear()
                 # Global AGENTS.md may be reported as a source even with zero
                 # project-doc bytes. Repository sources must never be inherited.
@@ -486,8 +510,11 @@ class CodexModelHost:
                              "tool_mode": "direct", "catalog_sha256": catalog_hash,
                              "catalog_audit_host_version": actual_version,
                              "non_fixture_tools": {"request_user_input": "exposed by host; every request denied"}}
+                milestone("thread_ready")
                 emit({"type": "host", "model": reported_model, "reasoning_effort": self.config.reasoning_effort,
-                      "model_host_version": actual_version, "isolation": isolation})
+                      "model_host_version": actual_version, "isolation": isolation,
+                      "at_ms": milestones["thread_ready"]})
+                milestone("turn_submitted")
                 response = rpc.request("turn/start", {"threadId": thread_id,
                     "input": [{"type": "text", "text": prompt}], "model": self.config.model,
                     "effort": self.config.reasoning_effort, "environments": [],
@@ -498,21 +525,25 @@ class CodexModelHost:
                 if not turn_id:
                     raise HostError("App-server did not return a turn id")
                 while True:
-                    message = (pending_turn_notifications.pop(0) if pending_turn_notifications
-                               else rpc.receive(deadline))
+                    if pending_turn_notifications:
+                        message, observed_ms = pending_turn_notifications.pop(0)
+                    else:
+                        message = rpc.receive(deadline)
+                        observed_ms = now_ms()
                     if message.get("method") == "turn/completed":
                         params = message.get("params", {})
                         turn = params.get("turn", {})
                         if params.get("threadId") != thread_id or turn.get("id") != turn_id:
                             raise IsolationError("Received completion for another trial")
+                        milestone("turn_completed", observed_ms)
                         for item in turn.get("items", []):
                             notify({"method": "item/completed", "params": {"threadId": thread_id,
-                                    "turnId": turn_id, "item": item}})
+                                    "turnId": turn_id, "item": item}}, observed_ms)
                         status = "completed" if turn.get("status") == "completed" else "failed"
                         if status != "completed":
                             error = f"Model turn ended with status {turn.get('status', 'unknown')}"
                         break
-                    notify(message)
+                    notify(message, observed_ms)
                 rpc.close()
                 rpc = None
         except TrialDeadline as exc:
@@ -534,7 +565,9 @@ class CodexModelHost:
                     except (OSError, ValueError):
                         pass
                 rpc.close()
+        wall_ms = now_ms()
+        milestone("host_finished", wall_ms)
         return HostResult(status=status, final_response="\n".join(final_messages.values()),
                           model=reported_model, reasoning_effort=self.config.reasoning_effort,
                           model_host_version=actual_version, usage=usage, tool_calls=tool_calls,
-                          wall_ms=now_ms(), error=error, isolation=isolation)
+                          wall_ms=wall_ms, error=error, isolation=isolation, milestones_ms=milestones)

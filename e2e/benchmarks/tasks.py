@@ -186,11 +186,19 @@ def execute_external(ctx, request, output, args, row):
     row["metrics"] = metrics
     final = next(event for event in events if event.get("type") == "result")
     if args.model:
+        row["adapter_result"] = final
+        row["adapter_tools"] = [event for event in events if event.get("type") == "tool"]
         row["adapter_identity"] = final.get("engine_identity")
         row["isolation"] = final.get("isolation")
         row["cleanup_errors"] = final.get("cleanup_errors", [])
         ctx.require("adapter used the pinned model configuration",
                     final.get("model_config") == request["model_config"], final.get("model_config"))
+        ctx.require("adapter used the pinned observation mode",
+                    final.get("observation_mode", "on-demand") == request.get("observation_mode", "on-demand"),
+                    final.get("observation_mode"))
+        ctx.require("adapter used the pinned catalog mode",
+                    final.get("catalog_mode", "full") == request.get("catalog_mode", "full"),
+                    final.get("catalog_mode"))
         if final["status"] == "completed":
             ctx.require("adapter confirms restricted computer-tool isolation",
                         final.get("isolation", {}).get("verified") is True, final.get("isolation"))
@@ -328,6 +336,8 @@ def task_trial(ctx, task, round_number, args, row, output):
                "model": args.model, "prompt": PROMPTS[task] + RULES, "targets": targets, "timeout_seconds": args.timeout}
     if args.model:
         request.update(model_config=report.model_config_for(args), case_seed=row["case_seed"],
+                       observation_mode=getattr(args, "observation_mode", "on-demand"),
+                       catalog_mode=getattr(args, "catalog_mode", "full"),
                        interface_track=args.interface_track, engine=args.engine, engine_version=args.engine_version,
                        runner_sha256=row["runner_sha256"], browser_visibility="headed" if args.headed_browser else "headless",
                        browser_identity=browser_identity(args))
@@ -425,6 +435,8 @@ def run_tasks(args):
               "fixture_sha256": meta["fixture_sha256"], "task_sha256": meta["task_sha256"],
               "metadata": meta, "rounds": args.rounds, "trials": [], "status": "INCOMPLETE"}
     result.update(execution_profile="model" if args.model else "external-scripted" if args.adapter_command else "scripted",
+                  observation_mode=getattr(args, "observation_mode", "on-demand"),
+                  catalog_mode=getattr(args, "catalog_mode", "full"),
                   model_config=model_config, interface_track=getattr(args, "interface_track", "native-tools"),
                   runner_sha256=runner_sha256,
                   browser_visibility="headed" if getattr(args, "headed_browser", False) else "headless",
@@ -466,6 +478,18 @@ def run_tasks(args):
                 row["status"] = report.classify_scenario({**observed, "invariants": observed["invariants"] + row.get("adapter_invariants", [])})
             else:
                 row["error"] = result.get("error", "Trial did not run")
+            if args.model and row["task_id"] == "native_notes":
+                from benchmarks.completion_timing import verified_native_completion
+                events = [*row.get("adapter_tools", []), row.get("adapter_result", {})]
+                trace_events = []
+                try:
+                    trace_path = pathlib.Path(row["evidence_dir"]) / "model-trace.jsonl"
+                    trace_events = [json.loads(line) for line in trace_path.read_text().splitlines() if line.strip()]
+                except (KeyError, OSError, ValueError):
+                    # Missing or malformed timing evidence cannot establish an
+                    # earlier verified completion; ordinary outcome judging stands.
+                    pass
+                row["metrics"].update(verified_native_completion(row, events, trace_events))
         result["status"] = report.overall(result["trials"])
         if result.get("error"):
             result["status"] = "FAIL"

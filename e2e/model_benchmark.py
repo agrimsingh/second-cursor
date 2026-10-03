@@ -25,9 +25,9 @@ REPO = ROOT.parent
 
 def runner_fingerprint():
     digest = hashlib.sha256()
-    for path in [ROOT / "model_benchmark.py", ROOT / "best_in_class.py", ROOT / "run.py", ROOT / "start-browser.py",
+    for path in [ROOT / "model_benchmark.py", ROOT / "model_efficiency.py", ROOT / "best_in_class.py", ROOT / "run.py", ROOT / "start-browser.py",
                  *(ROOT / "benchmarks" / name for name in
-                 ("model_adapter.py", "model_host.py", "engines.py"))]:
+                 ("model_adapter.py", "model_host.py", "engines.py", "completion_timing.py", "tool_surface.py"))]:
         digest.update(path.relative_to(ROOT).as_posix().encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -70,6 +70,8 @@ def parser():
     placement.add_argument("--off-space", action="store_const", dest="native_placement", const="textedit-off-space",
                            help="Alias for --native-placement textedit-off-space")
     cli.add_argument("--max-steps", type=int, default=40)
+    cli.add_argument("--observation-mode", choices=("on-demand", "upfront"), default="on-demand")
+    cli.add_argument("--catalog-mode", choices=("full", "compact"), default="full")
     cli.add_argument("--timeout", type=float, default=240, help="Per-trial solver budget in seconds")
     cli.add_argument("--codex-binary", default=shutil.which("codex") or "codex")
     cli.add_argument("--cua-binary", default=shutil.which("cua-driver") or "cua-driver")
@@ -88,6 +90,12 @@ def build_plan(args):
     config = report.validate_model_config({"model": args.model, "reasoning_effort": args.reasoning_effort,
         "max_steps": args.max_steps, "timeout_seconds": args.timeout, "model_host_version": host_version})
     engines = ["second-cursor", "cua-driver"] if args.engine == "both" else [args.engine]
+    observation_mode = getattr(args, "observation_mode", "on-demand")
+    catalog_mode = getattr(args, "catalog_mode", "full")
+    if observation_mode == "upfront" and (engines != ["second-cursor"] or args.task != ["native_notes"]):
+        raise ValueError("upfront observations require second-cursor and only native_notes")
+    if catalog_mode == "compact" and (engines != ["second-cursor"] or args.task != ["native_notes"]):
+        raise ValueError("compact catalog requires second-cursor and only native_notes")
     bundle = pathlib.Path(os.environ.get("SC_E2E_APP", str(pathlib.Path.home() / "Applications/SecondCursor.app")))
     binary = bundle / "Contents/MacOS/SecondCursor"
     if not binary.is_file():
@@ -104,13 +112,16 @@ def build_plan(args):
         order = engines if index % 2 == 0 else list(reversed(engines))
         for engine in order:
             adapter = [sys.executable, str(ROOT / "benchmarks/model_adapter.py"), "--engine", engine,
-                       "--codex-binary", args.codex_binary, "--cua-binary", args.cua_binary]
+                       "--codex-binary", args.codex_binary, "--cua-binary", args.cua_binary,
+                       "--observation-mode", observation_mode, "--catalog-mode", catalog_mode]
             command = [sys.executable, str(ROOT / "best_in_class.py"), "tasks", "--rounds", "1",
                        "--adapter-command", json.dumps(adapter), "--engine", engine + "-model",
                        "--engine-version", identities[engine], "--model", config["model"],
                        "--reasoning-effort", config["reasoning_effort"], "--max-steps", str(args.max_steps),
                        "--timeout", str(args.timeout), "--model-host-version", host_version,
-                       "--interface-track", "native-tools", "--seed", str(args.seed + index),
+                       "--interface-track", "native-tools", "--observation-mode", observation_mode,
+                       "--catalog-mode", catalog_mode,
+                       "--seed", str(args.seed + index),
                        "--headed-browser", "--native-placement", args.native_placement,
                        "--browser-identity", json.dumps(pinned_browser), "--adapter-browser"]
             for task in tasks:
@@ -119,6 +130,7 @@ def build_plan(args):
                          "command": command})
     metadata = report.metadata()
     return {"model_config": config, "engines": identities, "selected_engines": engines,
+            "observation_mode": observation_mode, "catalog_mode": catalog_mode,
             "tasks": tasks, "runs": runs, "runner_sha256": runner_fingerprint(),
             "trial_count": len(runs) * len(tasks), "interface_track": "native-tools",
             "contract": report.CONTRACT, "track": "host-background", "native_placement": args.native_placement,
@@ -131,6 +143,8 @@ def build_plan(args):
 def planned_artifact(plan, engine):
     """Use the preflight manifest, never the first child's claims, as the baseline."""
     return {"kind": "tasks", "execution_profile": "model", "engine": engine + "-model",
+            "observation_mode": plan.get("observation_mode", "on-demand"),
+            "catalog_mode": plan.get("catalog_mode", "full"),
             "engine_version": plan["engines"][engine], "model": plan["model_config"]["model"],
             "model_config": copy.deepcopy(plan["model_config"]),
             **{key: copy.deepcopy(plan[key]) for key in ("contract", "track", "native_placement", "interface_track",

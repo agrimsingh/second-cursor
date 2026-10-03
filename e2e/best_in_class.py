@@ -447,6 +447,12 @@ def validate_comparison(payloads):
     if any(t != task_sets[0] for t in task_sets[1:]):
         raise ValueError("Cannot compare different task selections")
     if profiles[0] == "model":
+        modes = [p.get("observation_mode", "on-demand") for p in payloads]
+        if any(mode not in {"on-demand", "upfront"} for mode in modes) or len(set(modes)) != 1:
+            raise ValueError("Cannot compare different or unknown observation_mode values; use the explicit efficiency experiment")
+        catalogs = [p.get("catalog_mode", "full") for p in payloads]
+        if any(mode not in {"full", "compact"} for mode in catalogs) or len(set(catalogs)) != 1:
+            raise ValueError("Cannot compare different or unknown catalog_mode values; use the explicit efficiency experiment")
         browser_tasks = any(task != "native_notes" for task in task_sets[0])
         configs = [validate_model_config(p.get("model_config")) for p in payloads]
         if any(c != configs[0] for c in configs[1:]):
@@ -556,7 +562,9 @@ def parser():
     task_cli.add_argument("--model")
     task_cli.add_argument("--reasoning-effort", choices=REASONING_EFFORTS,
                           help="Explicit model reasoning setting, required for model runs")
-    task_cli.add_argument("--max-steps", type=int, default=40, help="Maximum model tool steps per trial")
+    task_cli.add_argument("--max-steps", type=int, default=40, help="Maximum total control-tool attempts per trial, including upfront observations")
+    task_cli.add_argument("--observation-mode", choices=("on-demand", "upfront"), default="on-demand")
+    task_cli.add_argument("--catalog-mode", choices=("full", "compact"), default="full")
     task_cli.add_argument("--seed", type=int, action="append",
                           help="Case ID for a trial round; repeat once per round (not a model sampling seed)")
     task_cli.add_argument("--model-host-version", help="Pinned model host/version fingerprint, required for model runs")

@@ -15,6 +15,33 @@ import model_benchmark as pilot
 
 
 class PlanTests(unittest.TestCase):
+    def test_upfront_mode_is_pinned_in_plan_adapter_and_harness(self):
+        args = pilot.parser().parse_args(["--model", "gpt-6.1-sol", "--reasoning-effort", "high",
+            "--engine", "second-cursor", "--task", "native_notes", "--observation-mode", "upfront"])
+        with mock.patch.object(pilot.pathlib.Path, "is_file", return_value=True), \
+                mock.patch.object(pilot, "version", return_value="codex-cli 1.0"), \
+                mock.patch.object(pilot.report, "digest", return_value="binary-hash"), \
+                mock.patch.object(pilot.report, "metadata", return_value={"fixture_sha256": "fixture-hash", "task_sha256": "task-hash"}):
+            plan = pilot.build_plan(args)
+        self.assertEqual(plan["observation_mode"], "upfront")
+        self.assertEqual(pilot.planned_artifact(plan, "second-cursor")["observation_mode"], "upfront")
+        for item in plan["runs"]:
+            command = item["command"]
+            self.assertEqual(command[command.index("--observation-mode") + 1], "upfront")
+            adapter = json.loads(command[command.index("--adapter-command") + 1])
+            self.assertEqual(adapter[adapter.index("--observation-mode") + 1], "upfront")
+
+    def test_upfront_mode_rejects_unmatched_driver_or_task(self):
+        for options in (["--engine", "both", "--task", "native_notes"],
+                        ["--engine", "second-cursor", "--task", "browser_work_order"]):
+            args = pilot.parser().parse_args(["--model", "gpt-6.1-sol", "--reasoning-effort", "high",
+                                              "--observation-mode", "upfront", *options])
+            with mock.patch.object(pilot, "version", return_value="codex-cli 1.0"), \
+                    mock.patch.object(pilot.pathlib.Path, "is_file", return_value=True), \
+                    mock.patch.object(pilot.report, "digest", return_value="binary-hash"), \
+                    self.assertRaisesRegex(ValueError, "upfront"):
+                pilot.build_plan(args)
+
     def test_explicit_model_and_source_identity_are_pinned_before_trials(self):
         args = pilot.parser().parse_args(["--model", "gpt-6.1-sol", "--reasoning-effort", "high",
                                           "--rounds", "2", "--task", "native_notes"])
