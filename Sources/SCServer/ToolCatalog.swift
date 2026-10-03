@@ -168,7 +168,7 @@ enum ToolCatalog {
             Tool(
                 name: "batch",
                 description:
-                    "Run several actions on one window in a single call, strictly in order, then return one observation after the UI settles. Batch predictable sequences where you already know every step: pressing a known series of buttons, filling known fields, typing followed by a shortcut, keyboard navigation. Do not batch past a step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet): end the batch there and look at the observation, or call get_window_state. Element indexes come from get_window_state and are not refreshed between steps. Pixel steps (x/y clicks, drags, scrolls at a point) take coordinate_space like the standalone tools, and stop the batch if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the batch stops at the first failure. The observation is a diff like get_window_state unless full=true. \(tabBatch)",
+                    "Run several actions on one window in a single call, strictly in order, then return one observation after the UI settles. Batch predictable sequences where you already know every step: pressing a known series of buttons, filling known fields, select_text followed by type_text to replace a match or insert at its caret, typing followed by a shortcut, keyboard navigation. Do not batch past a step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet): end the batch there and look at the observation, or call get_window_state. Element indexes come from get_window_state and are not refreshed between steps. Pixel steps (x/y clicks, drags, scrolls at a point) take coordinate_space like the standalone tools, and stop the batch if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the batch stops at the first failure or uncertain result. The observation is a diff like get_window_state unless full=true. \(tabBatch)",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
@@ -186,7 +186,7 @@ enum ToolCatalog {
                                         "tool": string(
                                             "Step action.",
                                             enumValues: [
-                                                "click", "type_text", "press_key", "set_value", "scroll", "drag",
+                                                "click", "type_text", "select_text", "press_key", "set_value", "scroll", "drag",
                                                 "perform_action", "wait", "browser_click", "browser_type",
                                                 "browser_press_key", "browser_scroll",
                                             ])
@@ -618,7 +618,10 @@ enum ToolCatalog {
         "coordinate_space": string("click, drag, scroll: window or screenshot.", enumValues: ["window", "screenshot"]),
         "button": string("click: mouse button.", enumValues: ["left", "right", "middle"]),
         "count": integer("click: 2 for a double-click."),
-        "text": string("type_text: text to insert."),
+        "text": string("type_text: text to insert. select_text: exact nonempty text to match."),
+        "prefix": string("select_text: text immediately before the match, to disambiguate repeated text."),
+        "suffix": string("select_text: text immediately after the match, to disambiguate repeated text."),
+        "selection_type": string("select_text: select the match or put the caret before/after it.", enumValues: ["text", "cursor_before", "cursor_after"]),
         "keystrokes_only": ["type": "boolean", "description": "type_text: send real key events instead of an accessibility insert."],
         "keys": string("press_key: chord such as \"return\" or \"cmd+a\"."),
         "value": string("set_value: new value."),

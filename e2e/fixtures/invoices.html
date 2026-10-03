@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Synthetic invoice reconciliation</title>
+<style>
+body{font:16px system-ui;margin:24px;color:#152d39;background:#f3f6f7}main{display:grid;grid-template-columns:320px minmax(420px,760px);gap:30px}h1{font-size:26px}#list{display:grid;gap:6px}button,input{font:inherit;padding:8px}button{cursor:pointer}#detail{background:white;padding:24px;border-radius:12px;align-self:start}label{display:block;margin:12px 0}input{display:block;width:90%}small{color:#567}#status{min-height:24px}
+</style>
+<h1>Synthetic invoice reconciliation</h1>
+<p>Local test data only. Enter the net, tax, and gross totals in cents. Round tax half up to the nearest cent.</p>
+<main><nav aria-label="Invoices" id="list"></nav><section id="detail"><h2>Choose an invoice</h2></section></main>
+<p id="status" role="status">Loading invoices</p>
+<script>
+let invoices=[],selected=null;
+const text=(tag,value,parent)=>{const node=document.createElement(tag);node.textContent=value;parent.append(node);return node;};
+async function refresh(){invoices=(await(await fetch('/state')).json()).invoices;render();}
+function render(){
+ const list=document.querySelector('#list');list.replaceChildren();
+ for(const invoice of invoices){const button=text('button',`${invoice.id} — ${invoice.status}`,list);button.onclick=()=>{selected=invoice.id;render();};}
+ const detail=document.querySelector('#detail');detail.replaceChildren();
+ const invoice=invoices.find(item=>item.id===selected);
+ document.querySelector('#status').textContent=`Submitted: ${invoices.filter(item=>item.status==='submitted').map(item=>item.id).join(', ')||'none'}`;
+ if(!invoice){text('h2','Choose an invoice',detail);return;}
+ text('h2',`Invoice ${invoice.id}`,detail);text('p',`Supplier: ${invoice.supplier}`,detail);
+ for(const line of invoice.lines)text('p',`Line: ${line.quantity} x ${line.unit_cents} cents`,detail);
+ text('p',`Tax rate: ${invoice.tax_percent} percent`,detail);text('p',`Expense account: ${invoice.account}`,detail);
+ if(invoice.status==='submitted'){text('p',`Submission confirmed for ${invoice.id}`,detail);return;}
+ const form=document.createElement('form');detail.append(form);
+ for(const [key,label] of [['net_cents','Net cents'],['tax_cents','Tax cents'],['gross_cents','Gross cents'],['account','Account'],['note','Note']]){
+  const wrapper=text('label',label,form),input=document.createElement('input');input.name=key;input.required=true;input.autocomplete='off';wrapper.append(input);
+ }
+ const submit=text('button',`Submit ${invoice.id}`,form);submit.type='submit';
+ form.onsubmit=async event=>{
+  event.preventDefault();submit.disabled=true;
+  const entry=Object.fromEntries(new FormData(form));
+  for(const key of ['net_cents','tax_cents','gross_cents'])entry[key]=Number(entry[key]);
+  try{const response=await fetch('/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({invoice_id:invoice.id,entry})});
+   if(!response.ok)throw Error(`Submission refused (${response.status})`);await refresh();
+  }catch(error){document.querySelector('#status').textContent=error.message;submit.disabled=false;}
+ };
+}
+refresh().catch(error=>document.querySelector('#status').textContent=error.message);
+</script>
+</html>

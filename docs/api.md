@@ -68,6 +68,8 @@ The private `operation-journal` directory under the runtime's support directory 
 
 Native batches cannot cross app processes. Browser batches cannot cross tabs. Both run in order and recheck admission between steps. A native step is the tool name plus that tool's arguments, `{"tool": "click", "element_index": 5}`; the older `{"tool": "click", "args": {...}}` still works, with `args` as an object or a JSON string. `browser_command`'s `arguments` may also be a JSON string. Both allowances exist because Gemini through Cursor stringifies free-form nested objects and garbles the keys of declared ones. A malformed `args` or `arguments` is refused with an error naming the field, and a step missing a required argument lists any fields it did not recognize.
 
+Native batches also accept `select_text` with `element_index`, exact `text`, optional `prefix`/`suffix`, and `selection_type` (`text`, `cursor_before`, or `cursor_after`). Selection and insertion use the same guarded paths as standalone calls. The whole batch is parsed before any step runs; an ambiguous or missing text match stops the following steps by default, and an unconfirmed selection reports uncertainty rather than allowing typing at an assumed caret. Put a final `expect` on the batch to verify the resulting document in the same call.
+
 ## Tasks and human takeover
 
 Each session gets a task when it starts working with a target or explicitly calls the task API. Use `task` with `action: create` and a short `title` to name unused work, `get` or `list` to inspect it, and `update` to report progress. `list` returns only tasks associated with the calling session, excluding finished tasks unless `include_finished: true`; the native panel shows all clients. `task_id` defaults to the session's current task, and an explicit ID cannot control another session's active task. Responses contain `{task: ...}` or `{tasks: [...]}` with snake_case snapshot fields such as `in_flight_count`, `requires_fresh_observation`, and `last_verified_outcome`.
@@ -174,8 +176,10 @@ const sc = await SecondCursor.local();
 try {
   const notes = await sc.app('TextEdit');
   const area = notes.observation.elements.find((e) => e.role === 'AXTextArea').index;
-  await notes.selectText(area, 'draft', { selection_type: 'cursor_after' });
-  const { observation } = await notes.typeText(' (reviewed)');
+  const { observation } = await notes.batch([
+    { tool: 'select_text', element_index: area, text: 'draft', selection_type: 'cursor_after' },
+    { tool: 'type_text', element_index: area, text: ' (reviewed)' },
+  ], { expect: { text: 'draft (reviewed)' } });
   console.log(observation.tree);
 } finally { await sc.close(); }
 ```
@@ -187,6 +191,28 @@ try {
 `createTask({title, client_name})`, `task(id?)`, and `bindTask(id)` return a `Task` handle with `get`, `update`, `pause`, `takeover`, `resume`, and `cancel`; `tasks()` lists task snapshots; pass `{include_finished: true}` to include finished work. Use `update({status: 'thinking'})` for host progress and `update({status: 'completed'})` only after the host has finished its work. `Tab.hover([x, y])` and `Locator.hover()` expose browser hover. The SDK package includes TypeScript declarations.
 
 `sdk/agent.mjs` is an optional model-independent loop; its adapter owns provider-specific encoding and its approval hook belongs to the host. For multi-step flows with branching, a short Node script using the SDK is often better than many separate tool calls; see `.cursor/skills/second-cursor/SKILL.md`.
+
+For an opt-in resumable agent, import `runAgent` and `fileCheckpointStore` from `@second-cursor/client/agent` (or `./sdk/agent.mjs`). Give each workflow a stable ID, goal, checkpoint path, and target identities. Construct an unconnected `SecondCursor` client so the loop can restore the checkpoint's original session before connecting; `SecondCursor.local()` has already connected and may create a different session.
+
+```js
+const result = await runAgent({
+  adapter, // Your model adapter: next({ task, tools, history, progress }).
+  client: new SecondCursor({ url, token }),
+  task: 'Reconcile the three specified invoice drafts and verify each submission.',
+  workflow: {
+    id: 'invoice-reconciliation-2026-10-04',
+    store: fileCheckpointStore(checkpointPath),
+    targets: [{ browserId, tabId }], // Or { windowId } for a native target.
+  },
+  onApproval,
+});
+```
+
+The loop saves ordered history, adapter-supplied `progress`, and an operation ID before dispatch. After a process restart it reconciles the pending operation in the original session, discards unexecuted calls from the interrupted turn, and reads the targets again before asking the model to continue. A completed checkpoint returns its saved result without another model call. Unknown, expired, or uncertain outcomes return `stopped: 'recovery_required'`; paused, cancelled, and interrupted runtime tasks require the host to handle their lifecycle. The loop never automatically resumes a task or repeats an uncertain mutation. Keep the original session open while work remains resumable.
+
+File checkpoints use atomic writes, mode 0600, and one process owner at a time. They deliberately contain the goal, tool arguments/results, and potentially screenshots, so choose a private path and delete them according to your retention policy. Runtime bearer credentials are excluded; provider credentials belong in the adapter's configuration, never in its returned history or progress. Ordinary `runAgent` calls without `workflow` retain the in-memory behavior. See [workflow acceptance](acceptance-workflow-recovery.md) and [the interrupted invoice test](acceptance-invoice-workflow.md).
+
+The store automatically recovers a lock left by a dead local process. A crash during that lock-recovery step can leave a `.lock.recover` marker and deliberately block further runs; remove that marker only after confirming that no workflow runner is still alive.
 
 ## Validation
 

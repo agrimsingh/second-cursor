@@ -270,6 +270,7 @@ public struct ActionResult: Codable, Sendable, Equatable {
 public enum BatchAction: Sendable, Equatable {
     case click(target: ClickTarget, button: MouseButton, count: Int)
     case typeText(text: String, elementIndex: Int?, keystrokesOnly: Bool)
+    case selectText(elementIndex: Int, text: String, prefix: String?, suffix: String?, mode: String)
     case pressKey(keys: String)
     case setValue(elementIndex: Int, value: String)
     case scroll(target: ClickTarget?, direction: ScrollDirection, amount: Int)

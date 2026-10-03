@@ -507,7 +507,7 @@ extension ToolRouter {
     }
 
     private static let batchTools: Set<String> = [
-        "click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "wait",
+        "click", "type_text", "select_text", "press_key", "set_value", "scroll", "drag", "perform_action", "wait",
     ]
 
     private func runBatch(_ args: Arguments) async throws -> ToolOutput {
@@ -615,6 +615,15 @@ extension ToolRouter {
             action = .typeText(
                 text: try args.string("text"), elementIndex: try args.optionalInt("element_index"),
                 keystrokesOnly: try args.bool("keystrokes_only", default: false))
+        case "select_text":
+            let text = try args.string("text")
+            let mode = try args.optionalString("selection_type") ?? "text"
+            guard !text.isEmpty, ["text", "cursor_before", "cursor_after"].contains(mode) else {
+                throw SCError.invalidArgument("Step \(index) (select_text): nonempty text and valid selection_type required")
+            }
+            action = .selectText(
+                elementIndex: try args.int("element_index"), text: text,
+                prefix: try args.optionalString("prefix"), suffix: try args.optionalString("suffix"), mode: mode)
         case "press_key":
             action = .pressKey(keys: try args.string("keys"))
         case "set_value":

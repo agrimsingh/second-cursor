@@ -4,14 +4,22 @@
   "type": "module",
   "types": "./index.d.ts",
   "exports": {
-    ".": { "types": "./index.d.ts", "import": "./index.mjs", "default": "./index.mjs" },
-    "./agent": "./agent.mjs"
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "default": "./index.mjs"
+    },
+    "./agent": {
+      "types": "./agent.d.ts",
+      "import": "./agent.mjs",
+      "default": "./agent.mjs"
+    }
   },
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "test": "node recovery-smoke.mjs",
+    "test": "node recovery-smoke.mjs && node --test agent-recovery.test.mjs",
     "test:live": "node smoke.mjs && node stdio-smoke.mjs"
   },
   "bin": {

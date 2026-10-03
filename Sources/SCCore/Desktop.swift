@@ -445,6 +445,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             return try performClick(wid, target: target, button: button, count: max(count, 1), flags: [])
         case let .typeText(text, elementIndex, keystrokesOnly):
             return try insertText(wid, text: text, elementIndex: elementIndex, keystrokesOnly: keystrokesOnly)
+        case let .selectText(elementIndex, text, prefix, suffix, mode):
+            return try performSelectText(wid, index: elementIndex, text: text, prefix: prefix, suffix: suffix, mode: mode)
         case let .pressKey(keys):
             return try performKey(wid, chord: try Keyboard.parse(keys))
         case let .setValue(elementIndex, value):
@@ -1067,25 +1069,39 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     public func selectText(windowID: UInt32, index: Int, text: String, prefix: String?, suffix: String?, mode: String) async throws -> ActionResult {
         try await act(windowID) {
-            guard !text.isEmpty, ["text", "cursor_before", "cursor_after"].contains(mode) else { throw SCError.invalidArgument("Nonempty text and valid selection mode required") }
-            let (record, item) = try self.mutationElement(windowID, index)
-            let value = (AX.text(item.element.attribute(kAXValueAttribute)) ?? "") as NSString
-            var matches: [NSRange] = [], start = 0
-            while start < value.length {
-                let range = value.range(of: text, range: NSRange(location: start, length: value.length-start))
-                if range.location == NSNotFound { break }
-                let before = value.substring(to: range.location), after = value.substring(from: NSMaxRange(range))
-                if prefix.map({ before.hasSuffix($0) }) ?? true, suffix.map({ after.hasPrefix($0) }) ?? true { matches.append(range) }
-                start = NSMaxRange(range)
-            }
-            guard matches.count == 1 else { throw SCError.invalidArgument("Text matched \(matches.count) times; supply prefix/suffix to select exactly one occurrence") }
-            let found = matches[0]
-            let range = CFRange(location: mode == "cursor_after" ? NSMaxRange(found) : found.location, length: mode == "text" ? found.length : 0)
-            try NativeSafety.check(pid: record.pid, wid: windowID, input: false)
-            guard item.element.set(kAXSelectedTextRangeAttribute, AX.rangeValue(range)) == .success else { throw SCError.actionFailed("This element does not support text selection") }
-            let actual = AX.range(item.element.attribute(kAXSelectedTextRangeAttribute))
-            return ActionResult(route: "ax_selection", verified: actual?.location == range.location && actual?.length == range.length)
+            try self.performSelectText(windowID, index: index, text: text, prefix: prefix, suffix: suffix, mode: mode)
         }
+    }
+
+    /// Shared by standalone selection and a batch while already on the target app's queue.
+    private func performSelectText(_ windowID: CGWindowID, index: Int, text: String, prefix: String?, suffix: String?, mode: String) throws -> ActionResult {
+        guard !text.isEmpty, ["text", "cursor_before", "cursor_after"].contains(mode) else { throw SCError.invalidArgument("Nonempty text and valid selection mode required") }
+        let (record, item) = try mutationElement(windowID, index)
+        let value = (AX.text(item.element.attribute(kAXValueAttribute)) ?? "") as NSString
+        var matches: [NSRange] = [], start = 0
+        while start < value.length {
+            let range = value.range(of: text, range: NSRange(location: start, length: value.length-start))
+            if range.location == NSNotFound { break }
+            let before = value.substring(to: range.location), after = value.substring(from: NSMaxRange(range))
+            if prefix.map({ before.hasSuffix($0) }) ?? true, suffix.map({ after.hasPrefix($0) }) ?? true { matches.append(range) }
+            // Include overlapping matches ("aa" in "aaa") while keeping the next
+            // search boundary outside a UTF-16 surrogate pair.
+            let unit = value.character(at: range.location)
+            let surrogatePair = (0xD800...0xDBFF).contains(unit) && range.location + 1 < value.length
+                && (0xDC00...0xDFFF).contains(value.character(at: range.location + 1))
+            start = range.location + (surrogatePair ? 2 : 1)
+        }
+        guard matches.count == 1 else { throw SCError.invalidArgument("Text matched \(matches.count) times; supply prefix/suffix to select exactly one occurrence") }
+        let found = matches[0]
+        let range = CFRange(location: mode == "cursor_after" ? NSMaxRange(found) : found.location, length: mode == "text" ? found.length : 0)
+        try NativeSafety.check(pid: record.pid, wid: windowID, input: false)
+        guard item.element.set(kAXSelectedTextRangeAttribute, AX.rangeValue(range)) == .success else { throw SCError.actionFailed("This element does not support text selection") }
+        let actual = AX.range(item.element.attribute(kAXSelectedTextRangeAttribute))
+        let verified = actual?.location == range.location && actual?.length == range.length
+        return ActionResult(
+            route: "ax_selection", verified: verified,
+            note: verified ? nil : "Selection readback did not match the requested range; observe before typing or retrying.",
+            uncertain: verified ? nil : true)
     }
 
     private static let clipboardLock = NSLock()
