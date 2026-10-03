@@ -12,6 +12,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
 
     struct Actions {
         var showOnboarding: () -> Void
+        var showTasks: () -> Void
+        var showSetup: () -> Void
         var tearDownAgentDisplay: () -> Void
         var quit: () -> Void
     }
@@ -34,7 +36,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let activityLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let accessibilityItem = NSMenuItem(title: "Grant Accessibility permission…", action: nil, keyEquivalent: "")
-    private let screenRecordingItem = NSMenuItem(title: "Grant Screen Recording permission (then relaunch)…", action: nil, keyEquivalent: "")
+    private let screenRecordingItem = NSMenuItem(title: "Allow Screen Recording…", action: nil, keyEquivalent: "")
     private let pauseItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let copyConfigItem = NSMenuItem(title: "Copy Cursor MCP config", action: nil, keyEquivalent: "")
     private var timer: Timer?
@@ -49,6 +51,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let items: [(NSMenuItem, Selector?)] = [
             (statusLine, nil),
             (activityLine, nil),
+            (NSMenuItem(title: "Tasks…", action: nil, keyEquivalent: "t"), #selector(showTasks)),
+            (NSMenuItem(title: "Setup…", action: nil, keyEquivalent: ","), #selector(showSetup)),
             (accessibilityItem, #selector(grantAccessibility)),
             (screenRecordingItem, #selector(grantScreenRecording)),
             (.separator(), nil),
@@ -71,7 +75,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         statusItem.menu = menu
 
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
     }
@@ -99,12 +103,27 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             symbol = "exclamationmark.triangle"
         }
         let running = if case .running = serverState { true } else { false }
-        let working = running && !paused && agentActivity.active
-        activityLine.title = working ? "Agent active: \(agentActivity.app ?? "unknown app")" : "Idle"
+        let tasks = TaskRegistry.shared.list(includeFinished: false)
+        let workingTasks = tasks.filter { $0.status.permitsMutation }
+        let needsYou = tasks.filter { $0.status == .needsUser || $0.status == .interrupted }
+        let working = running && !paused && (!workingTasks.isEmpty || agentActivity.active)
+        if paused && !tasks.isEmpty {
+            activityLine.title = "\(tasks.count) task\(tasks.count == 1 ? "" : "s") · input paused"
+        } else if !needsYou.isEmpty {
+            activityLine.title = "\(needsYou.count) task\(needsYou.count == 1 ? "" : "s") need\(needsYou.count == 1 ? "s" : "") you"
+        } else if tasks.count == 1, let task = tasks.first {
+            activityLine.title = Self.shortTitle("\(task.status.displayName): \(task.title)")
+        } else if !tasks.isEmpty {
+            activityLine.title = "\(workingTasks.count) active · \(tasks.count) tasks"
+        } else {
+            activityLine.title = working ? Self.shortTitle("Agent active: \(agentActivity.app ?? "unknown app")") : "Idle"
+        }
+        statusLine.title = Self.shortTitle(statusLine.title)
         if let button = statusItem.button {
             var image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Second Cursor")
-            if working {
-                image = image?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [Self.accent]))
+            if working || !needsYou.isEmpty {
+                let tint = needsYou.isEmpty ? Self.accent : NSColor.systemOrange
+                image = image?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [tint]))
                 image?.isTemplate = false
             } else {
                 image?.isTemplate = true
@@ -113,11 +132,18 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             button.toolTip = "Second Cursor — \(statusLine.title) — \(activityLine.title)"
         }
 
-        pauseItem.title = paused ? "Resume agent" : "Pause agent"
+        pauseItem.title = paused ? "Resume all input" : "Pause all input"
         accessibilityItem.isHidden = Permissions.accessibility
         screenRecordingItem.isHidden = Permissions.screenRecording
         copyConfigItem.isEnabled = config != nil
     }
+
+    private static func shortTitle(_ title: String) -> String {
+        title.count > 30 ? String(title.prefix(29)) + "…" : title
+    }
+
+    @objc private func showTasks() { actions.showTasks() }
+    @objc private func showSetup() { actions.showSetup() }
 
     @objc private func grantAccessibility() {
         actions.showOnboarding()

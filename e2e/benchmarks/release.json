@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "suites": [
+    {"id":"core","script":"run.py","group":"quiet","scenarios":["server_auth","status","blocked_apps","textedit_background","calculator","pixel_click_in_place","pixel_double_click_selects_word","drag_select","parallel_apps","batch_calculator","batch_textedit","batch_order_and_errors","nested_argument_shapes","tree_diffs","action_observations","app_target_pins_observed_window","paste_restores_clipboard","batch_layout_guard","browser","browser_settled_reads","browser_click_navigation","browser_snapshot_hints","pause","action_log"]},
+    {"id":"instance","script":"instance.py","group":"quiet","scenarios":["home_layout","action_log_isolated","pause_isolated","native_host_follows_sc_home","second_instance_lifecycle","isolated_browser"]},
+    {"id":"parity","script":"parity.py","group":"quiet","scenarios":["sessions_native","native_rich_editing","browser_parity","browser_extended","execution_safety","browser_ownership"]},
+    {"id":"pointer","script":"clicks.py","group":"quiet","scenarios":["click_delivery","scroll_delivery"]},
+    {"id":"outcomes","script":"expect.py","group":"quiet","scenarios":["expect_shapes","expect_verified","expect_failed","expect_gone","expect_element_value","expect_on_batch","expect_waits_past_settle","settle_catches_late_change","silent_app_fallback","wait_for_concurrent_change","wait_for_timeout","observer_bookkeeping"]},
+    {"id":"browser-batch","script":"browser_batch.py","group":"quiet","scenarios":["inbox_batch","covered_step_stops","batch_navigation","bad_steps_run_nothing"]},
+    {"id":"transport","script":"transport_recovery.py","group":"quiet","scenarios":["automatic_transport_ownership","durable_operation_recovery","journal_write_failure_refuses_input","late_completion_preserves_new_operation"]},
+    {"id":"stdio-process","script":"transport_stdio.py","args":["--native-binary","{native_binary}"],"format":"unittest","minimum_tests":8,"group":"quiet","scenarios":[]},
+    {"id":"native-safety","script":"native_safety.py","group":"quiet","scenarios":["native_capabilities","native_semantic_edits","native_stale_coordinates","native_stale_resize","native_modifier_refusal"]},
+    {"id":"task-runtime","script":"tasks.py","group":"quiet","scenarios":["task_lifecycle","task_pause_resume","task_inflight_takeover","task_cancel","task_heartbeat","task_restart_recovery","task_browser_cancel_recreate","task_browser_control_failure"]},
+    {"id":"browser-reliability","script":"browser_reliability.py","group":"quiet","scenarios":["browser_checkbox_settling","browser_delayed_search","browser_truthful_outcomes","browser_repl_uncertain_outcomes","browser_freshness_guard","browser_live_locator_sequence","browser_trusted_hover"]},
+    {"id":"setup","script":"setup.py","group":"quiet","scenarios":["cli_help","mcp_stdio","mcp_stdio_concurrent","mcp_stdio_errors","mcp_autolaunch","doctor","turn_ended","install_mcp_dry_run","install_mcp_write","install_mcp_codex_tables","config_read_only"]},
+    {"id":"release-setup","script":"release_setup.py","args":["--browser"],"group":"quiet","scenarios":["release_package_integrity","release_preflight_read_only","browser_install_portable","doctor_setup_contract","browser_control_self_test","browser_control_failure_cleanup"]},
+    {"id":"sdk","script":"benchmarks/sdk_live.py","group":"quiet","scenarios":["sdk_recovery_contract","sdk_live_transports","sdk_live_stdio"]},
+    {"id":"tasks","script":"best_in_class.py","args":["tasks"],"group":"quiet","format":"tasks","scenarios":["native_notes","browser_work_order","canvas_route","transient_dialog"]},
+    {"id":"focus","script":"focus.py","group":"takeover","scenarios":["focus_native_actions","focus_concurrent_handoffs","focus_chrome_occluded","press_key_aliases"]},
+    {"id":"same-app-focus","script":"benchmarks/native_attended.py","group":"takeover","scenarios":["native_input_ownership"]},
+    {"id":"task-ui","script":"task_ui.py","args":["--ui"],"group":"takeover","scenarios":["task_panel_controls","task_panel_history","setup_panel_checks"]},
+    {"id":"approvals","script":"review.py","group":"approvals","scenarios":["private_browser_access","approval_lifecycle"]},
+    {"id":"off-space","script":"run.py","group":"environment","scenarios":["off_space_read","launch_on_hidden_space"]}
+  ]
+}

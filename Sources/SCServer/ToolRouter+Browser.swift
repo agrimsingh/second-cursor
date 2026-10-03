@@ -275,6 +275,7 @@ extension ToolRouter {
     ) async -> ToolOutput {
         var json = base
         if let events = reply["events"] { json["events"] = events }
+        if let outcome = reply["outcome"] { json["outcome"] = outcome }
         guard mode != "none" else { return ToolOutput(json: json) }
         let shot = Self.screenshot(reply["screenshot"])
         if reply["observation"] != nil || shot != nil || reply["observation_error"] != nil {

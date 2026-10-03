@@ -58,15 +58,28 @@ try {
   const catalog = await request("tools/list");
   if (!catalog.tools.some((t) => t.name === "browser_command"))
     throw Error("Extended browser tool missing");
+  if (!catalog.tools.some((t) => t.name === "task"))
+    throw Error("Task lifecycle tool missing");
   const status = await request("tools/call", { name: "status", arguments: {} });
   if (
     status.isError ||
     !JSON.parse(status.content.find((x) => x.type === "text").text).permissions
   )
     throw Error("Live status unavailable");
+  const taskResult = await request("tools/call", { name: "task", arguments: { action: "get" } });
+  const task = JSON.parse(taskResult.content.find((x) => x.type === "text").text).task;
+  if (taskResult.isError || !task?.id || !task.sessions?.length || task.sessions.includes("legacy"))
+    throw Error("Stdio did not negotiate a real runtime session and task");
+  const paused = await request("tools/call", { name: "task", arguments: { action: "pause" } });
+  if (JSON.parse(paused.content.find((x) => x.type === "text").text).task?.status !== "paused")
+    throw Error("Stdio task pause failed");
+  const resumed = await request("tools/call", { name: "task", arguments: { action: "resume" } });
+  if (resumed.isError) throw Error("Stdio task resume failed");
+  const completed = await request("tools/call", { name: "task", arguments: { action: "update", status: "completed" } });
+  if (completed.isError) throw Error("Stdio task completion failed");
   await writeFile(
     new URL("report.md", dir),
-    "PASS: stdio process, MCP initialization, tool discovery, and live runtime status.\nRerun: node sdk/stdio-smoke.mjs\n",
+    "PASS: stdio process, MCP initialization, tool discovery, host-issued session, task pause/resume/completion, and live runtime status.\nRerun: node sdk/stdio-smoke.mjs\n",
   );
 } finally {
   child.kill();

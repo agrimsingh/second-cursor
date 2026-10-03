@@ -6,6 +6,8 @@ import SCShared
 import UniformTypeIdentifiers
 
 enum Capture {
+    private static let historyLock = NSLock()
+    private static var previousFrames: [String: (hash: Int, at: Date)] = [:]
     /// Clients shrink larger images before a model sees them (Cursor to about 1024 px wide), and a model reading
     /// positions off a shrunk image would click off by the shrink factor.
     static let maxEdge = 1024
@@ -14,8 +16,28 @@ enum Capture {
     /// most `maxEdge`. `scale` is image pixels per window point. Works for occluded windows and windows on other Spaces.
     static func window(_ wid: CGWindowID) async throws -> Screenshot {
         let (image, points) = try await image(wid, maxEdge: maxEdge)
-        return Screenshot(pngData: try Timing.measure("capture_encode") { try png(image) }, width: image.width, height: image.height,
-                          scale: Double(image.width) / Double(points.width))
+        let encoded = try Timing.measure("capture_encode") { try png(image) }
+        let record = WindowList.record(wid)
+        let now = Date()
+        var hash = Hasher()
+        hash.combine(encoded)
+        let fingerprint = hash.finalize()
+        let key = "\(record?.pid ?? 0):\(wid)"
+        let changed = historyLock.withLock { () -> Bool? in
+            let previous = previousFrames[key]
+            previousFrames[key] = (fingerprint, now)
+            if previousFrames.count > 256, let oldest = previousFrames.min(by: { $0.value.at < $1.value.at })?.key {
+                previousFrames.removeValue(forKey: oldest)
+            }
+            return previous.map { $0.hash != fingerprint }
+        }
+        let reason = record?.isOnScreen == false
+            ? "The window is off screen and its app may have stopped repainting. Capture time does not establish frame freshness; verify the result through AX or bring the window to an active agent display."
+            : "Capture completed, but ScreenCaptureKit does not provide the application's last repaint time. Unchanged pixels do not establish a frozen or up-to-date frame."
+        return Screenshot(pngData: encoded, width: image.width, height: image.height,
+                          scale: Double(image.width) / Double(points.width),
+                          freshness: FrameFreshness(capturedAt: now.timeIntervalSince1970, reason: reason,
+                            windowOnScreen: record?.isOnScreen, changedSincePreviousCapture: changed))
     }
 
     /// The window's own pixels and its size in points. `maxEdge` nil keeps the display's backing resolution, for

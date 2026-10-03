@@ -5,13 +5,13 @@ import SCShared
 /// `SecondCursor doctor [--json]`: asks the running app (never this process, whose permissions don't matter)
 /// for its state. Exits 1 when something needs the user's action. Never starts the app or writes a config.
 enum Doctor {
-    private struct Item {
+    struct Item {
         enum Level { case ok, problem, note }
         var level: Level
         var text: String
     }
 
-    static func run(json: Bool) -> Int32 {
+    static func report(config: SCConfig? = nil) -> (report: [String: Any], items: [Item]) {
         var report: [String: Any] = [
             "config_path": SCPaths.configURL.path, "url": NSNull(), "reachable": false, "version": NSNull(),
             "permissions": NSNull(), "paused": PauseState.isPaused, "extension_connected": NSNull(),
@@ -19,7 +19,7 @@ enum Doctor {
         var items: [Item] = []
 
         do {
-            let config = try CLI.loadConfig()
+            let config = try config ?? CLI.loadConfig()
             report["url"] = LocalHTTP.url(config, SecondCursorServer.path).absoluteString
             items += check(config, into: &report)
         } catch {
@@ -30,7 +30,18 @@ enum Doctor {
         report["problems"] = problems
         report["notes"] = items.filter { $0.level == .note }.map(\.text)
         report["ok"] = problems.isEmpty
+        report["browser_setup_notes"] = BrowserSetup.diagnosticNotes()
+        report["extension_directory"] = BrowserSetup.extensionDirectory.path
+        report["clients"] = InstallMCP.Client.allCases.map { client in
+            let status = SetupDiagnostics.clientStatus(client, config: config)
+            return ["client": client.rawValue, "configured": status.configured, "path": status.path, "detail": status.detail] as [String: Any]
+        }
+        return (report, items)
+    }
 
+    static func run(json: Bool) -> Int32 {
+        let (report, items) = report()
+        let problems = report["problems"] as? [String] ?? []
         if json {
             let data = (try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])) ?? Data()
             print(String(decoding: data, as: UTF8.self))
@@ -44,6 +55,7 @@ enum Doctor {
                 }
                 print("\(mark) \(item.text)")
             }
+            for note in report["browser_setup_notes"] as? [String] ?? [] { print("· \(note)") }
             print("  Config: \(SCPaths.configURL.path)")
         }
         return problems.isEmpty ? 0 : 1
@@ -51,10 +63,10 @@ enum Doctor {
 
     private static func check(_ config: SCConfig, into report: inout [String: Any]) -> [Item] {
         let url = LocalHTTP.url(config, SecondCursorServer.path).absoluteString
-        let initialize = LocalHTTP.mcp(config, id: 1, method: "initialize", params: [
-            "protocolVersion": LocalHTTP.protocolVersion, "capabilities": [String: Any](),
-            "clientInfo": ["name": "second-cursor-doctor", "version": "1"],
-        ], timeout: 5)
+        let connection = LocalMCPConnection(config: config)
+        defer { connection.close() }
+        let initialize: Result<[String: Any], CLIError> = Result { try connection.initialize(name: "second-cursor-doctor") }
+            .mapError { ($0 as? CLIError) ?? CLIError($0) }
         let serverInfo: [String: Any]
         switch initialize {
         case .success(let result):
@@ -76,8 +88,9 @@ enum Doctor {
         report["version"] = version ?? NSNull()
         var items = [Item(level: .ok, text: "App reachable at \(url) (version \(version ?? "unknown"))")]
 
-        let status = LocalHTTP.mcp(config, id: 2, method: "tools/call",
-                                   params: ["name": "status", "arguments": [String: Any]()], timeout: 5)
+        let status: Result<[String: Any], CLIError> = Result {
+            try connection.rpc(method: "tools/call", params: ["name": "status", "arguments": [String: Any]()])
+        }.mapError { ($0 as? CLIError) ?? CLIError($0) }
         guard case .success(let result) = status,
               let text = (result["content"] as? [[String: Any]])?.first(where: { $0["type"] as? String == "text" })?["text"] as? String,
               let state = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any]

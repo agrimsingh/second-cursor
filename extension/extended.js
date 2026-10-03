@@ -6,6 +6,7 @@ import { click, pressKey, reachablePoint, scroll, type } from "./input.js";
 import { isSecretField } from "./snapshot.js";
 import {
   requireAgentTab,
+  requireAgentInput,
   userTabs,
   claimTab,
   releaseTab,
@@ -678,7 +679,14 @@ function domOperation(p, isSecretField, anchor) {
       }),
     );
     e.dispatchEvent(new Event("change", { bubbles: true }));
-    return { value: "value" in e ? valueOf(e) : e.textContent };
+    const actual = "value" in e ? String(e.value) : e.textContent;
+    const redacted = secret(e);
+    const verified = e.isConnected && actual === p.text;
+    return { value: "value" in e ? valueOf(e) : e.textContent,
+      outcome: { state: verified ? "verified" : "uncertain", verified, verification: "value",
+        reason: verified ? "The connected control has the requested value after its input handlers returned."
+          : "The control was replaced or did not retain the requested value; inspect it before continuing.",
+        expected: redacted ? "[redacted]" : p.text, actual: redacted ? "[redacted]" : actual } };
   }
   if (p.operation === "select_option") {
     const opts = [...e.options];
@@ -693,13 +701,24 @@ function domOperation(p, isSecretField, anchor) {
     for (const o of opts) o.selected = values.includes(o.value);
     e.dispatchEvent(new Event("input", { bubbles: true }));
     e.dispatchEvent(new Event("change", { bubbles: true }));
-    return { value: e.value };
+    const actual = [...e.selectedOptions].map(o => o.value);
+    const verified = e.isConnected && actual.length === values.length && actual.every(v => values.includes(v));
+    return { value: e.value,
+      outcome: { state: verified ? "verified" : "uncertain", verified,
+        reason: verified ? "The connected control has the requested selection after its input handlers returned."
+          : "The control was replaced or did not retain the requested selection; inspect it before continuing.",
+        verification: "selected_values", expected: values, actual } };
   }
   if (p.operation === "check") {
     if (!["checkbox", "radio"].includes(e.type))
       throw Error("Element is not checkbox/radio");
     if (e.checked !== (p.checked !== false)) e.click();
-    return { checked: e.checked };
+    const expected = p.checked !== false;
+    const verified = e.isConnected && e.checked === expected;
+    return { checked: e.checked, outcome: { state: verified ? "verified" : "uncertain", verified,
+      reason: verified ? "The connected control has the requested checked state after its input handlers returned."
+        : "The control was replaced or did not retain the requested checked state; inspect it before continuing.",
+      verification: "checked", expected, actual: e.checked } };
   }
   if (p.operation === "select_text") {
     // How often a text matches would reveal a redacted value a guess at a time.
@@ -910,6 +929,7 @@ async function refDom(tabId, p, ref, object) {
       `Ref ${ref} is no longer on the page; take a new snapshot`,
     );
   try {
+    if (!["query", "inspect", "node", "dom_snapshot"].includes(p.operation)) await requireAgentInput(tabId, p.session_id);
     const result = await cdp(tabId, "Runtime.callFunctionOn", {
       objectId,
       functionDeclaration: `function (p) { return (${domOperation.toString()})(p, ${isSecretField.toString()}, this); }`,
@@ -933,10 +953,13 @@ async function refDom(tabId, p, ref, object) {
   }
 }
 async function dom(tabId, p, object = false) {
+  // A pause can arrive while an action animates its cursor or resolves a frame. Check again at the DOM mutation.
+  if (!["query", "inspect", "node", "dom_snapshot"].includes(p.operation)) await requireAgentInput(tabId, p.session_id);
   const ref = p.locator?.chain?.[0]?.ref;
   if (ref !== undefined) return refDom(tabId, p, ref, object);
   const context = await contextFor(tabId, p);
   const arg = { ...p, locator: { ...p.locator, frame: undefined } };
+  if (!["query", "inspect", "node", "dom_snapshot"].includes(p.operation)) await requireAgentInput(tabId, p.session_id);
   const result = await context.send("Runtime.evaluate", {
     expression: `(${domOperation.toString()})(${JSON.stringify(arg)}, ${isSecretField.toString()})`,
     returnByValue: !object,
@@ -961,6 +984,7 @@ const ok = () => ({ ok: true });
 // Operations that act on the page; each sets the cursor's caption, or clears it when it has none.
 const CURSOR_OPERATIONS = new Set([
   "click",
+  "hover",
   "drag",
   "scroll",
   "fill",
@@ -1009,6 +1033,7 @@ const OPERATION_ARGUMENTS = {
   inspect: "locator; optional offset, length in UTF-16 units",
   click:
     "locator or x,y; optional button (left/right/middle), count (1..3), modifiers array",
+  hover: "locator or x,y; optional modifiers array. Dispatches trusted CDP mouse movement without clicking.",
   fill: "locator, text",
   type: "text; optional locator",
   paste:
@@ -1020,7 +1045,7 @@ const OPERATION_ARGUMENTS = {
   select_option: "locator, value",
   press_key: "keys; optional locator",
   scroll: "direction, amount; optional locator",
-  drag: "from_x, from_y, to_x, to_y in viewport CSS pixels",
+  drag: "from_x, from_y, to_x, to_y in viewport CSS pixels. Left-button pointer drag; no HTML5 DataTransfer synthesis.",
   back: "tab_id",
   forward: "tab_id",
   reload: "tab_id",
@@ -1044,8 +1069,8 @@ const OPERATION_ARGUMENTS = {
 };
 
 // browser_repl asks for the tab's URL with every result, so page.url() follows navigations its actions cause.
-export async function extended(p) {
-  const result = await operate(p);
+export async function extended(p, guardObservation) {
+  const result = await operate(p, guardObservation);
   if (p.report_url && Number.isInteger(p.tabId) && result && typeof result === "object") {
     const tab = await chrome.tabs.get(p.tabId).catch(() => null);
     if (tab) result.url = tab.url || tab.pendingUrl || "";
@@ -1053,7 +1078,7 @@ export async function extended(p) {
   return result;
 }
 
-async function operate(p) {
+async function operate(p, guardObservation) {
   const { tabId, operation: op } = p,
     session = p.session_id ?? "legacy";
   if (
@@ -1068,6 +1093,14 @@ async function operate(p) {
     throw new BridgeError("invalid_argument", "Invalid selection_type");
   if (p.button && !["left", "right", "middle"].includes(p.button))
     throw new BridgeError("invalid_argument", "Invalid mouse button");
+  if (p.button !== undefined && op !== "click")
+    throw new BridgeError("invalid_argument", "button is supported only by click");
+  if (p.modifiers !== undefined && !["click", "hover"].includes(op))
+    throw new BridgeError("invalid_argument", "modifiers are supported only by click and hover");
+  if (p.modifiers !== undefined && !Array.isArray(p.modifiers))
+    throw new BridgeError("invalid_argument", "modifiers must be an array");
+  if (p.count !== undefined && op !== "click")
+    throw new BridgeError("invalid_argument", "count is supported only by click");
   if (
     (p.modifiers ?? []).some(
       (m) => !["alt", "ctrl", "cmd", "shift"].includes(m),
@@ -1085,6 +1118,11 @@ async function operate(p) {
       arguments: OPERATION_ARGUMENTS,
       cdp_allowlist: [...CDP_ALLOWLIST],
       local_approval_required: [...PRIVATE_OPERATIONS],
+      input: { backend: "chrome_debugger_cdp", background: true, hover: true, pointer_drag: true,
+        html5_drag_data_transfer: false, modifier_click: true, touch: false },
+      observations: { revision_guard: "observation_id", coverage: ["dom", "form_properties", "viewport", "frames"],
+        excludes: ["canvas_or_video_paint", "render_only_layout", "closed_shadow_roots"],
+        outcomes: ["dispatched", "verified", "uncertain"], verified_postconditions: ["value", "checked", "selected_values"] },
       locator_fields: [
         "selector",
         "role",
@@ -1122,7 +1160,10 @@ async function operate(p) {
   await requireAgentTab(tabId, session);
   if (op === "release") return releaseTab(tabId, session);
   if (op === "retain") return retainTab(tabId, session, p.mode);
-  if (CURSOR_OPERATIONS.has(op)) setCaption(tabId, p.caption ?? "", session);
+  if (CURSOR_OPERATIONS.has(op)) {
+    await requireAgentInput(tabId, session);
+    setCaption(tabId, p.caption ?? "", session);
+  }
   if (op === "dom_snapshot" || op === "inspect" || op === "query")
     return dom(tabId, p);
   if (
@@ -1133,14 +1174,14 @@ async function operate(p) {
     await pointAtLocator(tabId, p);
     return dom(tabId, p);
   }
-  if (op === "click") {
-    const point = p.locator
+  if (op === "click" || op === "hover") {
+    let point = p.locator
       ? await reachablePoint("The locator's element", () => locatorTarget(tabId, p))
       : { x: p.x, y: p.y };
     if (!Number.isFinite(point.x) || !Number.isFinite(point.y))
       throw new BridgeError(
         "invalid_argument",
-        "click needs locator or coordinates",
+        `${op} needs locator or coordinates`,
       );
     const modifiers = (p.modifiers ?? []).reduce(
         (n, m) => n | ({ alt: 1, ctrl: 2, cmd: 4, shift: 8 }[m] ?? 0),
@@ -1155,7 +1196,14 @@ async function operate(p) {
         clickCount: p.count ?? 1,
         modifiers,
       });
-    await pointTo(tabId, point, p.count ?? 1);
+    await pointTo(tabId, point, op === "hover" ? 0 : p.count ?? 1);
+    // Resolve again after the cursor glide, so a moving/replaced locator cannot receive input at its old position.
+    if (p.locator) point = await reachablePoint("The locator's element", () => locatorTarget(tabId, p));
+    else await guardObservation?.();
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, button: "none", buttons: 0, modifiers });
+    if (op === "hover") return ok();
+    if (p.locator) point = await reachablePoint("The locator's element", () => locatorTarget(tabId, p));
+    else await guardObservation?.();
     const before = loadsOf(tabId).started;
     // Do not wait for navigation while a JS dialog is open.
     await send("mousePressed");
@@ -1206,6 +1254,7 @@ async function operate(p) {
         "Four drag coordinates required",
       );
     await dragTo(tabId, { x: p.from_x, y: p.from_y }, { x: p.to_x, y: p.to_y });
+    await guardObservation?.();
     await cdp(tabId, "Input.dispatchMouseEvent", {
       type: "mousePressed",
       x: p.from_x,
@@ -1247,7 +1296,10 @@ async function operate(p) {
     return ok();
   }
   if (op === "reload") {
-    await settleAround(tabId, () => chrome.tabs.reload(tabId));
+    await settleAround(tabId, async () => {
+      await requireAgentInput(tabId, session);
+      return chrome.tabs.reload(tabId);
+    });
     show(tabId);
     return ok();
   }
@@ -1406,10 +1458,15 @@ async function operate(p) {
       expression: "devicePixelRatio",
       returnByValue: true,
     });
+    // Beyond-viewport capture can temporarily resize the renderer, firing page resize handlers even when the
+    // requested clip already fits. Use the ordinary screenshot path for viewport/contained clips; only expand
+    // the renderer for an explicitly requested region outside the current viewport.
+    const beyondViewport = clip.x < v.pageX || clip.y < v.pageY ||
+      clip.x + clip.width > v.pageX + v.clientWidth || clip.y + clip.height > v.pageY + v.clientHeight;
     const { data } = await concealDuring(tabId, () =>
       cdp(tabId, "Page.captureScreenshot", {
         format: "png",
-        captureBeyondViewport: true,
+        captureBeyondViewport: beyondViewport,
         clip: { ...clip, scale: 1 / (result.value || 1) },
       }),
     );
@@ -1487,6 +1544,7 @@ async function operate(p) {
     return { result: await cdp(tabId, p.method, p.params ?? {}) };
   }
   if (op === "clipboard") {
+    if (p.action === "write") await requireAgentInput(tabId, session);
     const expression =
       p.action === "write"
         ? `navigator.clipboard.writeText(${JSON.stringify(p.text)}).then(()=>({ok:true}))`

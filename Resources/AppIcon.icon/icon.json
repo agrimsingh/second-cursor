@@ -1,0 +1,28 @@
+{
+  "fill": {
+    "solid": "srgb:0.09412,0.09020,0.07451,1.00000"
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "Artwork.png",
+          "name": "Second Cursor",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0
+      },
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

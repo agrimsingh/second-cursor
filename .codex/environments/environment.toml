@@ -6,3 +6,11 @@ script = ""
 name = "Run"
 icon = "run"
 command = "./scripts/build_and_run.sh"
+[[actions]]
+name = "Check setup"
+icon = "test"
+command = "./build/SecondCursor.app/Contents/MacOS/SecondCursor doctor"
+[[actions]]
+name = "Check packaging"
+icon = "test"
+command = "./scripts/package-release.sh --check"

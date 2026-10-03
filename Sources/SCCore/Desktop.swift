@@ -3,6 +3,11 @@ import ApplicationServices
 import Foundation
 import SCShared
 
+private enum NativePlan {
+    /// The existing explicit batch escape hatch; ordinary coordinate actions always validate their layout.
+    @TaskLocal static var acceptsLayoutChange = false
+}
+
 public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// What the agent last saw of one window. Only touched on that window's app queue.
     private final class WindowTree {
@@ -10,6 +15,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let table = IndexTable()
         var snapshotID: String?
         var observationID: String?
+        var inputSequence: UInt64 = 0
+        var layoutFingerprint: Int?
+        var sheets: [CFHashCode] = []
+        var document: String?
         /// The last full rendering and its frame-free keys; the next diff is computed against them.
         var lines: [String]?
         var keys: [String]?
@@ -153,6 +162,35 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         PermissionStatus(accessibility: AXIsProcessTrusted(), screenRecording: CGPreflightScreenCaptureAccess())
     }
 
+    public func nativeCapabilities(windowID: UInt32?) async -> NativeCapabilityProfile {
+        if let windowID, let record = WindowList.record(windowID) {
+            return (try? await run(on: queue(for: record.pid)) { self.capabilities(record) }) ?? capabilities(nil)
+        }
+        return capabilities(nil)
+    }
+
+    private func capabilities(_ record: CGWindowRecord?) -> NativeCapabilityProfile {
+        let semanticConflict = record.flatMap { NativeSafety.conflict(pid: $0.pid, wid: $0.id, input: false) }
+        let inputConflict = record.flatMap { NativeSafety.conflict(pid: $0.pid, wid: $0.id, input: true) }
+        let pointerReason = SkyLight.pointerUnavailableReason ?? inputConflict
+        let keyboardReason = SkyLight.keyboardUnavailableReason ?? inputConflict
+        let browser = "Use a semantic AX action when exposed, or an agent-owned browser tab for web content. Isolated execution requires a separately configured environment."
+        return NativeCapabilityProfile(osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+            inputMonitoringAvailable: HumanInputMonitor.shared.state.monitoring,
+            capabilities: [
+                "semantic_actions": NativeGestureCapability(supported: semanticConflict == nil, reason: semanticConflict,
+                    alternative: semanticConflict == nil ? nil : browser),
+                "pointer": NativeGestureCapability(supported: pointerReason == nil, reason: pointerReason, alternative: pointerReason == nil ? nil : browser),
+                "drag": NativeGestureCapability(supported: pointerReason == nil, reason: pointerReason, alternative: pointerReason == nil ? nil : browser),
+                "keyboard": NativeGestureCapability(supported: keyboardReason == nil, reason: keyboardReason, alternative: keyboardReason == nil ? nil : browser),
+                "modifier_click": NativeGestureCapability(supported: false, reason: "Background native modifier clicks are not reliably delivered.", alternative: browser),
+                "modifier_drag": NativeGestureCapability(supported: false, reason: "Background native modifier drags are not reliably delivered.", alternative: browser),
+                "hover": NativeGestureCapability(supported: false, reason: "Native background hover is not implemented.", alternative: browser),
+                "frame_freshness": NativeGestureCapability(supported: false,
+                    reason: "ScreenCaptureKit returns pixels without the application's last repaint time. Off-Space custom surfaces may stop repainting.")
+            ])
+    }
+
     public func listApps(includeNotRunning: Bool) async -> [AppInfo] {
         Apps.list(includeNotRunning: includeNotRunning)
     }
@@ -227,11 +265,13 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     public func click(windowID: UInt32, target: ClickTarget, button: MouseButton, count: Int, modifiers: [String]) async throws -> ActionResult {
         let flags = try Keyboard.flags(modifiers)
+        guard flags.isEmpty else { throw SCError.notAllowed("Native modifier clicks are unsupported because macOS may ignore their modifiers. Use a semantic AX action or the browser backend.") }
         return try await act(windowID) { try self.performClick(windowID, target: target, button: button, count: max(count, 1), flags: flags) }
     }
 
     public func drag(windowID: UInt32, from: Point, to: Point, modifiers: [String]) async throws -> ActionResult {
         let flags = try Keyboard.flags(modifiers)
+        guard flags.isEmpty else { throw SCError.notAllowed("Native modifier drags are unsupported because macOS may ignore their modifiers. Use a semantic AX action or the browser backend.") }
         return try await act(windowID) { try self.performDrag(windowID, from: from, to: to, flags: flags) }
     }
 
@@ -281,15 +321,22 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 do {
                     try Execution.context.beforeDispatch()
                     try admit(step)
+                    try self.validateObservation(step.windowID, matchID: step.windowID == windowID)
+                    if let record = WindowList.record(step.windowID) {
+                        try NativeSafety.check(pid: record.pid, wid: record.id, input: false)
+                    }
                     if let caption = step.caption {
                         self.cursor?.present(
                             .activity(session: Execution.context.sessionID, app: nil, near: nil, caption: caption))
                     }
                     self.watchChanges(step.windowID)
                     let started = Date()
-                    let result = try Timing.measure("perform") { try self.perform(step) }
+                    let result = try NativePlan.$acceptsLayoutChange.withValue(!stopOnLayoutChange) {
+                        try Timing.measure("perform") { try self.perform(step) }
+                    }
                     self.markAction(on: step.windowID, started: started, route: result.route)
                     results.append(BatchStepResult(tool: step.tool, ok: true, result: result))
+                    if stopOnError && result.uncertain == true { halted = true }
                 } catch {
                     let message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
                     results.append(BatchStepResult(tool: step.tool, ok: false, error: message))
@@ -381,6 +428,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     private func act(_ windowID: CGWindowID, _ work: @escaping () throws -> ActionResult) async throws -> ActionResult {
         try await run(windowID: windowID) {
             try self.validateObservation(windowID)
+            let record = try self.record(windowID)
+            try NativeSafety.check(pid: record.pid, wid: windowID, input: false)
             self.watchChanges(windowID)
             let started = Date()
             let result = try Timing.measure("perform", work)
@@ -414,7 +463,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     private func performDrag(_ wid: CGWindowID, from: Point, to: Point, flags: CGEventFlags) throws -> ActionResult {
         let record = try record(wid)
-        try requirePointerTarget(record)
+        try requirePointerTarget(record, validateLayout: false)
         for point in [from, to] {
             guard point.x >= 0, point.y >= 0, point.x < record.bounds.width, point.y < record.bounds.height else {
                 throw SCError.invalidArgument("Point (\(point.x), \(point.y)) is outside window \(wid) (\(Int(record.bounds.width))x\(Int(record.bounds.height)))")
@@ -422,15 +471,17 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         }
         showCursor(record, .drag(from: Point(x: record.bounds.minX + from.x, y: record.bounds.minY + from.y),
                                  to: Point(x: record.bounds.minX + to.x, y: record.bounds.minY + to.y)))
-        noteDelivered(record.id, at: Pointer.drag(
-            pid: record.pid, wid: record.id, window: record.isOnScreen ? try? resolver.resolve(pid: record.pid, wid: record.id) : nil,
-            from: Self.location(record, local: CGPoint(x: from.x, y: from.y)),
-            to: Self.location(record, local: CGPoint(x: to.x, y: to.y)), flags: flags))
+        let current = try self.record(wid)
+        try requirePointerTarget(current)
+        noteDelivered(current.id, at: try Pointer.drag(
+            pid: current.pid, wid: current.id, window: current.isOnScreen ? try? resolver.resolve(pid: current.pid, wid: current.id) : nil,
+            from: Self.location(current, local: CGPoint(x: from.x, y: from.y)),
+            to: Self.location(current, local: CGPoint(x: to.x, y: to.y)), flags: flags))
         return ActionResult(route: "skylight_drag")
     }
 
     private func applyValue(_ wid: CGWindowID, elementIndex: Int, value: String) throws -> ActionResult {
-        let (_, element) = try element(wid, elementIndex)
+        let (_, element) = try mutationElement(wid, elementIndex)
         let error = element.element.set(kAXValueAttribute, value as CFString)
         guard error == .success else { throw SCError.actionFailed("Setting AXValue failed (AXError \(error.rawValue))") }
         let readBack = AX.text(element.element.attribute(kAXValueAttribute))
@@ -442,49 +493,69 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let record = try record(wid)
         _ = try resolver.resolve(pid: record.pid, wid: wid)
         guard chord.flags.contains(.maskCommand) else {
-            withKeyWindow(record) { Keyboard.press(chord, pid: record.pid) }
-            return ActionResult(route: "pid_keyboard")
+            // A background app also needs its target-only AppKit focus before it can confirm a
+            // different document as key. Keep the same guarded handoff used by command shortcuts.
+            try SkyLight.requireKeyboardSupport()
+            try NativeSafety.check(pid: record.pid, wid: wid, input: true)
+            let handoff = try SkyLight.focusWithoutRaise(pid: record.pid, wid: wid)
+            guard handoff != nil || SkyLight.isFront(pid: record.pid, wid: wid) else {
+                throw SCError.notAllowed("macOS refused a background focus handoff; no key was dispatched. Use a semantic AX action or the browser backend.")
+            }
+            defer { if let handoff { usleep(50_000); SkyLight.restore(handoff) } }
+            try withKeyWindow(record) { try Keyboard.press(chord, pid: record.pid, wid: wid) }
+            return ActionResult(route: handoff == nil ? "pid_keyboard" : "pid_keyboard_focus_handoff")
         }
         // The handoff serializes input for every app, so an app that does not answer is found out before it.
         let bar = MenuShortcut.menuBar(pid: record.pid)
         // Menu key equivalents only fire in an AppKit-active app with a key window, so hand the target
         // AppKit focus (no raise, no Space change) for the duration of the chord, then give it back.
-        let handoff = SkyLight.focusWithoutRaise(pid: record.pid, wid: wid)
+        try SkyLight.requireKeyboardSupport()
+        try NativeSafety.check(pid: record.pid, wid: wid, input: true)
+        let handoff = try SkyLight.focusWithoutRaise(pid: record.pid, wid: wid)
+        guard handoff != nil || SkyLight.isFront(pid: record.pid, wid: wid) else {
+            throw SCError.notAllowed("macOS refused a background focus handoff; no shortcut was dispatched. Use a semantic AX action or the browser backend.")
+        }
         defer { if let handoff { usleep(50_000); SkyLight.restore(handoff) } }
         var route = "pid_keyboard_focus_handoff"
-        var verified: Bool?
+        var uncertain: Bool?
         var note: String?
-        withKeyWindow(record) {
+        try withKeyWindow(record) {
             // The walk has to happen inside the handoff (see MenuShortcut.find), so it gets a hard budget.
             let found = bar.flatMap { MenuShortcut.find(chord, in: $0, deadline: Date().addingTimeInterval(1.5)) }
+            try NativeSafety.check(pid: record.pid, wid: wid, input: true)
             let pressed = found?.item.perform(kAXPressAction)
             if pressed == .success || pressed == .cannotComplete {
                 route = "ax_menu_shortcut"
                 // .cannotComplete only means the app did not answer in time; the item may still run later.
-                verified = pressed == .success ? true : nil
+                uncertain = pressed == .cannotComplete ? true : nil
                 note = found?.title.map { "pressed menu item \"\($0)\"" }
                 if pressed == .cannotComplete {
                     note = (note.map { $0 + "; " } ?? "") + "app did not reply in time; the action may still run"
                 }
             } else {
-                Keyboard.press(chord, pid: record.pid)
+                try Keyboard.press(chord, pid: record.pid, wid: wid)
             }
         }
-        return ActionResult(route: route, verified: verified, note: note)
+        return ActionResult(route: route, note: note, uncertain: uncertain)
     }
 
     private func performNamedAction(_ wid: CGWindowID, elementIndex: Int, action: String) throws -> ActionResult {
-        let (_, element) = try element(wid, elementIndex)
+        let (record, element) = try mutationElement(wid, elementIndex)
         let available = element.element.actions
         guard let match = available.first(where: { $0 == action || TreeBuilder.actionName($0) == action }) else {
             let names = available.map(TreeBuilder.actionName)
             throw SCError.invalidArgument("Element \(elementIndex) has no action \(action); available: \(names.isEmpty ? "none" : names.joined(separator: ", "))")
         }
+        guard match != kAXRaiseAction else {
+            throw SCError.notAllowed("AXRaise would change foreground window ordering. Use a background semantic action or hand the task to the user.")
+        }
+        try NativeSafety.check(pid: record.pid, wid: wid, input: false)
         let error = element.element.perform(match)
         guard error == .success || error == .cannotComplete else {
             throw SCError.actionFailed("\(action) failed (AXError \(error.rawValue))")
         }
-        return ActionResult(route: "ax_action", note: error == .cannotComplete ? "app did not reply in time; the action may still have run" : nil)
+        return ActionResult(route: "ax_action", note: error == .cannotComplete ? "app did not reply in time; the action may still have run" : nil,
+                            uncertain: error == .cannotComplete ? true : nil)
     }
 
     // MARK: Settling
@@ -592,17 +663,25 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         return false
     }
 
-    /// Keys reach whichever window the app treats as key, so make the target key first (without
-    /// activating the app). When the user is working in that same app, hand key back afterwards.
-    private func withKeyWindow(_ record: CGWindowRecord, _ body: () -> Void) {
-        let previous = SkyLight.isFront(pid: record.pid, wid: record.id) ? SkyLight.keyWindow(pid: record.pid) : nil
-        SkyLight.makeKeyWindow(pid: record.pid, wid: record.id)
-        usleep(50_000)
-        body()
-        if let previous, previous != record.id {
+    /// Keys reach whichever window the app treats as key. Only background processes may change their
+    /// key window; an active process must already have this target key, so no handoff can steal typing.
+    private func withKeyWindow(_ record: CGWindowRecord, _ body: () throws -> Void) throws {
+        try SkyLight.requireKeyboardSupport()
+        try NativeSafety.check(pid: record.pid, wid: record.id, input: true)
+        // AXFocusedWindow remembers a background app's logical window even when AppKit has resigned key.
+        // Background key equivalents still need the synthetic make-key record after a focus handoff.
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != record.pid || SkyLight.keyWindow(pid: record.pid) != record.id {
+            try NativeSafety.check(pid: record.pid, wid: record.id, input: true)
+            guard SkyLight.makeKeyWindow(pid: record.pid, wid: record.id) else {
+                throw SCError.notAllowed("macOS refused safe key-window targeting. Use set_value, a semantic AX action or the browser backend.")
+            }
             usleep(50_000)
-            SkyLight.makeKeyWindow(pid: record.pid, wid: previous)
         }
+        try NativeSafety.check(pid: record.pid, wid: record.id, input: true)
+        guard SkyLight.keyWindow(pid: record.pid) == record.id else {
+            throw SCError.notAllowed("The app did not confirm the target as its key window; no keyboard input was sent. Observe again or use a semantic AX action.")
+        }
+        try body()
     }
 
     public func scroll(windowID: UInt32, target: ClickTarget?, direction: ScrollDirection, amount: Int) async throws -> ActionResult {
@@ -617,8 +696,13 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// screenshot never waits behind a busy or hung app.
     public func screenshot(windowID: UInt32) async throws -> Screenshot {
         if needsSettle(windowID) { await settle(windowID: windowID) }
-        guard let record = WindowList.record(windowID) else { throw SCError.windowNotFound(windowID) }
-        noteObserved(windowID, size: record.bounds.size)
+        try await run(windowID: windowID) {
+            let record = try self.record(windowID)
+            self.noteObserved(windowID, size: record.bounds.size)
+            let tree = self.tree(for: windowID, pid: record.pid)
+            tree.inputSequence = HumanInputMonitor.shared.state.inputSequence(for: record.pid)
+            tree.layoutFingerprint = (try? self.resolver.resolve(pid: record.pid, wid: windowID)).map { TreeBuilder.layoutFingerprint(window: $0) }
+        }
         return try await capture(windowID)
     }
 
@@ -719,6 +803,10 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         }
         let frame = window.frame ?? record.bounds
         let tree = tree(for: wid, pid: record.pid)
+        tree.inputSequence = HumanInputMonitor.shared.state.inputSequence(for: record.pid)
+        tree.layoutFingerprint = Timing.measure("layout_guard_baseline") { TreeBuilder.layoutFingerprint(window: window) }
+        tree.sheets = window.elements("AXSheets").map { CFHash($0) }
+        tree.document = window.string(kAXDocumentAttribute)
         let id = String(UUID().uuidString.prefix(8)).lowercased()
         noteObserved(wid, size: record.bounds.size)
         tree.observationID = id
@@ -763,6 +851,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             result.scopeLabel = options.scope == nil ? options.scopeLabel : nil
             result.elements = out.structured
             result.ocrCount = ocrCount
+            result.capabilities = capabilities(record)
             return result
         }
 
@@ -812,7 +901,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         // findElements hands out indexes for elements past the outline's cut; they keep working while the element exists.
         for node in builder.nodes where node.indexed {
             if let index = tree.table.existingIndex(forKey: node.key), tree.elements[index] == nil {
-                tree.elements[index] = SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key)
+                tree.elements[index] = SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key, label: node.label)
             }
         }
         var result = WindowSnapshot(
@@ -823,6 +912,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         )
         result.elements = out.structured
         result.ocrCount = ocrCount
+        result.capabilities = capabilities(record)
         return result
     }
 
@@ -850,7 +940,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                     + ". Pass one of these, or an element index")
         }
         let node = nodes[match]
-        return (SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key),
+        return (SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key, label: node.label),
                 "\"\(TreeBuilder.escape(node.label, limit: 120))\"")
     }
 
@@ -918,13 +1008,40 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         guard element.element.isAlive else {
             throw SCError.actionFailed("Element \(index) no longer exists; call get_window_state again")
         }
+        let identity = TreeBuilder.currentIdentity(element.element)
+        guard identity.role == element.role, identity.label == element.label else {
+            throw SCError.actionFailed("Element \(index) changed identity since observation; call get_window_state again")
+        }
         return (record, element)
     }
 
-    private func validateObservation(_ wid: CGWindowID) throws {
-        if let expected = Execution.context.observationID,
+    private func mutationElement(_ wid: CGWindowID, _ index: Int) throws -> (CGWindowRecord, SnapshotElement) {
+        try validateObservation(wid, matchID: false)
+        let (record, element) = try element(wid, index)
+        guard element.element.bool(kAXEnabledAttribute) != false else {
+            throw SCError.actionFailed("Element \(index) is disabled; read get_window_state before choosing another action")
+        }
+        try NativeSafety.check(pid: record.pid, wid: wid, input: false)
+        return (record, element)
+    }
+
+    private func validateObservation(_ wid: CGWindowID, matchID: Bool = true) throws {
+        if matchID, let expected = Execution.context.observationID,
            storedTree(for: wid)?.observationID != expected {
             throw SCError.actionFailed("Stale observation; read get_window_state again before acting")
+        }
+        if let tree = storedTree(for: wid), HumanInputMonitor.shared.state.inputSequence(for: tree.pid) > tree.inputSequence {
+            throw SCError.notAllowed("The user interacted with this app since observation. Read get_window_state again after they yield before acting.")
+        }
+        if let tree = storedTree(for: wid), tree.snapshotID != nil,
+           let window = try? resolver.resolve(pid: tree.pid, wid: wid) {
+            if window.string(kAXDocumentAttribute) != tree.document {
+                throw SCError.actionFailed("The window changed documents since observation; read get_window_state again before acting")
+            }
+            let sheets = window.elements("AXSheets").map { CFHash($0) }
+            if sheets != tree.sheets {
+                throw SCError.actionFailed("A sheet opened or closed since observation; read get_window_state again before acting")
+            }
         }
     }
 
@@ -951,7 +1068,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     public func selectText(windowID: UInt32, index: Int, text: String, prefix: String?, suffix: String?, mode: String) async throws -> ActionResult {
         try await act(windowID) {
             guard !text.isEmpty, ["text", "cursor_before", "cursor_after"].contains(mode) else { throw SCError.invalidArgument("Nonempty text and valid selection mode required") }
-            let (_, item) = try self.element(windowID, index)
+            let (record, item) = try self.mutationElement(windowID, index)
             let value = (AX.text(item.element.attribute(kAXValueAttribute)) ?? "") as NSString
             var matches: [NSRange] = [], start = 0
             while start < value.length {
@@ -964,6 +1081,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             guard matches.count == 1 else { throw SCError.invalidArgument("Text matched \(matches.count) times; supply prefix/suffix to select exactly one occurrence") }
             let found = matches[0]
             let range = CFRange(location: mode == "cursor_after" ? NSMaxRange(found) : found.location, length: mode == "text" ? found.length : 0)
+            try NativeSafety.check(pid: record.pid, wid: windowID, input: false)
             guard item.element.set(kAXSelectedTextRangeAttribute, AX.rangeValue(range)) == .success else { throw SCError.actionFailed("This element does not support text selection") }
             let actual = AX.range(item.element.attribute(kAXSelectedTextRangeAttribute))
             return ActionResult(route: "ax_selection", verified: actual?.location == range.location && actual?.length == range.length)
@@ -980,6 +1098,16 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 documentAttributes: nil))?.string ?? text
         } : text
         return try await act(windowID) {
+            let record = try self.record(windowID)
+            try SkyLight.requireKeyboardSupport()
+            try NativeSafety.check(pid: record.pid, wid: windowID, input: true)
+            let focused = AXUIElementCreateApplication(record.pid).element(kAXFocusedUIElementAttribute)
+            let target = focused.flatMap { element -> AXUIElement? in
+                element.element(kAXWindowAttribute)?.windowID == windowID || element.windowID == windowID ? element : nil
+            }
+            let before = target.flatMap { AX.text($0.attribute(kAXValueAttribute)) }
+            let expected = target.flatMap { Self.expectedInsertion(plain, into: before, target: $0) }
+            let selectionBefore = target.flatMap { AX.range($0.attribute(kAXSelectedTextRangeAttribute)) }
             Self.clipboardLock.lock(); defer { Self.clipboardLock.unlock() }
             let pb = NSPasteboard.general
             let saved = (pb.pasteboardItems ?? []).map { item in item.types.compactMap { type in item.data(forType: type).map { (type, $0) } } }
@@ -1000,21 +1128,34 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             do {
                 result = try self.performKey(windowID, chord: Keyboard.parse("cmd+v"))
             } catch {
-                restore()
-                throw error
+                let reason = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+                throw SCError.actionFailed(reason + " Paste was interrupted and may be pending. The paste content was left on the clipboard; the previous clipboard was not restored. Observe before retrying.")
             }
             var note = "format=\(format); Markdown is pasted as source. " + (result.note ?? "")
-            // An unconfirmed press or queued keystrokes may read the clipboard later; restoring now could paste
-            // the user's own clipboard into the app instead.
-            if result.verified == true {
-                let pasted = Date()
-                self.settleNow(windowID, after: Activity(at: pasted, answers: pasted))
-                restore()
-            } else {
-                note += (note.hasSuffix(" ") ? "" : "; ")
-                    + "the app did not confirm the paste, so the pasted content was left on the clipboard (the previous clipboard was not restored)"
+            // Acknowledging AXPress does not prove that Paste read the clipboard. Wait for the exact insertion
+            // before restoring, so a delayed handler cannot insert the user's restored clipboard instead.
+            let budget = max(0, min(1, (Execution.context.deadline?.timeIntervalSinceNow ?? 60) - 0.25))
+            let deadline = Date().addingTimeInterval(budget)
+            var confirmed = false
+            if let target, let expected {
+                repeat {
+                    let actual = AX.text(target.attribute(kAXValueAttribute))
+                    let selection = AX.range(target.attribute(kAXSelectedTextRangeAttribute))
+                    let collapsed = selectionBefore.map { original in
+                        original.length > 0 && selection?.location == original.location + plain.utf16.count && selection?.length == 0
+                    } ?? false
+                    confirmed = actual == expected && (before != expected || collapsed)
+                    if confirmed || Date() >= deadline { break }
+                    usleep(20_000)
+                } while true
             }
-            return ActionResult(route: "clipboard_paste", verified: result.verified, note: note)
+            if confirmed { restore() }
+            else {
+                note += (note.hasSuffix(" ") ? "" : "; ")
+                    + "the exact paste result was not confirmed and the action may still execute, so paste content was left on the clipboard (the previous clipboard was not restored)"
+            }
+            return ActionResult(route: "clipboard_paste", verified: confirmed ? true : nil, note: note,
+                                uncertain: confirmed ? nil : true)
         }
     }
 
@@ -1026,7 +1167,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             let record = try record(wid)
             return try pixelClick(record, local: CGPoint(x: x, y: y), button: button, count: count, flags: flags)
         case .element(let index):
-            let (record, element) = try element(wid, index)
+            let (record, element) = try mutationElement(wid, index)
             let action = button == .left ? kAXPressAction : button == .right ? kAXShowMenuAction : nil
             // Modifier clicks (shift-extend, cmd-toggle) have no accessibility equivalent, so they go through the pointer.
             if flags.isEmpty, let action, element.element.actions.contains(action) {
@@ -1034,9 +1175,15 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                     showCursor(record, .click(at: Point(x: frame.midX, y: frame.midY), count: button == .left ? count : 1))
                 }
                 for _ in 0..<(button == .left ? count : 1) {
+                    try NativeSafety.check(pid: record.pid, wid: wid, input: false)
+                    _ = try self.mutationElement(wid, index)
                     let error = element.element.perform(action)
                     guard error == .success || error == .cannotComplete else {
                         throw SCError.actionFailed("\(action) failed on element \(index) (AXError \(error.rawValue))")
+                    }
+                    if error == .cannotComplete {
+                        return ActionResult(route: button == .left ? "ax_press" : "ax_show_menu",
+                            note: "The app did not confirm this press; it may still execute. Remaining requested presses were not sent. Observe before retrying.", uncertain: true)
                     }
                 }
                 return ActionResult(route: button == .left ? "ax_press" : "ax_show_menu")
@@ -1054,14 +1201,16 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     }
 
     private func pixelClick(_ record: CGWindowRecord, local: CGPoint, button: MouseButton, count: Int, flags: CGEventFlags) throws -> ActionResult {
-        try requirePointerTarget(record)
+        try requirePointerTarget(record, validateLayout: false)
         guard local.x >= 0, local.y >= 0, local.x < record.bounds.width, local.y < record.bounds.height else {
             throw SCError.invalidArgument("Point (\(local.x), \(local.y)) is outside window \(record.id) (\(Int(record.bounds.width))x\(Int(record.bounds.height)))")
         }
         showCursor(record, .click(at: Point(x: record.bounds.minX + local.x, y: record.bounds.minY + local.y), count: count))
-        noteDelivered(record.id, at: Pointer.click(
-            pid: record.pid, wid: record.id, window: record.isOnScreen ? try? resolver.resolve(pid: record.pid, wid: record.id) : nil,
-            at: Self.location(record, local: local), button: button, count: count, flags: flags))
+        let current = try self.record(record.id)
+        try requirePointerTarget(current)
+        noteDelivered(current.id, at: try Pointer.click(
+            pid: current.pid, wid: current.id, window: current.isOnScreen ? try? resolver.resolve(pid: current.pid, wid: current.id) : nil,
+            at: Self.location(current, local: local), button: button, count: count, flags: flags))
         return ActionResult(route: "skylight_pointer")
     }
 
@@ -1071,13 +1220,19 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     /// Pointer events are addressed to the window, so they land in place on any Space. A minimized
     /// window has no on-screen frame to hit-test against.
-    private func requirePointerTarget(_ record: CGWindowRecord) throws {
-        if Execution.context.observationID != nil, let before=observedSize(record.id),
+    private func requirePointerTarget(_ record: CGWindowRecord, validateLayout: Bool = true) throws {
+        try SkyLight.requirePointerSupport()
+        try NativeSafety.check(pid: record.pid, wid: record.id, input: true)
+        try validateObservation(record.id, matchID: false)
+        if !NativePlan.acceptsLayoutChange, let before=observedSize(record.id),
            abs(before.width-record.bounds.width)>1 || abs(before.height-record.bounds.height)>1 {
             throw SCError.actionFailed("Window resized since observation; observe again before using coordinates")
         }
-        guard !record.isOnScreen else { return }
         let window = try resolver.resolve(pid: record.pid, wid: record.id)
+        if validateLayout, !NativePlan.acceptsLayoutChange, let before = storedTree(for: record.id)?.layoutFingerprint,
+           Timing.measure("layout_guard", { TreeBuilder.layoutFingerprint(window: window) }) != before {
+            throw SCError.actionFailed("Window layout or content changed since observation; get_window_state again before using coordinates. A stable semantic AX element may still be actionable.")
+        }
         if window.bool(kAXMinimizedAttribute) == true {
             throw SCError.actionFailed("window \(record.id) is minimized; pixel input needs it restored")
         }
@@ -1085,19 +1240,26 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
     private func performScroll(_ wid: CGWindowID, target: ClickTarget?, direction: ScrollDirection, amount: Int) throws -> ActionResult {
         if case .element(let index) = target {
-            let (_, element) = try element(wid, index)
+            let (record, element) = try mutationElement(wid, index)
             let action = [ScrollDirection.up: "AXScrollUpByPage", .down: "AXScrollDownByPage",
                           .left: "AXScrollLeftByPage", .right: "AXScrollRightByPage"][direction]!
             var candidate: AXUIElement? = element.element
             while let current = candidate {
                 if current.actions.contains(action) {
-                    for _ in 0..<amount { _ = current.perform(action) }
+                    for _ in 0..<amount {
+                        try NativeSafety.check(pid: record.pid, wid: wid, input: false)
+                        let error = current.perform(action)
+                        guard error == .success else {
+                            throw SCError.actionFailed("AX scrolling was not confirmed (AXError \(error.rawValue)); observe before retrying")
+                        }
+                    }
                     return ActionResult(route: "ax_scroll_page")
                 }
                 if current.role == kAXScrollAreaRole, let bar = current.element(
                     direction == .up || direction == .down ? kAXVerticalScrollBarAttribute : kAXHorizontalScrollBarAttribute
                 ), let position = (bar.attribute(kAXValueAttribute) as? NSNumber)?.doubleValue {
                     let step = (direction == .up || direction == .left ? -0.1 : 0.1) * Double(amount)
+                    try NativeSafety.check(pid: record.pid, wid: wid, input: false)
                     let error = bar.set(kAXValueAttribute, NSNumber(value: min(1, max(0, position + step))))
                     if error == .success { return ActionResult(route: "ax_scrollbar") }
                 }
@@ -1105,9 +1267,9 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 candidate = current.element(kAXParentAttribute)
             }
             guard let frame = element.element.frame else { throw SCError.actionFailed("Element \(index) is not scrollable") }
-            let record = try record(wid)
-            let local = CGPoint(x: frame.midX - record.bounds.minX, y: frame.midY - record.bounds.minY)
-            return try wheel(record, local: local, direction: direction, amount: amount)
+            let pointerRecord = try self.record(wid)
+            let local = CGPoint(x: frame.midX - pointerRecord.bounds.minX, y: frame.midY - pointerRecord.bounds.minY)
+            return try wheel(pointerRecord, local: local, direction: direction, amount: amount)
         }
         let record = try record(wid)
         var local = CGPoint(x: record.bounds.width / 2, y: record.bounds.height / 2)
@@ -1116,7 +1278,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     }
 
     private func wheel(_ record: CGWindowRecord, local: CGPoint, direction: ScrollDirection, amount: Int) throws -> ActionResult {
-        try requirePointerTarget(record)
+        try requirePointerTarget(record, validateLayout: false)
         let (dx, dy): (Int32, Int32) = switch direction {
         case .up: (0, 3)
         case .down: (0, -3)
@@ -1124,7 +1286,9 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         case .right: (-3, 0)
         }
         showCursor(record, .scroll(at: Point(x: record.bounds.minX + local.x, y: record.bounds.minY + local.y)))
-        noteDelivered(record.id, at: Pointer.scroll(pid: record.pid, wid: record.id, at: Self.location(record, local: local),
+        let current = try self.record(record.id)
+        try requirePointerTarget(current)
+        noteDelivered(current.id, at: try Pointer.scroll(pid: current.pid, wid: current.id, at: Self.location(current, local: local),
                                                     dx: dx, dy: dy, ticks: amount))
         return ActionResult(route: "skylight_wheel")
     }
@@ -1136,7 +1300,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         let target: AXUIElement
         var inWebArea: Bool
         if let elementIndex {
-            let (_, element) = try element(wid, elementIndex)
+            let (_, element) = try mutationElement(wid, elementIndex)
             target = element.element
             inWebArea = element.inWebArea
         } else {
@@ -1145,7 +1309,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             guard let focused = app.element(kAXFocusedUIElementAttribute),
                   focused.element(kAXWindowAttribute)?.windowID == wid || focused.windowID == wid
             else {
-                withKeyWindow(record) { Keyboard.type(text, pid: record.pid) }
+                try withKeyWindow(record) { try Keyboard.type(text, pid: record.pid, wid: wid) }
                 return ActionResult(route: "pid_keyboard", verified: nil, note: "no focused element found in this window; typed into it as the app's key window")
             }
             target = focused
@@ -1155,21 +1319,54 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
 
         if !keystrokesOnly, !inWebArea, target.isSettable(kAXSelectedTextAttribute) {
             let before = AX.text(target.attribute(kAXValueAttribute))
-            if target.set(kAXSelectedTextAttribute, text as CFString) == .success {
+            let expected = Self.expectedInsertion(text, into: before, target: target)
+            try NativeSafety.check(pid: record.pid, wid: wid, input: false)
+            let error = target.set(kAXSelectedTextAttribute, text as CFString)
+            if error == .success {
                 let after = AX.text(target.attribute(kAXValueAttribute))
-                if after != before || text.isEmpty { return ActionResult(route: "ax_selected_text", verified: after?.contains(text) ?? false) }
+                return ActionResult(route: "ax_selected_text", verified: expected.map { after == $0 },
+                    note: expected == nil ? "Text insertion was accepted, but the prior selection was unavailable for exact verification."
+                        : after == expected ? nil : "The app accepted AX text insertion but the exact expected text was not observed. Inspect before retrying; use keystrokes_only for apps that do not implement AX text insertion faithfully.")
+            }
+            if error == .cannotComplete {
+                return ActionResult(route: "ax_selected_text", note: "The app did not confirm text insertion; it may still execute. Observe before retrying.", uncertain: true)
             }
         }
 
         if elementIndex != nil, target.bool(kAXFocusedAttribute) != true {
-            target.set(kAXFocusedAttribute, kCFBooleanTrue)
+            try NativeSafety.check(pid: record.pid, wid: wid, input: true)
+            guard target.set(kAXFocusedAttribute, kCFBooleanTrue) == .success else {
+                throw SCError.notAllowed("The requested element refused focus; no keyboard text was sent. Use set_value or another semantic AX action.")
+            }
             usleep(50_000)
+            let focused = AXUIElementCreateApplication(record.pid).element(kAXFocusedUIElementAttribute)
+            guard focused.map({ CFEqual($0, target) }) ?? (target.bool(kAXFocusedAttribute) == true) else {
+                throw SCError.notAllowed("The requested element did not become focused; no keyboard text was sent. Observe again or use set_value.")
+            }
         }
         let before = AX.text(target.attribute(kAXValueAttribute))
-        withKeyWindow(record) { Keyboard.type(text, pid: record.pid) }
+        let expected = Self.expectedInsertion(text, into: before, target: target)
+        try withKeyWindow(record) {
+            if elementIndex != nil {
+                let focused = AXUIElementCreateApplication(record.pid).element(kAXFocusedUIElementAttribute)
+                guard focused.map({ CFEqual($0, target) }) ?? (target.bool(kAXFocusedAttribute) == true) else {
+                    throw SCError.notAllowed("Focus changed before text dispatch; no keyboard text was sent. Observe again or use set_value.")
+                }
+            }
+            try Keyboard.type(text, pid: record.pid, wid: wid)
+        }
         usleep(50_000)
         let after = AX.text(target.attribute(kAXValueAttribute))
-        return ActionResult(route: "pid_keyboard", verified: before == nil && after == nil ? nil : after != before)
+        return ActionResult(route: "pid_keyboard", verified: expected.map { after == $0 },
+            note: expected == nil ? "Key events were dispatched, but the prior value and selection did not support exact text verification." : nil)
+    }
+
+    private static func expectedInsertion(_ text: String, into value: String?, target: AXUIElement) -> String? {
+        guard let value, let range = AX.range(target.attribute(kAXSelectedTextRangeAttribute)) else { return nil }
+        let original = value as NSString
+        guard range.location >= 0, range.length >= 0, range.location <= original.length,
+              range.length <= original.length - range.location else { return nil }
+        return original.replacingCharacters(in: NSRange(location: range.location, length: range.length), with: text)
     }
 
     private static func hasWebAreaAncestor(_ element: AXUIElement) -> Bool {

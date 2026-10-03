@@ -3,7 +3,7 @@ import Foundation
 import JavaScriptCore
 import SCShared
 
-/// browser_repl: one persistent JavaScriptCore context per session, whose Playwright-shaped `page` and `context`
+/// browser_repl: one persistent JavaScriptCore context per session and browser, whose Playwright-shaped `page` and `context`
 /// (BrowserREPL+Prelude.swift) drive the session's Chrome tabs through `BrowserControlling`. A session's scripts run
 /// on its own serial queue, one call at a time, and only while a call is running. Failure modes and the decisions
 /// covering them are listed in e2e/repl.py.
@@ -14,7 +14,11 @@ final class BrowserREPL: @unchecked Sendable {
     private let browser: BrowserControlling
     private let log: ActionLog
     private let lock = NSLock()
-    private var sessions: [String: Session] = [:]
+    private struct SessionKey: Hashable {
+        let sessionID: String
+        let browserID: String
+    }
+    private var sessions: [SessionKey: Session] = [:]
 
     init(browser: BrowserControlling, log: ActionLog) {
         self.browser = browser
@@ -26,15 +30,27 @@ final class BrowserREPL: @unchecked Sendable {
             throw SCError.actionFailed(
                 "browser_repl needs JavaScriptCore's execution time limit, which this version of macOS does not export")
         }
+        // A Page retains a numeric Chrome tab id. Pin the selected browser before looking up its JS context so
+        // switching profiles cannot silently redirect an old Page to a different tab with the same numeric id.
+        var context = Execution.context
+        if context.browserID == nil {
+            let metadata = (try? JSONSerialization.jsonObject(with: await browser.instances())) as? [String: Any]
+            let ids = (metadata?["browsers"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
+            guard ids.count == 1 else {
+                if ids.isEmpty { throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected") }
+                throw SCError.invalidArgument("Multiple browsers connected; provide browser_id from browser_instances")
+            }
+            context.browserID = ids[0]
+        }
+        let key = SessionKey(sessionID: id, browserID: context.browserID!)
         let session = lock.withLock {
-            if let session = sessions[id] { return session }
+            if let session = sessions[key] { return session }
             let session = Session(id: id, browser: browser, log: log)
-            sessions[id] = session
+            sessions[key] = session
             return session
         }
         // Answer before the router's deadline, so what the code printed still reaches the client.
         let margin = min(1.5, max(0, deadline.timeIntervalSinceNow) * 0.2)
-        var context = Execution.context
         context.observationID = nil
         let outcome = await session.submit(
             code: code, deadline: deadline.addingTimeInterval(-margin), context: context, client: ClientRequest.current)
@@ -43,7 +59,10 @@ final class BrowserREPL: @unchecked Sendable {
     }
 
     func close(session id: String) {
-        lock.withLock { sessions.removeValue(forKey: id) }?.close()
+        let closed = lock.withLock {
+            sessions.keys.filter { $0.sessionID == id }.compactMap { sessions.removeValue(forKey: $0) }
+        }
+        for session in closed { session.close() }
     }
 
     /// For the client's `notifications/cancelled`: ends the call that request started.
@@ -59,6 +78,7 @@ private struct Outcome {
 }
 
 private final class Call {
+    let cancellationID = UUID()
     let code: String
     let deadline: Date
     let context: ExecutionContext
@@ -118,7 +138,7 @@ private final class Session: @unchecked Sendable {
     ]
     // No operation that needs local approval, reads beyond the page's controls, or runs page JavaScript.
     private static let operations: Set<String> = [
-        "inspect", "query", "click", "fill", "type", "press_key", "check", "select_option", "select_text",
+        "inspect", "query", "click", "hover", "fill", "type", "press_key", "check", "select_option", "select_text",
         "perform_action", "scroll", "wait", "back", "forward", "reload", "dialog", "screenshot",
     ]
     private static let ended = "The browser_repl call that started this has ended"
@@ -155,7 +175,8 @@ private final class Session: @unchecked Sendable {
                 code: code, deadline: deadline, context: context, requestID: client?.id, continuation: continuation)
             queue.async { self.enqueue(call) }
             after(deadline.timeIntervalSinceNow) { self.expire(call) }
-            client?.onGone { [weak self] in self?.cancel(call) }
+            let callID = call.cancellationID
+            client?.onGone { [weak self] in self?.cancel(callID: callID) }
         }
     }
 
@@ -170,10 +191,19 @@ private final class Session: @unchecked Sendable {
     }
 
     private func cancel(_ call: Call) {
-        watchdog.cancel(call: ObjectIdentifier(call))
+        watchdog.cancel(call: call.cancellationID)
         queue.async {
             self.waiting.removeAll { $0 === call }
             self.finish(call, Watchdog.Reason.cancelled.message, failed: true)
+        }
+    }
+
+    private func cancel(callID: UUID) {
+        watchdog.cancel(call: callID)
+        queue.async {
+            for call in [self.current].compactMap({ $0 }) + self.waiting where call.cancellationID == callID {
+                self.cancel(call)
+            }
         }
     }
 
@@ -211,7 +241,7 @@ private final class Session: @unchecked Sendable {
 
     private func start(_ call: Call) {
         current = call
-        watchdog.begin(deadline: call.deadline, call: ObjectIdentifier(call), requestID: call.requestID)
+        watchdog.begin(deadline: call.deadline, call: call.cancellationID, requestID: call.requestID)
         // Per call and process-wide: memory another session freed but the allocator has not returned yet counts
         // against no one.
         watchdog.memoryLimit = Memory.footprint() + BrowserREPL.memoryBudget
@@ -393,11 +423,40 @@ private final class Session: @unchecked Sendable {
         let browser = self.browser
         let context = call.context
         let image = method == "tab.screenshot" || operation == "screenshot"
+        let tabID = params["tabId"] as? Int
+        let targetKey = tabID.map { tab in
+            context.browserID.map { SCTaskTarget.browserKey(browserID: $0, tabID: tab) } ?? "tab:\(tab)"
+        }
+        let mutates = ["tabs.open", "tabs.close", "tab.navigate"].contains(method)
+            || (method == "extended" && !["inspect", "query", "wait", "screenshot"].contains(operation ?? "")
+                && !(operation == "dialog" && params["accept"] == nil))
         Task {
             let result: Result<Data, Error>
             do {
                 result = .success(try await Execution.$context.withValue(context) {
-                    try await browser.command(method, params: body)
+                    if let tabID, let targetKey {
+                        TaskRegistry.shared.noteTarget(session: context.sessionID,
+                            target: SCTaskTarget(key: targetKey, app: "Browser", tabID: tabID, browserID: context.browserID))
+                    }
+                    if mutates {
+                        try TaskRegistry.shared.checkMutation(session: context.sessionID,
+                            targetKey: targetKey)
+                    }
+                    let data = try await browser.command(method, params: body)
+                    if let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                        let openedTab = (json["tab"] as? [String: Any])?["id"] as? Int
+                        let observedTab = tabID ?? openedTab
+                        let observation = method == "tab.snapshot" ? json : json["observation"] as? [String: Any]
+                        if let observedTab, let observation,
+                           (observation["freshness"] as? [String: Any])?["status"] as? String == "current" {
+                            let key = context.browserID.map { SCTaskTarget.browserKey(browserID: $0, tabID: observedTab) }
+                                ?? "tab:\(observedTab)"
+                            TaskRegistry.shared.noteTarget(session: context.sessionID,
+                                target: SCTaskTarget(key: key, app: "Browser", tabID: observedTab, browserID: context.browserID))
+                            TaskRegistry.shared.noteObservation(session: context.sessionID, targetKey: key)
+                        }
+                    }
+                    return data
                 })
             } catch {
                 result = .failure(error)
@@ -478,7 +537,7 @@ private final class Watchdog: @unchecked Sendable {
     private var sliceStart = Date()
     private var deadline = Date.distantFuture
     private var closed = false
-    private var running: (call: ObjectIdentifier, requestID: String?)?
+    private var running: (call: UUID, requestID: String?)?
     private var cancelled = false
     private var fired: Reason?
     var memoryLimit = UInt64.max
@@ -505,7 +564,7 @@ private final class Watchdog: @unchecked Sendable {
         return reason != nil
     }
 
-    func begin(deadline: Date, call: ObjectIdentifier, requestID: String?) {
+    func begin(deadline: Date, call: UUID, requestID: String?) {
         lock.withLock {
             self.deadline = deadline
             running = (call, requestID)
@@ -519,7 +578,7 @@ private final class Watchdog: @unchecked Sendable {
             running = nil
         }
     }
-    func cancel(call: ObjectIdentifier) { lock.withLock { if running?.call == call { cancelled = true } } }
+    func cancel(call: UUID) { lock.withLock { if running?.call == call { cancelled = true } } }
     func cancel(requestID: String) { lock.withLock { if running?.requestID == requestID { cancelled = true } } }
     func beginSlice() { lock.withLock { sliceStart = Date() } }
     func close() { lock.withLock { closed = true } }

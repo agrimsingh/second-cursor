@@ -91,8 +91,10 @@ async function coveredBy(levels) {
         call(node.object.objectId, []),
       );
       if (result.value) return result.value;
-    } catch {
-      // Nothing at the point, or a node gone mid-check: the click goes ahead as it always did.
+    } catch (error) {
+      // A failed hit test cannot establish that the point still belongs to the target. Sending anyway could hit a
+      // replacement control; return a useful refusal and let the caller observe the new page.
+      throw new BridgeError("failed", `Could not verify the target's hit area; input was not sent: ${error.message ?? error}`);
     } finally {
       send("Runtime.releaseObjectGroup", { objectGroup }).catch(() => {});
     }
@@ -167,7 +169,7 @@ async function refTarget(tabId, ref) {
   return { point, levels };
 }
 
-export async function click(tabId, { ref, x, y }) {
+export async function click(tabId, { ref, x, y }, guardObservation) {
   let point;
   if (ref != null && ref !== "")
     point = await timed(tabId, "locate", () => reachablePoint(`Ref ${ref}`, () => refTarget(tabId, ref)));
@@ -175,9 +177,14 @@ export async function click(tabId, { ref, x, y }) {
   else throw new BridgeError("invalid_argument", "click needs a ref or both x and y");
 
   await timed(tabId, "cursor", () => pointTo(tabId, point, 1));
+  if (ref != null && ref !== "") point = await reachablePoint(`Ref ${ref}`, () => refTarget(tabId, ref));
+  else await guardObservation?.();
   const mouse = (params) => cdp(tabId, "Input.dispatchMouseEvent", { x: point.x, y: point.y, modifiers: 0, ...params });
   await timed(tabId, "input", async () => {
     await mouse({ type: "mouseMoved", button: "none", buttons: 0 });
+    // Hover handlers can open menus or move the target before mouseDown. Re-hit-test the live ref at that point.
+    if (ref != null && ref !== "") point = await reachablePoint(`Ref ${ref}`, () => refTarget(tabId, ref));
+    else await guardObservation?.();
     await mouse({ type: "mousePressed", button: "left", buttons: 1, clickCount: 1 });
     await mouse({ type: "mouseReleased", button: "left", buttons: 0, clickCount: 1 });
   });
@@ -227,19 +234,34 @@ export async function pressKey(tabId, keys) {
   if (FOCUS_KEYS.has(key.key) && modifiers.every((m) => m.key === "Shift")) expectQuickReaction(tabId, QUICK_REACT_MS);
   const send = (params) => cdp(tabId, "Input.dispatchKeyEvent", params);
   let bits = 0;
-  for (const m of modifiers) {
-    bits |= m.bit;
-    await send({ type: "rawKeyDown", modifiers: bits, key: m.key, code: m.code, windowsVirtualKeyCode: m.keyCode });
-  }
-  const base = { modifiers: bits, key: key.key, code: key.code, windowsVirtualKeyCode: key.keyCode };
-  await send({ ...base, type: "rawKeyDown", ...(command ? { commands: [command] } : {}) });
-  if (key.text && !(bits & (2 | 4))) {
-    await send({ ...base, type: "char", text: key.text, unmodifiedText: key.text });
-  }
-  await send({ ...base, type: "keyUp" });
-  for (const m of [...modifiers].reverse()) {
-    bits &= ~m.bit;
-    await send({ type: "keyUp", modifiers: bits, key: m.key, code: m.code, windowsVirtualKeyCode: m.keyCode });
+  const held = [];
+  let mainDown = false;
+  let inputError;
+  try {
+    for (const m of modifiers) {
+      bits |= m.bit;
+      await send({ type: "rawKeyDown", modifiers: bits, key: m.key, code: m.code, windowsVirtualKeyCode: m.keyCode });
+      held.push(m);
+    }
+    const base = { modifiers: bits, key: key.key, code: key.code, windowsVirtualKeyCode: key.keyCode };
+    await send({ ...base, type: "rawKeyDown", ...(command ? { commands: [command] } : {}) });
+    mainDown = true;
+    if (key.text && !(bits & (2 | 4)))
+      await send({ ...base, type: "char", text: key.text, unmodifiedText: key.text });
+  } catch (error) {
+    inputError = error;
+    throw error;
+  } finally {
+    // Human takeover between keyDown and char must not leave a modifier held for the person's next keystroke.
+    let releaseError;
+    if (mainDown) await send({ type: "keyUp", modifiers: bits, key: key.key, code: key.code,
+      windowsVirtualKeyCode: key.keyCode }).catch(error => { releaseError = error; });
+    for (const m of held.reverse()) {
+      bits &= ~m.bit;
+      await send({ type: "keyUp", modifiers: bits, key: m.key, code: m.code, windowsVirtualKeyCode: m.keyCode })
+        .catch(error => { releaseError = error; });
+    }
+    if (releaseError && !inputError) throw releaseError;
   }
 }
 

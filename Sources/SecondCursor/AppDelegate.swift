@@ -12,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let agentDisplay = AgentDisplay()
     private let browserBridge = BrowserBridge()
     private let onboarding = OnboardingPanel()
+    private var setup: SetupPanel?
+    private lazy var tasks = TaskPanel(showSetup: { [weak self] in self?.setup?.show() })
     private var server: SecondCursorServer?
     private var menu: StatusMenu?
     private var signalSources: [DispatchSourceSignal] = []
@@ -20,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         installSignalHandlers()
         onboarding.listenForRequests()
+        _ = tasks // Listen for explicit requests even before the panel has been opened.
         // A test instance (SC_HOME) must never put UI in front of the user unless asked to.
         if CommandLine.arguments.contains("--show-onboarding") || (SCPaths.customHome == nil && OnboardingPanel.needed) {
             onboarding.show()
@@ -31,9 +34,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             config = try SCConfig.loadOrCreate()
         } catch {
             makeMenu(config: nil).serverState = .failed("Could not load config: \(error.localizedDescription)")
+            if CommandLine.arguments.contains("--show-tasks") { tasks.show() }
             return
         }
         let menu = makeMenu(config: config)
+        if CommandLine.arguments.contains("--show-tasks") { tasks.show() }
         Desktop.cursorOnAgentDisplay = SCPaths.customHome != nil && config.cursorOnAgentDisplay == true
 
         startBrowserBridge()
@@ -77,8 +82,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func makeMenu(config: SCConfig?) -> StatusMenu {
         let agentDisplay = self.agentDisplay
+        setup = SetupPanel(config: config, showPermission: { [weak self] step in
+            self?.onboarding.show(step: step)
+        })
         let menu = StatusMenu(config: config, actions: .init(
             showOnboarding: { [weak self] in self?.onboarding.show() },
+            showTasks: { [weak self] in self?.tasks.show() },
+            showSetup: { [weak self] in self?.setup?.show() },
             tearDownAgentDisplay: { Task { await agentDisplay.teardown() } },
             quit: { NSApp.terminate(nil) }
         ))

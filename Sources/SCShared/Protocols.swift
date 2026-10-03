@@ -44,6 +44,8 @@ public protocol DesktopControlling: AnyObject, Sendable {
     /// App processes watched for accessibility notifications: at most 16, least recently used evicted, exited ones dropped.
     func observedApps() -> Int
     func permissionStatus() -> PermissionStatus
+    /// Native input support on this OS, optionally narrowed to the current state of one target window.
+    func nativeCapabilities(windowID: UInt32?) async -> NativeCapabilityProfile
     func listApps(includeNotRunning: Bool) async -> [AppInfo]
     /// `appQuery` matches app name or bundle id (case-insensitive substring); nil lists all.
     func listWindows(appQuery: String?) async -> [WindowInfo]
@@ -60,7 +62,7 @@ public protocol DesktopControlling: AnyObject, Sendable {
     /// values and descriptions case-insensitively (exact, then prefix, then substring); `role` is an AX role
     /// with or without the "AX" prefix. At least one of them is set.
     func findElements(windowID: UInt32, text: String?, role: String?, limit: Int) async throws -> ElementSearch
-    /// `modifiers` are held during the click, e.g. ["shift"] or ["cmd"].
+    /// Native modifiers are refused when the backend cannot guarantee their delivery. Consult `nativeCapabilities`.
     func click(windowID: UInt32, target: ClickTarget, button: MouseButton, count: Int, modifiers: [String]) async throws -> ActionResult
     /// Press at `from`, move to `to`, release; window-local points.
     func drag(windowID: UInt32, from: Point, to: Point, modifiers: [String]) async throws -> ActionResult

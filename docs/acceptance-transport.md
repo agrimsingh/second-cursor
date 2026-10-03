@@ -1,0 +1,16 @@
+# Transport ownership and crash recovery acceptance
+
+Failure cases written before implementation. All live checks use the existing disposable `SC_HOME` harness and scratch apps on the agent display; they do not restart the user's app.
+
+1. Two ordinary MCP clients omit `session_id`. Each must receive a distinct runtime session on initialize, and the second client must not mutate a native window claimed by the first.
+2. A host reconnects with its existing `Mcp-Session-Id`. The server must reuse that session. Unknown or closed IDs must return HTTP 404, and a missing ID after initialization must return HTTP 400. No error may silently dispatch a mutation under `legacy` or a replacement session.
+3. A trusted SDK supplies an explicit task session. The shared bearer token plus the opaque session ID deliberately authorizes this override; the explicit task remains alive when the enclosing transport ends. MCP cannot explicitly select `legacy` to bypass ownership. The legacy `/api` default remains supported.
+4. A stdio host pipelines requests immediately after initialize, cancels an in-flight request, or closes stdin. Both adapters must forward the issued session header, preserve concurrency after initialization, wait for pending responses, and delete only their own transport session on EOF. A stale-session error must never trigger an automatic mutation retry.
+5. The process stops after recording intent but before dispatch. Recovery must report `interrupted`, with a known non-dispatched outcome, and must not automatically run the old request.
+6. The process stops after dispatch but before committing the result. Recovery must report `uncertain`, with `outcome_known: false`, and an identical retry must not repeat the action.
+7. The process stops after committing completion. Recovery must report the completed outcome, mark the omitted result payload expired, and return reconciliation metadata on retry without repeating the action. A different request reusing the same operation ID must be refused.
+8. The journal is unwritable or corrupt. New mutating operations must fail before dispatch, rather than proceed without the recovery guarantee. Persisted records must contain digests and outcome metadata, never typed text, clipboard contents, screenshots, URLs, or complete result payloads.
+9. A session is closed or an operation cancelled while it is queued. Dispatch must still be refused. Existing lease expiry and configured operation retention remain bounded and compatible.
+10. A second task tries to tear down the shared agent display while the first owns a window. Teardown must refuse without moving that window. Once the owning task closes and its input drains, teardown may proceed. Its lease must block new native window mutations until the actual display work completes, including input from legacy clients and another request in the same session.
+
+`e2e/transport_recovery.py` exercises real HTTP isolation, a completed scratch edit across a forced process restart, and deterministic fault-injected intent/dispatched records at the journal boundary. `e2e/transport_stdio.py` exercises the actual proxy processes against a disposable local HTTP fixture. Neither simulated crash records nor a passing suite establish flawless behavior on every app or OS.

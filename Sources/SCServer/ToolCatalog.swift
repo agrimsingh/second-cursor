@@ -259,7 +259,7 @@ enum ToolCatalog {
             Tool(
                 name: "press_key",
                 description:
-                    "Send a key or chord to the window without focusing it, e.g. \"return\", \"escape\", \"tab\", \"down\", \"cmd+a\", \"cmd+shift+t\". A cmd chord that matches a menu item presses that item (route ax_menu_shortcut); verified=true then only means the app confirmed the menu press was delivered, not that the command had an effect, so check the observation.",
+                    "Send a key or chord to the window without focusing it, e.g. \"return\", \"escape\", \"tab\", \"down\", \"cmd+a\", \"cmd+shift+t\". A cmd chord that matches a menu item presses that item (route ax_menu_shortcut). A successful menu press confirms dispatch only; it does not verify the command's effect. Check the resulting observation or supply an expectation to verify the outcome.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
@@ -484,6 +484,22 @@ enum ToolCatalog {
 
     private static let extraTools: [Tool] = [
         Tool(
+            name: "task",
+            description: "Name and supervise this session's task. Use update to report thinking, needs_user, completed or failed; pause/takeover stop new input, and resume requires fresh target observations. Task state is independent of tool-call activity. Cancel never undoes already delivered input.",
+            inputSchema: schema([
+                "action": string("Task operation", enumValues: ["create", "list", "get", "update", "bind", "pause", "takeover", "resume", "cancel"]),
+                "task_id": string("Task ID; defaults to this session's task. Only tasks bound to this session may be controlled."),
+                "title": string("Short task name; omit sensitive content."),
+                "client_name": string("Host or agent name shown in the task panel."),
+                "status": string("Host-reported lifecycle state", enumValues: ["queued", "running", "thinking", "needs_user", "completed", "failed"]),
+                "include_finished": boolean("Include completed, failed and cancelled tasks in the list.", default: false),
+            ], required: ["action"])),
+        Tool(
+            name: "capabilities",
+            description: "Inspect supported native gestures and current target restrictions before choosing an input route. Unsupported gestures refuse before dispatch; the agent display shares the current GUI session and is not an isolated machine.",
+            inputSchema: schema(["window_id": integer("Optional target window for context-specific capabilities.")]),
+            annotations: .init(readOnlyHint: true)),
+        Tool(
             name: "session",
             description:
                 "Create or close an explicit client session. Closing cancels queued work and cleans up ephemeral browser tabs.",
@@ -541,7 +557,7 @@ enum ToolCatalog {
                         "Operation",
                         enumValues: [
                             "capabilities", "user_tabs", "claim", "release", "retain", "dom_snapshot", "inspect",
-                            "click", "fill", "type", "paste", "select_text", "perform_action", "check", "select_option",
+                            "click", "hover", "fill", "type", "paste", "select_text", "perform_action", "check", "select_option",
                             "press_key", "scroll", "drag", "back", "forward", "reload", "wait", "dialog", "upload",
                             "downloads", "logs", "history", "export", "assets", "viewport", "screenshot", "cdp",
                             "batch", "clipboard",

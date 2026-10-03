@@ -7,8 +7,26 @@ import SCShared
 /// unchanged entry leaves the file alone. Client configs hold other servers' API keys, so output never echoes
 /// file contents: a dry run shows only our entry (token shortened) and the names of what else is kept.
 enum InstallMCP {
-    enum Client: String, CaseIterable {
+    enum Client: String, CaseIterable, Sendable {
         case cursor, claude, codex, gemini
+
+        var displayName: String {
+            switch self {
+            case .cursor: return "Cursor"
+            case .claude: return "Claude Code"
+            case .codex: return "Codex"
+            case .gemini: return "Gemini CLI"
+            }
+        }
+
+        var relativeConfigPath: String {
+            switch self {
+            case .cursor: return ".cursor/mcp.json"
+            case .claude: return ".claude.json"
+            case .codex: return ".codex/config.toml"
+            case .gemini: return ".gemini/settings.json"
+            }
+        }
     }
 
     static let serverName = "second-cursor"
@@ -38,46 +56,61 @@ enum InstallMCP {
             return 2
         }
 
-        let home = URL(fileURLWithPath: ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory(), isDirectory: true)
-        let command = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])).resolvingSymlinksInPath().path
-        let scHome = SCPaths.customHome?.path
-        var stdio: [String: Any] = ["command": command, "args": ["mcp"]]
-        if let scHome {
-            stdio["env"] = ["SC_HOME": scHome]
-        }
-
         do {
-            switch client {
-            case .cursor:
-                let config = try CLI.loadConfig()
-                try update(home.appendingPathComponent(".cursor/mcp.json"), dryRun: dryRun) {
-                    try mergeJSON($0, section: "mcpServers", key: serverName, value: cursorEntry(config))
-                }
-            case .claude:
-                var entry = stdio
-                entry["type"] = "stdio"
-                try update(home.appendingPathComponent(".claude.json"), dryRun: dryRun) {
-                    try mergeJSON($0, section: "mcpServers", key: serverName, value: entry)
-                }
-            case .gemini:
-                try update(home.appendingPathComponent(".gemini/settings.json"), dryRun: dryRun) {
-                    try mergeJSON($0, section: "mcpServers", key: serverName, value: stdio)
-                }
-            case .codex:
-                try update(home.appendingPathComponent(".codex/config.toml"), dryRun: dryRun) {
-                    try mergeCodex($0, command: command, scHome: scHome)
-                }
-            }
-            if withHook {
-                try update(home.appendingPathComponent(".cursor/hooks.json"), dryRun: dryRun) {
-                    try mergeHook($0, command: "\(CLI.shellQuoted(command)) --turn-ended")
-                }
-            }
+            let messages = try install(client: client, dryRun: dryRun, withHook: withHook)
+            for message in messages { print(message) }
+            return 0
         } catch {
             CLI.printError("install-mcp: \(error.localizedDescription)")
             return 1
         }
-        return 0
+    }
+
+    static var homeDirectory: URL {
+        URL(fileURLWithPath: ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory(), isDirectory: true)
+    }
+
+    static var executablePath: String {
+        (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])).resolvingSymlinksInPath().path
+    }
+
+    /// Structured entry point shared by setup UI and the CLI. Returned messages contain no complete tokens.
+    static func install(client: Client, dryRun: Bool = false, withHook: Bool = false) throws -> [String] {
+        guard !withHook || client == .cursor else { throw Refusal("Turn-end hooks are only supported for Cursor.") }
+        let home = homeDirectory
+        let command = executablePath
+        let scHome = SCPaths.customHome?.path
+        var stdio: [String: Any] = ["command": command, "args": ["mcp"]]
+        if let scHome { stdio["env"] = ["SC_HOME": scHome] }
+        let path = home.appendingPathComponent(client.relativeConfigPath)
+        var messages: [String] = []
+        switch client {
+        case .cursor:
+            let config = try CLI.loadConfig()
+            messages += try update(path, dryRun: dryRun) {
+                try mergeJSON($0, section: "mcpServers", key: serverName, value: cursorEntry(config))
+            }
+        case .claude:
+            var entry = stdio
+            entry["type"] = "stdio"
+            messages += try update(path, dryRun: dryRun) {
+                try mergeJSON($0, section: "mcpServers", key: serverName, value: entry)
+            }
+        case .gemini:
+            messages += try update(path, dryRun: dryRun) {
+                try mergeJSON($0, section: "mcpServers", key: serverName, value: stdio)
+            }
+        case .codex:
+            messages += try update(path, dryRun: dryRun) {
+                try mergeCodex($0, command: command, scHome: scHome)
+            }
+        }
+        if withHook {
+            messages += try update(home.appendingPathComponent(".cursor/hooks.json"), dryRun: dryRun) {
+                try mergeHook($0, command: "\(CLI.shellQuoted(command)) --turn-ended")
+            }
+        }
+        return messages
     }
 
     private struct Refusal: LocalizedError {
@@ -95,27 +128,29 @@ enum InstallMCP {
     }
 
     /// Computes the new contents from the old (nil when missing) and writes them unless unchanged.
-    private static func update(_ file: URL, dryRun: Bool, _ transform: (Data?) throws -> Merge) throws {
+    private static func update(_ file: URL, dryRun: Bool, _ transform: (Data?) throws -> Merge) throws -> [String] {
         let target = file.resolvingSymlinksInPath()
         let fm = FileManager.default
-        let original = fm.contents(atPath: target.path)
+        let original: Data?
+        do { original = try Data(contentsOf: target) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { original = nil }
+        catch { throw Refusal("Could not read \(target.path); it was left unchanged. \(error.localizedDescription)") }
         let merge = try transform(original)
         let updated = merge.data
         let unchanged = updated == original
 
         if dryRun {
             let action = unchanged ? "unchanged" : original == nil ? "would create" : "would update"
-            print("# dry run: \(action) \(target.path): \(merge.change)")
+            var messages = ["# dry run: \(action) \(target.path): \(merge.change)"]
             if !merge.kept.isEmpty {
                 let shown = merge.kept.prefix(12).joined(separator: ", ")
-                print("# keeps: \(shown)\(merge.kept.count > 12 ? " and \(merge.kept.count - 12) more" : "")")
+                messages.append("# keeps: \(shown)\(merge.kept.count > 12 ? " and \(merge.kept.count - 12) more" : "")")
             }
-            print(merge.preview, terminator: merge.preview.hasSuffix("\n") ? "" : "\n")
-            return
+            messages.append(merge.preview.trimmingCharacters(in: .newlines))
+            return messages
         }
         if unchanged {
-            print("\(target.path): \(merge.change); nothing to write")
-            return
+            return ["\(target.path): \(merge.change); nothing to write"]
         }
         try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
         // The files hold bearer tokens and API keys: keep an existing file's mode, create new ones private.
@@ -130,7 +165,7 @@ enum InstallMCP {
         }
         try updated.write(to: target, options: .atomic)
         try fm.setAttributes([.posixPermissions: mode], ofItemAtPath: target.path)
-        print("Updated \(target.path): \(merge.change) (\(note))")
+        return ["Updated \(target.path): \(merge.change) (\(note))"]
     }
 
     private static func jsonObject(_ data: Data?, _ label: String) throws -> [String: Any] {
@@ -280,7 +315,7 @@ enum InstallMCP {
     }
 
     /// `[mcp_servers.second_cursor]` or one of its sub-tables, in any quoting or spacing, trailing comment ignored.
-    private static func isOurHeader(_ line: String) -> Bool {
+    static func isOurHeader(_ line: String) -> Bool {
         guard isTOMLHeader(line) else { return false }
         let name = String(line.prefix { $0 != "#" }).filter { !$0.isWhitespace }
         return ["second_cursor", "\"second_cursor\"", "'second_cursor'"].contains { key in
@@ -312,7 +347,7 @@ enum InstallMCP {
         return names
     }
 
-    private static func tomlString(_ value: String) -> String {
+    static func tomlString(_ value: String) -> String {
         var escaped = ""
         for scalar in value.unicodeScalars {
             switch scalar {

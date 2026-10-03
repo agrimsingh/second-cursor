@@ -6,12 +6,13 @@ import SCShared
 /// A borderless, click-through overlay that draws the agent's own cursor and moves it to each action, so the user
 /// can watch the agent work. It never touches the real cursor; it only paints one. Between actions the cursor rests
 /// where it last pointed for as long as the task is active: from any agent call until every active session's turn
-/// has ended or it closed, the user pauses, or no call came for `idleTimeout`. The cursor belongs to its window:
+/// has ended or it closed, or the user pauses. Registered task lifecycles outlive gaps between tool calls. The cursor belongs to its window:
 /// the overlay sits directly above that window, so whatever covers the window covers the cursor, and it fades out
 /// while the point is covered or the window is on another Space. The extension draws the same cursor inside agent
 /// Chrome tabs (extension/cursor.js); keep the two designs in step.
 final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Sendable {
-    /// For hosts without a turn-end hook, which never say that a task is over.
+    /// Compatibility fallback for direct engine callers that have no registered task. Registered tasks
+    /// keep their presence while thinking, regardless of the interval between tool calls.
     static let idleTimeout: TimeInterval = 60
 
     /// Called on the main thread when activity starts or ends, or moves to another app.
@@ -75,6 +76,9 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification] {
             center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.refreshAnchor() }
         }
+        NotificationCenter.default.addObserver(
+            forName: .scTaskRegistryDidChange, object: nil, queue: .main
+        ) { [weak self] _ in self?.checkLiveness() }
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.screensChanged() }
@@ -148,7 +152,7 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
         publish()
     }
 
-    /// Pausing and the idle timeout have no event of their own, so they are polled while anything is showing.
+    /// Global pause and anchor visibility are polled; task control changes also arrive through the registry.
     private func watch() {
         guard watchdog == nil else { return }
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.checkLiveness() }
@@ -162,7 +166,12 @@ final class AgentCursorOverlay: NSObject, AgentCursorPresenting, @unchecked Send
             return
         }
         let cutoff = Date().addingTimeInterval(-Self.idleTimeout)
-        let stale = sessions.filter { $0.value < cutoff }.map(\.key)
+        let stale = sessions.filter { session, lastCall in
+            if let task = TaskRegistry.shared.snapshot(session: session) {
+                return !task.status.permitsMutation
+            }
+            return lastCall < cutoff
+        }.map(\.key)
         if !stale.isEmpty || sessions.isEmpty { end(stale) }
         refreshAnchor()
     }

@@ -281,20 +281,43 @@ final class ExtensionLink: @unchecked Sendable {
         return Array(active.keys)
     }
 
-    /// Sends a session-wide method to every connected browser; unreachable ones are skipped.
-    func broadcast(_ method: String, _ params: [String: Any], timeout: TimeInterval = 60) async -> [[String: Any]] {
-        var replies: [[String: Any]] = []
-        for id in instanceIDs() {
-            var context = Execution.context
-            context.browserID = id
-            context.sessionID = params["session_id"] as? String ?? context.sessionID
-            if let reply = try? await Execution.$context.withValue(context, operation: {
-                try await call(method, params, timeout: timeout)
-            }) {
-                replies.append(reply)
+    private struct BroadcastReply: @unchecked Sendable {
+        var reply: [String: Any]?
+        var error: String?
+    }
+
+    /// Controls have their own lane, so a tab's long-running drag cannot postpone its pause. Every connected
+    /// browser receives the control concurrently; a missing acknowledgement is a visible failure, never success.
+    func broadcast(_ method: String, _ params: [String: Any], timeout: TimeInterval = 5) async throws -> [[String: Any]] {
+        let ids = instanceIDs()
+        let baseContext = Execution.context
+        return try await withThrowingTaskGroup(of: BroadcastReply.self) { group in
+            for id in ids {
+                group.addTask {
+                    var context = baseContext
+                    context.browserID = id
+                    context.sessionID = params["session_id"] as? String ?? context.sessionID
+                    do {
+                        let reply = try await Execution.$context.withValue(context) {
+                            try await self.callNow(method, params, timeout: timeout)
+                        }
+                        return BroadcastReply(reply: reply)
+                    } catch {
+                        return BroadcastReply(error: "\(id): \(error.localizedDescription)")
+                    }
+                }
             }
+            var replies: [[String: Any]] = []
+            var failures: [String] = []
+            for try await result in group {
+                if let reply = result.reply { replies.append(reply) }
+                if let error = result.error { failures.append(error) }
+            }
+            guard failures.isEmpty else {
+                throw SCError.actionFailed("Browser session control was not acknowledged: " + failures.sorted().joined(separator: "; "))
+            }
+            return replies
         }
-        return replies
     }
 
     private func promote(_ connection: Connection, message: [String: Any]) {

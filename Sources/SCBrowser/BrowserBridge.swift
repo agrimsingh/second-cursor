@@ -18,13 +18,16 @@ public final class BrowserBridge: BrowserControlling, @unchecked Sendable {
 
     public func command(_ method: String, params: Data) async throws -> Data {
         let object = try JSONSerialization.jsonObject(with:params) as? [String:Any] ?? [:]
-        if method == "session.close" { _ = await link.broadcast(method, object); return Data("{}".utf8) }
+        if ["session.close", "session.pause", "session.resume", "session.takeover"].contains(method) {
+            let replies = try await link.broadcast(method, object)
+            return try JSONSerialization.data(withJSONObject: ["browsers_acknowledged": replies.count])
+        }
         if method == "tab.info" {
             return try JSONSerialization.data(withJSONObject: await link.call(method, object, timeout: 3))
         }
         if method == "session.end_turn" {
             // A hook runs this after every turn; an unresponsive browser must not hold it up.
-            let replies = await link.broadcast(method, object, timeout: 5)
+            let replies = try await link.broadcast(method, object, timeout: 5)
             let released = replies.reduce(0) { $0 + (($1["released"] as? NSNumber)?.intValue ?? 0) }
             return try JSONSerialization.data(withJSONObject: ["released_tabs": released])
         }

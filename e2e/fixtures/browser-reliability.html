@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Browser reliability fixture</title>
+  <style>
+    body { font: 16px system-ui; margin: 24px; }
+    main { max-width: 900px; }
+    .controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    label { display: block; }
+    input:not([type=checkbox]):not([type=radio]), select { display: block; max-width: 95%; }
+    button { min-height: 32px; }
+    #layout-space { height: 0; }
+    #scroll-space { height: 1100px; }
+    #hover-target { padding: 8px 20px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Browser reliability</h1>
+  <div class="controls">
+    <label><input id="plain-check" type="checkbox"> Plain checkbox</label>
+    <label><input id="reverting-check" type="checkbox"> Reverting checkbox</label>
+    <label><input id="selected-radio" type="radio" name="choice" checked> Selected radio</label>
+    <label>Plain value <input id="plain-value"></label>
+    <label>Reverting value <input id="reverting-value" value="locked"></label>
+    <label>Password <input id="secret-value" type="password" autocomplete="new-password"></label>
+    <label>Plain choice <select id="plain-choice"><option value="keep">Keep</option><option value="change">Change</option></select></label>
+    <label>Reverting choice <select id="reverting-choice"><option value="keep">Keep</option><option value="change">Change</option></select></label>
+    <label>Delayed search <input id="search" autocomplete="off"></label>
+    <label><input id="replacing-check" type="checkbox"> Replacing checkbox</label>
+  </div>
+  <ul id="results" aria-label="Search results"></ul>
+  <p>
+    <button id="change-layout" type="button">Change layout</button>
+    <button id="scroll-viewport" type="button">Scroll viewport</button>
+    <button id="batch-next" type="button">Advance batch</button>
+  </p>
+  <div id="layout-space"></div>
+  <button id="guarded-target" type="button">Guarded target</button>
+  <button id="hover-target" type="button">Hover target</button>
+  <p id="guarded-status">Target clicks: 0</p>
+  <p id="layout-status">Layout changes: 0</p>
+  <p id="batch-status">Batch advances: 0</p>
+  <p id="hover-status">Hover: outside</p>
+  <div id="scroll-space" aria-hidden="true"></div>
+</main>
+<script>
+  const byId = (id) => document.getElementById(id);
+  // No application handler or attribute mutation: native checkbox state alone must settle promptly.
+  byId("reverting-check").addEventListener("change", (event) => { event.target.checked = false; });
+  byId("reverting-value").addEventListener("input", (event) => { event.target.value = "locked"; });
+  byId("reverting-choice").addEventListener("change", (event) => { event.target.value = "keep"; });
+  // A framework may replace the target while handling the input. The detached node still says checked=true,
+  // but the live replacement rejects the requested state, so reading the old node cannot verify the action.
+  byId("replacing-check").addEventListener("change", (event) => {
+    const replacement = event.target.cloneNode(true);
+    replacement.checked = false;
+    event.target.replaceWith(replacement);
+  });
+
+  let searchTimer;
+  byId("search").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(async () => {
+      const query = byId("search").value;
+      await fetch("browser-reliability.html?delay_ms=150", { cache: "no-store" });
+      byId("results").replaceChildren(...[1, 2, 3].map((i) =>
+        Object.assign(document.createElement("li"), { textContent: `${query} verified result ${i}` })));
+    }, 300);
+  });
+
+  let clicks = 0, changes = 0, advances = 0;
+  byId("guarded-target").addEventListener("click", () => {
+    byId("guarded-status").textContent = `Target clicks: ${++clicks}`;
+  });
+  byId("change-layout").addEventListener("click", () => {
+    byId("layout-space").style.height = (++changes % 2 ? 72 : 0) + "px";
+    byId("layout-status").textContent = `Layout changes: ${changes}`;
+  });
+  // No DOM change: the freshness guard must notice a changed viewport independently.
+  byId("scroll-viewport").addEventListener("click", () => window.scrollBy({ top: 120, behavior: "instant" }));
+  byId("batch-next").addEventListener("click", () => {
+    byId("batch-status").textContent = `Batch advances: ${++advances}`;
+  });
+  byId("hover-target").addEventListener("mouseenter", (event) => {
+    byId("hover-status").textContent = `Hover: inside; trusted: ${event.isTrusted}`;
+  });
+  byId("hover-target").addEventListener("mouseleave", () => {
+    byId("hover-status").textContent = "Hover: outside";
+  });
+</script>
+</body>
+</html>

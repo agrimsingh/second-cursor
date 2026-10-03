@@ -4,6 +4,20 @@ import SCShared
 
 /// This policy is applied before any extended operation (including batch children) leaves the app.
 enum BrowserPolicy {
+    static let readOnly: Set<String> = [
+        "capabilities", "user_tabs", "dom_snapshot", "inspect", "query", "wait", "screenshot", "history",
+        "logs", "downloads", "assets", "export", "cdp",
+    ]
+
+    static func mutates(_ raw: [String: Value]) -> Bool {
+        guard let operation = raw["operation"]?.stringValue else { return true }
+        if operation == "clipboard" { return raw["action"]?.stringValue == "write" }
+        if operation == "batch", let steps = raw["steps"]?.arrayValue {
+            return steps.contains { $0.objectValue.map(mutates) ?? true }
+        }
+        return !readOnly.contains(operation)
+    }
+
     static let sensitive: Set<String> = ["user_tabs", "claim", "history", "clipboard", "cdp", "upload"]
     // Deliberately read-only and tab-scoped. No Runtime, Network, Browser or Target escape hatch.
     static let allowedCDP: Set<String> = [

@@ -1,10 +1,10 @@
 # Second Cursor
 
-Let an AI agent use any app on your Mac while you keep working. Second Cursor clicks, types, and reads apps in the background: your cursor never moves, your focus never changes, and you are never dragged to another Space. It runs as a small menu bar app and exposes an MCP server over HTTP, so Cursor or any other MCP client can drive it.
+Let an AI agent work in your Mac apps while you keep working. Second Cursor reads accessibility trees and browser DOMs, then sends input to supported apps and tabs in the background. It runs as a menu bar app with an MCP server, so your preferred client and model can drive it. App behavior and macOS capabilities set the limits; see [limitations](#limitations) before relying on an unattended workflow.
 
-There is one deliberate exception: local approval prompts. When an agent first touches an app you have not approved, or asks for a sensitive browser operation (your own tabs, history, clipboard, uploads), Second Cursor brings up a dialog so that you, not the model, decide. That dialog takes focus on purpose.
+Local approval prompts deliberately take focus. When an agent first touches an app you have not approved, or asks for a sensitive browser operation (your own tabs, history, clipboard, uploads), Second Cursor brings up a dialog so that you, not the model, decide.
 
-Version 0.2 also provides explicit client sessions, structured observations, full-text inspection, native text selection and rich paste, DOM browser actions, multi-profile browser connections, and a dependency-free JavaScript SDK. See [the client contract](docs/api.md) and [the E2E acceptance cases](docs/parity-acceptance.md).
+The runtime provides session ownership, structured observations, outcome checks, native text selection and rich paste, DOM browser actions, multi-profile browser connections, and a dependency-free JavaScript SDK. See [the client contract](docs/api.md) and [the E2E acceptance cases](docs/parity-acceptance.md).
 
 ## How it works
 
@@ -14,19 +14,22 @@ flowchart LR
     Server --> Desktop["Desktop control<br/>AX tree, input, capture"]
     Server --> Bridge["Browser bridge<br/>Unix socket"]
     Bridge --> Host["sc-native-host"] --> Ext["Chrome extension<br/>chrome.debugger on agent tabs"]
-    Desktop --> Apps["Mac apps, in place, on any Space"]
+    Desktop --> Apps["Supported Mac apps, in place"]
 ```
 
-- **In place.** Windows stay where they are. Clicks, drags, and scrolls are synthesized and posted to the target app's process, addressed to the window, so they land even when the window is behind other apps or on a Space you are not viewing.
+- **In place.** Clicks, drags, and scrolls are posted to the target app's process and addressed to its window, allowing compatible apps to receive input behind other windows or on another Space. Capability and human-input checks run before dispatch.
 - **Accessibility first.** Every window is read as a compact accessibility outline with indexed elements. Clicks and typing go through accessibility actions whenever possible.
 - **Diffs, not re-reads.** The first `get_window_state` of a window in a session returns the whole outline. Later reads return only the lines that changed, and an element keeps its index across reads. Pass `full: true` for the whole outline again, or `scope: <index>` to read one region at full depth.
 - **Windows on other Spaces.** macOS hides off-Space windows from the normal window list, so Second Cursor finds them through the app's main/focused window or a remote-token lookup (and, for Electron apps, through their web areas).
 - **Background keyboard.** Keys are posted to the target app's process. Command shortcuts (cmd+a, cmd+z, ...) briefly hand the app AppKit focus without raising it, press the matching menu item, then give focus back.
-- **Parallel.** Each app gets its own serial queue, so agents working in different apps run at the same time while actions within one app stay ordered.
-- **Visible presence.** While an agent works, its cursor (a black arrowhead with an orange glow) rests at its last position on the window it is working in, with an optional caption saying what it is doing, and the menu bar icon turns orange. You see the cursor whenever you can see that window; when another window covers it or you switch Spaces, the cursor hides and the agent keeps working. In Chrome the same cursor is drawn inside the agent's tab. Everything clears when the agent's turn ends (with the Cursor stop hook), when you pause, or after a minute without agent calls. A click waits until you can see the cursor land (at most half a second for long moves), and only when you can see it.
-- **Batching.** `batch` runs a predictable sequence of steps on one window as a single uninterrupted block, then returns one observation once the UI has settled, so a model spends one round trip instead of one per action. A pixel step stops the batch if the window changed size since the model last looked at it, because its coordinates would point at the old layout.
+- **Human priority.** Recent input to an app stops agent mutations there and invalidates its old observation. Pointer and keyboard work also refuses to change the key window of the foreground app you are using. `capabilities` explains which routes are available for a target; after you yield, the agent must read the target again.
+- **Parallel ownership.** MCP connections receive separate runtime sessions automatically. Native actions claim their target window, and each app has a serial queue, so actions in one app stay ordered while independent apps can run concurrently.
+- **Tasks and takeover.** **Tasks…** in the menu bar shows each task's client, state, targets, and last verified result. Pause or take over one task while others continue, then resume after the agent observes your changes. Task state stays visible while the model thinks; silence does not mean completion. See [the lifecycle contract](docs/api.md#tasks-and-human-takeover).
+- **Visible presence.** While an agent sends calls, its cursor (a black arrowhead with an orange glow) rests on its target window with an optional caption. It hides when covered or on another Space; Chrome draws the same presence inside the agent's tab. Cursor presence clears at turn end, on pause, or after a minute without calls. This visual timeout does not finish the task in the task panel. Visible pointer animation completes before dispatch; covered windows and background tabs do not wait for an invisible cursor.
+- **Batching.** `batch` runs a predictable sequence of steps on one window in order, then returns one observation once the UI has settled, so a model spends one round trip instead of one per action. Native pixel steps check the observed size and accessibility layout; pause, takeover, or human input can stop later steps.
+- **Outcome checks and recovery.** Results distinguish dispatched input, an observed UI, verified postconditions, and uncertain effects. A durable operation journal prevents an identical retained request from being replayed after a lost response or restart; uncertain operations require a fresh read before deciding what to do next.
 - **Browser.** A Chrome extension drives only the tabs it opens itself, in a "Second Cursor" tab group, over Chrome's debugger API. Existing user tabs are available only through local approval for discovery and claim operations; session cleanup leaves them open.
-- **Optional agent display.** An invisible virtual monitor is available as a private workspace (`agent_display`, `move_to_agent_display`). It is never used unless asked for. One case it cannot cover: while you are in a full-screen app, an app launched with `on_agent_display` may open its window on a desktop you are not viewing, where macOS hides it from Accessibility and lets no other app move it. `launch_app` says so, and the window moves to the agent display once you show that desktop.
+- **Optional agent display.** An invisible virtual monitor is available as a private workspace (`agent_display`, `move_to_agent_display`). It is never used unless asked for. It shares your macOS session, app processes, and clipboard; it is not an isolated desktop or VM. A launch on a hidden desktop can leave the window unreachable. `launch_app` reports that the window was left in place and queues no later move; observe it again and explicitly call `move_to_agent_display` when it is reachable. Teardown refuses while native input is in flight or another session owns a native window.
 
 ## Install
 
@@ -38,13 +41,15 @@ scripts/install.sh
 
 This creates a local self-signed code-signing identity (so macOS permission grants survive rebuilds), builds `SecondCursor.app`, installs it to `~/Applications`, registers the Chrome native messaging host, copies the extension to `~/Library/Application Support/SecondCursor/extension`, and launches the app.
 
-Then:
+Then open **Setup…** from the menu bar, or run `SecondCursor --show-onboarding`:
 
-1. Grant **Accessibility** and **Screen & System Audio Recording**. When either is missing, a small setup panel opens next to System Settings. **Open System Settings** jumps to the right pane. Drag the app icon from the panel into the list, or switch Second Cursor on if it is already listed. The panel ticks each permission off as it turns on and closes when both are granted. For Screen Recording, choose **Quit & Reopen** if System Settings asks. The menu bar's **Grant … permission** items reopen the panel, and so does `SecondCursor --show-onboarding`.
-2. For browser control, open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select `~/Library/Application Support/SecondCursor/extension`.
-3. Check the setup with `SecondCursor doctor`. It reports whether the app is reachable, its version, both permissions, pause state, the extension connection, and the config path. It exits non-zero when something needs your action. Add `--json` for machine output.
+1. Grant **Accessibility** and **Screen & System Audio Recording**. The permission helper opens the relevant System Settings pane. Drag the app icon into the list, or switch Second Cursor on if it is already listed. For Screen Recording, choose **Quit & Reopen** if System Settings asks.
+2. Select a client and install its MCP configuration. For browser control, install browser support, then open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select `~/Library/Application Support/SecondCursor/extension`. `SecondCursor install-browser` installs the support files from the app bundle without requiring this source checkout.
+3. Check the connection in Setup, or run `SecondCursor doctor`. It reports reachability, version, permissions, pause state, the extension connection, and the config path. `SecondCursor self-test` performs a read-only connection check; add `--browser` to open a disposable agent tab, click its test button, independently read the changed result, and close it. Both commands accept `--json` and return a nonzero exit code when their check fails.
 
 `SecondCursor` in these commands is the app's binary, `~/Applications/SecondCursor.app/Contents/MacOS/SecondCursor`. `SecondCursor --help` lists every command.
+
+The source installer uses a local development signature. Release packaging is available through `scripts/package-release.sh`, with an explicit Developer ID and notarization path; a locally packaged archive is not a notarized public release. See [release distribution](docs/release-distribution.md) for prerequisites and validation.
 
 ## Connect a client
 
@@ -80,7 +85,9 @@ The port and token live in `~/Library/Application Support/SecondCursor/config.js
 
 ### Cursor turn-end hook
 
-At the end of each agent turn, `SecondCursor --turn-ended` tells the app the turn is over. The next observation is then a full read, and approvals and claimed browser tabs held for that turn are released. `--session <id>` targets an explicit session; the default is the shared `legacy` session that MCP clients use. The command ignores its stdin and always exits 0, so a hook can never fail loudly. `install-mcp --client cursor --with-hook` adds a `stop` hook to `~/.cursor/hooks.json`, keeping your other hooks and writing a `.bak` first. `scripts/cursor-hooks.json` is the same hook as a sample to merge by hand.
+At the end of an agent turn, `SecondCursor --turn-ended --session <id>` resets that session's observation baseline and releases its turn approvals and claimed personal tabs. Automatic MCP sessions are separate: a host must supply the session ID, or call `/turn-ended` with its `Mcp-Session-Id` header. Omitting the ID affects only the `legacy` compatibility session. The command ignores stdin and always exits 0, so a hook cannot fail loudly.
+
+`install-mcp --client cursor --with-hook` adds the legacy-compatible `stop` hook to `~/.cursor/hooks.json`, preserving other hooks and writing a `.bak` first. `scripts/cursor-hooks.json` is the same sample. This unscoped hook cannot infer an MCP connection's session ID or clean another client's session. Stdio proxies close their own session when the host closes the transport.
 
 ### Agent skill
 
@@ -94,7 +101,7 @@ Second Cursor runs no model of its own. Whatever client you connect brings one, 
 
 | Area | Tools |
 | --- | --- |
-| Status | `status` |
+| Status and task control | `status`, `capabilities`, `task` |
 | Apps and windows | `list_apps`, `list_windows`, `launch_app`, `get_window_state`, `find_elements`, `screenshot` |
 | Sessions (for hosts; callable but not in `tools/list`, like the `session_id`, `operation_id`, `observation_id` and `timeout_ms` arguments) | `session`, `bind_target`, `operation_status`, `cancel_operation` |
 | Editing | `inspect_element`, `select_text`, `paste` |
@@ -108,7 +115,7 @@ Second Cursor runs no model of its own. Whatever client you connect brings one, 
 
 - **App approval:** the first time an agent reads or operates an app, you choose Allow for this session, Always allow, or Deny. Your own tabs, browsing history, clipboard, raw DevTools, and file uploads always ask. See [the client contract](docs/api.md#approvals).
 - **Not a sandbox:** approvals limit what an agent can do through Second Cursor's tools. An agent that can also run shell commands as you could edit the config or start its own instance, so treat approvals as a guard against mistakes, not against a determined agent.
-- **Pause:** the menu bar item pauses the agent; every tool except `status` is refused until you resume. `SecondCursor --pause` / `--resume` do the same from a shell.
+- **Pause:** the menu bar item pauses all agent input; **Tasks…** provides controls for one task. `SecondCursor --pause` / `--resume` control the global pause from a shell. Already delivered input cannot be undone.
 - **Blocked apps:** `blockedBundleIDs` in `config.json` (password managers, Keychain Access, System Settings by default) can never be launched or touched.
 - **Action log:** every state-changing call is appended to `~/Library/Logs/SecondCursor/actions.jsonl` before it runs.
 - **Timeouts:** execution deadlines are capped at 60 s. A timeout does not cancel already dispatched input; use operation IDs to reconcile outcomes and cancel queued work.
@@ -116,7 +123,11 @@ Second Cursor runs no model of its own. Whatever client you connect brings one, 
 
 ## Testing
 
-Testing is end to end only. Every suite runs against a disposable test instance, not against your running app. The harness starts a fresh copy of the installed bundle with its own `SC_HOME` folder, port, token and config, and stops it afterwards. Your app, config, logs and pause flag are never read, written or restarted. Test instances never show approval dialogs or the setup panel.
+Desktop and browser acceptance suites run against a disposable test instance. The harness starts a fresh copy of the installed bundle with its own `SC_HOME` folder, port, token and config, and stops it afterwards. Your running app, config, logs and pause flag are not changed. Ordinary tests do not show approval dialogs or setup panels; rendered UI and consent checks require explicit flags. Transport and SDK regressions also exercise isolated local servers without touching the desktop.
+
+`python3 e2e/best_in_class.py gate --profile quiet` runs the unattended suites serially and treats missing, skipped, or inconclusive evidence as incomplete. `python3 e2e/best_in_class.py tasks --rounds 3` runs independently judged complete tasks with fresh fixtures. Its built-in adapter is a deterministic control baseline; a competitive claim requires running another engine under the same task contract. See [release evidence and benchmarks](docs/best-in-class-acceptance.md) for the attended release gate and comparison boundaries.
+
+`python3 e2e/model_benchmark.py --engine both --model gpt-6.1-sol --reasoning-effort high --rounds 3 --native-placement desktop --max-steps 40 --timeout 300 --list` previews the 24-trial shared model pilot for Second Cursor and Cua Driver; remove `--list` to execute it. The runner uses fresh Codex conversations, fixture-scoped tools, alternating engine order, ordinary desktop native fixtures, and the same pinned headed Chrome for Testing build. This is the `host-background/native-tools` track; seeds identify fixed cases, and cost/model time remain unknown. The earlier browser cohort is invalid for comparison, and Cua's matched-browser binding currently refuses on consent, so no completed matched cohort establishes superiority. See [the benchmark plan](docs/benchmark-plan-2026-10-04.md) and [adapter contract](e2e/benchmarks/README.md).
 
 ```bash
 python3 e2e/run.py            # or name scenarios: python3 e2e/run.py textedit_background calculator
@@ -130,10 +141,16 @@ python3 e2e/clicks.py         # every pixel click, double-click and drag acts ex
 python3 e2e/latency.py        # per-call timings, written to latency.json
 python3 e2e/find.py           # find_elements, act, the compact tool surface
 python3 e2e/repl.py           # browser_repl: persistence, limits, sandbox, Playwright locators
+python3 e2e/tasks.py          # task ownership, pause/takeover/resume, restart recovery
+python3 e2e/transport_recovery.py  # automatic MCP sessions and durable operation reconciliation
+python3 e2e/native_safety.py   # native capabilities and stale-layout/input refusals
+python3 e2e/browser_reliability.py # freshness, hover, verified form state, settling
+python3 e2e/release_setup.py   # portable bundle, setup diagnostics and disposable browser check
+python3 e2e/task_ui.py --ui   # deliberately opens the disposable Tasks and Setup panels
 python3 e2e/focus.py --takeover   # focus safety; takes focus and covers the screen, so run it while you are away
 ```
 
-Apart from `focus.py --takeover`, `setup.py --ui` and `run.py --on-screen`, the suites put their windows on the agent display, so they run from whatever Space you are on without covering your screen or taking focus.
+Background suites put fixture windows on the agent display. `focus.py --takeover`, `native_safety.py --takeover`, `task_ui.py --ui`, `setup.py --ui`, and `run.py --on-screen` explicitly permit foreground fixture activity. Run those attended checks separately from unattended timing measurements.
 
 `SC_E2E_APP=build/SecondCursor.app` tests another bundle, and `--installed` targets your running app instead (opt-in). `python3 e2e/setup.py` runs `install-mcp` against a temporary `HOME` and checks that your real client configs are unchanged.
 
@@ -157,12 +174,12 @@ The suite talks to the app over MCP like a real client and, around every scenari
 ## Limitations
 
 - Relies on private macOS APIs (SkyLight event posting, remote accessibility tokens, CGVirtualDisplay). A macOS update can break any of them, and the app cannot ship through the Mac App Store.
-- Modifier-clicks (shift-click, cmd-click) are not supported yet: the modifier does not reach the app through process-targeted events.
-- Canvas-style apps and games that only accept hardware events, drag-and-drop between apps, and hover-only UI are not supported.
-- Custom-drawn apps (Ableton, games) may stop repainting while on a Space you are not viewing, so their screenshots go stale; input still lands and the accessibility tree stays live.
+- Native modifier clicks/drags and hover are unsupported and refused before dispatch. Browser hover and supported DOM actions can provide an alternative for web content; the native `capabilities` tool describes current route restrictions.
+- Canvas-style apps and games that require hardware input, cross-app drag-and-drop, and HTML5 drag payloads are not guaranteed by process-addressed or browser pointer input. Separate GUI isolation must be configured outside Second Cursor when a workflow requires it.
+- Custom-drawn apps (Ableton, games) may stop repainting on a Space you are not viewing. Native captures report unverified frame freshness; an image's capture time is not proof of the app's repaint time. Accessibility layout guards cannot detect changes confined to pixels.
 - A window on another Space that neither its app nor any accessibility client has exposed yet cannot be reached until the app is touched once.
 - Chrome shows its "started debugging this browser" bar while the extension is attached to an agent tab.
-- A pixel click or drag into a background window of the app you are currently using can bring that window forward, because the app is already active. Element-index actions don't have this problem.
+- Human-input arbitration is conservative: recent input requires a new read, another key window in the same foreground app blocks pointer/keyboard work, and unavailable input monitoring blocks foreground mutations. It does not make arbitrary simultaneous editing of one app safe.
 
 ## Credits
 

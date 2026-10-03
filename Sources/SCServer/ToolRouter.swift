@@ -45,6 +45,7 @@ final class ToolRouter: Sendable {
         self.sessions = Sessions(
             claimIdleSeconds: config.claimIdleSeconds ?? 300,
             retentionSeconds: config.operationRetentionSeconds ?? 3600)
+        installTaskControls()
     }
 
     func call(name called: String, arguments: [String: Value]) async -> CallTool.Result {
@@ -71,33 +72,28 @@ final class ToolRouter: Sendable {
             }
         }
         // A retry is identified by what the client sent, not by the window an app name resolved to.
-        let requested = raw
+        var requested = raw
+        // The operation ID identifies the record; it is not part of the action's payload. An implicitly
+        // generated ID can be supplied on a later retry without changing the original request signature.
+        requested.removeValue(forKey: "operation_id")
         do {
             guard Self.toolNames.contains(name) else { throw SCError.invalidArgument("Unknown tool: \(name)") }
             if let malformedArguments { throw malformedArguments }
-            let resolveStarted = DispatchTime.now().uptimeNanoseconds
-            raw = try await resolveAppTarget(name, raw)
-            timings?.add("resolve", ms: Timing.since(resolveStarted))
-            let args = Arguments(raw)
+            var args = Arguments(raw)
             let session = try args.optionalString("session_id") ?? "legacy"
             if name == "session" {
                 switch try args.string("action") {
                 case "create":
-                    return Self.success(ToolOutput(json: ["session_id": sessions.create()]))
+                    return Self.success(ToolOutput(json: ["session_id": try sessions.create()]))
                 case "close":
-                    sessions.close(session)
-                    desktop.closeSession(session)
-                    desktop.endAgentActivity(session: session)
-                    appApprovals.clear(session: session)
-                    repl.close(session: session)
-                    let payload = try JSONSerialization.data(withJSONObject: ["session_id": session])
-                    _ = try? await browser.command("session.close", params: payload)
+                    try await closeSession(session: session)
                     return Self.success(ToolOutput(json: ["closed": true]))
                 default:
                     throw SCError.invalidArgument("action must be create or close")
                 }
             }
             try sessions.validate(session)
+            if name == "task" { return Self.success(try await taskCall(args, session: session)) }
             if name == "operation_status" || name == "cancel_operation" {
                 let info = try sessions.info(
                     args.string("operation_id"), session: session, cancel: name == "cancel_operation")
@@ -112,12 +108,13 @@ final class ToolRouter: Sendable {
             let timeout = name == "wait_for" ? 60 : Double(min(limit, max(1, try args.int("timeout_ms", default: limit)))) / 1000
             let deadline = receivedAt.addingTimeInterval(timeout)
             let suppliedID = try args.optionalString("operation_id")
+            let mutating = Self.mutates(name, args)
             let id = suppliedID ?? UUID().uuidString
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             let signature = name + String(decoding: try encoder.encode(Value.object(requested)), as: UTF8.self)
             let (operation, fresh) = try sessions.reserve(
-                id: id, session: session, signature: signature, deadline: deadline, retain: suppliedID != nil)
+                id: id, session: session, signature: signature, deadline: deadline, retain: suppliedID != nil, mutating: mutating)
             if !fresh {
                 if let output = sessions.output(operation) { return Self.success(output) }
                 return Self.success(ToolOutput(json: try sessions.info(id, session: session)))
@@ -125,7 +122,15 @@ final class ToolRouter: Sendable {
             var admitted = false
             let gatesStarted = DispatchTime.now().uptimeNanoseconds
             do {
+                let resolveStarted = DispatchTime.now().uptimeNanoseconds
+                raw = try await resolveAppTarget(name, raw)
+                raw = try await resolveBrowserTarget(name, raw)
+                args = Arguments(raw)
+                timings?.add("resolve", ms: Timing.since(resolveStarted))
                 let owner = try await checkGates(name, args)
+                noteTaskTarget(name, args, owner: owner, session: session)
+                if mutating { _ = TaskRegistry.shared.ensureTask(session: session) }
+                let readGeneration = TaskRegistry.shared.snapshot(session: session)?.controlGeneration
                 var configuredTools = [name]
                 if name == "batch" {
                     configuredTools += try args.objects("steps").compactMap { $0["tool"]?.stringValue?.lowercased() }
@@ -154,13 +159,17 @@ final class ToolRouter: Sendable {
                 admitted = true
                 noteActivity(name, args, owner: owner, session: session)
                 timings?.add("gates", ms: Timing.since(gatesStarted) - (timings?.phasesMS["approval"] ?? 0))
-                let mutating = ToolCatalog.actionTools.contains(name)
                 let target = mutating ? try args.optionalInt("window_id").map { "window:\($0)" } : nil
+                let taskTarget = Self.targetKey(name, args)
+                let observationID = try args.optionalString("observation_id")
+                let browserID = try args.optionalString("browser_id")
+                let mutation = mutating ? try TaskRegistry.shared.beginMutation(session: session, targetKey: taskTarget) : nil
                 let context = ExecutionContext(
-                    sessionID: session, observationID: try args.optionalString("observation_id"),
-                    browserID: try args.optionalString("browser_id"), deadline: deadline,
+                    sessionID: session, observationID: observationID,
+                    browserID: browserID, deadline: deadline,
                     browserApprovals: browserApprovals, timings: timings
                 ) { [sessions] in
+                    if let mutation { try TaskRegistry.shared.checkMutation(mutation, targetKey: taskTarget) }
                     if name != "status" { try sessions.dispatch(operation, target: target) }
                 }
                 let output = try await Self.withTimeout(seconds: max(0.001, deadline.timeIntervalSinceNow), tool: name)
@@ -174,13 +183,19 @@ final class ToolRouter: Sendable {
                         }
                         if name == "status" {
                             result.json["agent_activity"] = Self.activityJSON(self.desktop.agentActivity())
+                            result.json["task_runtime"] = ["active_tasks": TaskRegistry.shared.list(includeFinished: false).count,
+                                "persistence_error": TaskRegistry.shared.persistenceError as Any? ?? NSNull()]
                         }
-                        if suppliedID != nil { result.json["operation_id"] = id }
+                        Self.annotateOutcome(&result, mutating: mutating)
+                        if suppliedID != nil || mutating { result.json["operation_id"] = id }
                         self.noteObservation(name, args, owner: owner, output: result, session: session)
+                        self.noteTaskObservation(name, args, result: result, session: session, generation: readGeneration)
                         self.sessions.finish(operation, result: result, error: nil)
+                        if let mutation { TaskRegistry.shared.finishMutation(mutation, verifiedSummary: Self.verifiedSummary(result, tool: name)) }
                         return result
                     } catch {
                         self.sessions.finish(operation, result: nil, error: Self.message(for: error))
+                        if let mutation { TaskRegistry.shared.finishMutation(mutation) }
                         throw error
                     }
                 }
@@ -201,7 +216,7 @@ final class ToolRouter: Sendable {
                     log.record(
                         ActionLogEntry(tool: name, target: args.logTarget, detail: "refused: \(Self.message(for: error))"))
                 }
-                return Self.failure(error)
+                return Self.failure(error, operationID: mutating ? id : nil)
             }
         } catch {
             return Self.failure(error)
@@ -379,13 +394,16 @@ final class ToolRouter: Sendable {
         sessions.forgetObservations(session: session)
         let cleared = appApprovals.clear(session: session)
         var released = 0
-        if let params = try? JSONSerialization.data(withJSONObject: ["session_id": session]),
-            let data = try? await browser.command("session.end_turn", params: params),
-            let reply = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        {
+        var result: [String: Any] = ["ok": true, "session_id": session, "cleared_app_approvals": cleared]
+        do {
+            let reply = try await browserSessionCommand("session.end_turn", session: session)
             released = (reply["released_tabs"] as? NSNumber)?.intValue ?? 0
+        } catch {
+            result["ok"] = false
+            result["browser_cleanup_error"] = Self.message(for: error)
         }
-        return ["ok": true, "session_id": session, "released_tabs": released, "cleared_app_approvals": cleared]
+        result["released_tabs"] = released
+        return result
     }
 
     private func checkGates(_ name: String, _ args: Arguments) async throws -> WindowOwner? {
@@ -445,8 +463,9 @@ final class ToolRouter: Sendable {
         return CallTool.Result(content: content, isError: false)
     }
 
-    private static func failure(_ error: Error) -> CallTool.Result {
-        CallTool.Result(content: [.text(text: message(for: error), annotations: nil, _meta: nil)], isError: true)
+    private static func failure(_ error: Error, operationID: String? = nil) -> CallTool.Result {
+        let suffix = operationID.map { " [operation_id=\($0); reconcile with operation_status before retrying]" } ?? ""
+        return CallTool.Result(content: [.text(text: message(for: error) + suffix, annotations: nil, _meta: nil)], isError: true)
     }
 
     /// JSONSerialization raises an Objective-C exception (a crash) on NaN or infinity,

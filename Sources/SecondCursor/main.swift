@@ -32,11 +32,20 @@ case "doctor":
     exit(Doctor.run(json: arguments.contains("--json")))
 case "install-mcp":
     exit(InstallMCP.run(arguments.dropFirst()))
+case "install-browser":
+    exit(BrowserSetup.run())
+case "self-test":
+    exit(FirstTaskCheck.runCLI(browser: arguments.contains("--browser"), json: arguments.contains("--json")))
 default:
     break
 }
 
 guard InstanceLock.acquire() else {
+    if arguments.contains("--show-tasks") {
+        TaskPanel.requestFromRunningInstance()
+        print("Asked the running Second Cursor to show its task panel")
+        exit(0)
+    }
     if arguments.contains("--show-onboarding") {
         OnboardingPanel.requestFromRunningInstance()
         print("Asked the running Second Cursor to show its onboarding panel")

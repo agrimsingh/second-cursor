@@ -92,6 +92,18 @@ extension ToolRouter {
                 "runtime": runtime,
                 "agent_display": Shape.display(await agentDisplay.status()),
                 "browser": Shape.browser(await browser.status()),
+                "native_capabilities": Shape.codable(await desktop.nativeCapabilities(windowID: nil)),
+            ])
+        case "capabilities":
+            let requestedWindow = try args.optionalInt("window_id")
+            let windowID = requestedWindow.flatMap(UInt32.init(exactly:))
+            if requestedWindow != nil && windowID == nil { throw SCError.invalidArgument("window_id must be an unsigned 32-bit integer") }
+            if let windowID { _ = try appGuard.checkWindow(windowID) }
+            return ToolOutput(json: [
+                "native": Shape.codable(await desktop.nativeCapabilities(windowID: windowID)),
+                "agent_display_is_isolated": false,
+                "isolated_backend_available": false,
+                "alternatives": ["browser DOM/CDP for web controls", "a separate app instance where supported", "an externally provisioned isolated desktop"],
             ])
 
         case "list_apps":
@@ -261,8 +273,15 @@ extension ToolRouter {
             case "create":
                 return ToolOutput(json: Shape.display(try await agentDisplay.ensureDisplay()))
             case "teardown":
+                let lease = try sessions.beginDisplayMutation(session: Execution.context.sessionID)
+                defer { sessions.endDisplayMutation(lease) }
+                try Execution.context.beforeDispatch()
                 await agentDisplay.teardown()
-                return ToolOutput(json: Shape.display(await agentDisplay.status()))
+                let state = await agentDisplay.status()
+                guard !state.isActive else {
+                    throw SCError.actionFailed("Agent display teardown was interrupted; inspect its status before retrying")
+                }
+                return ToolOutput(json: Shape.display(state))
             default:
                 throw SCError.invalidArgument("action must be one of status, create, teardown")
             }
@@ -438,6 +457,7 @@ extension ToolRouter {
         if let ms = snapshot.ocrMS { json["ocr_ms"] = ms }
         if let count = snapshot.ocrCount { json["ocr_count"] = count }
         if let error = snapshot.ocrError { json["ocr_error"] = error }
+        if let capabilities = snapshot.capabilities { json["capabilities"] = Shape.codable(capabilities) }
         if let base = snapshot.diffBase { json["diff_base"] = base }
         if let scope = snapshot.scope { json["scope"] = scope }
         if let label = snapshot.scopeLabel { json["scope"] = label }
@@ -511,7 +531,12 @@ extension ToolRouter {
         ) { [appGuard, log, sessions] step in
             do {
                 if PauseState.isPaused { throw SCError.paused }
-                _ = try appGuard.checkWindow(step.windowID)
+                let owner = try appGuard.checkWindow(step.windowID)
+                let taskTarget = "window:\(step.windowID)"
+                TaskRegistry.shared.noteTarget(session: session, target: SCTaskTarget(
+                    key: taskTarget, app: AppGuard.windowTarget(owner).name,
+                    bundleID: owner.bundleID, windowID: step.windowID))
+                try TaskRegistry.shared.checkMutation(session: session, targetKey: taskTarget)
                 try sessions.use("window:\(step.windowID)", session: session)
                 log.record(
                     ActionLogEntry(tool: step.tool, target: "window_id=\(step.windowID)", detail: step.logDetail))
@@ -531,6 +556,7 @@ extension ToolRouter {
                 if let action = result.result {
                     step["route"] = action.route
                     step["verified"] = action.verified ?? NSNull()
+                    step["uncertain"] = action.uncertain ?? false
                     if let note = action.note { step["note"] = note }
                 }
                 if let error = result.error { step["error"] = error }

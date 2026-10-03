@@ -1,6 +1,12 @@
 import { BridgeError } from "./errors.js";
+import { requireAgentInput, requireAgentTab } from "./tabs.js";
 
 const attached = new Set();
+const MUTATING_COMMANDS = new Set([
+  "Page.navigate", "Page.navigateToHistoryEntry", "Page.reload", "Page.handleJavaScriptDialog",
+  "DOM.focus", "DOM.scrollIntoViewIfNeeded", "DOM.setFileInputFiles",
+  "Emulation.setDeviceMetricsOverride", "Emulation.clearDeviceMetricsOverride",
+]);
 const frameSessions = new Map();
 // Page lifecycle events ("load", "networkIdle", …) of each tab's top-level frames, for the document each loader
 // committed. They come from the Page domain, so knowing whether a page is still fetching needs no Network.enable.
@@ -65,6 +71,10 @@ export async function attach(tabId) {
 }
 
 export async function cdp(tabId, method, params = {}) {
+  // Button/key release must always run after takeover, otherwise a held drag/modifier could reach human input.
+  const releasing = params.type === "mouseReleased" || params.type === "keyUp";
+  if (method.startsWith("Input.")) await (releasing ? requireAgentTab(tabId) : requireAgentInput(tabId));
+  else if (MUTATING_COMMANDS.has(method)) await requireAgentInput(tabId);
   await attach(tabId);
   try {
     return await chrome.debugger.sendCommand({ tabId }, method, params);
@@ -91,6 +101,9 @@ export function protocolMessage(error) {
 export const frameSession = (tabId, frameId) => frameSessions.get(`${tabId}:${frameId}`);
 
 export async function frameCDP(tabId,frameId,method,params={}) {
+  const releasing = params.type === "mouseReleased" || params.type === "keyUp";
+  if (method.startsWith("Input.")) await (releasing ? requireAgentTab(tabId) : requireAgentInput(tabId));
+  else if (MUTATING_COMMANDS.has(method)) await requireAgentInput(tabId);
   await attach(tabId);
   const sessionId=frameSessions.get(`${tabId}:${frameId}`);
   try{return await chrome.debugger.sendCommand({tabId,...(sessionId?{sessionId}:{})},method,params);}

@@ -3,9 +3,10 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 import ObjectiveC
+import SCShared
 
-/// Private SkyLight entry points for background input. Every call degrades to the public
-/// API (or a no-op) when a symbol is missing, so an OS update weakens delivery instead of crashing.
+/// Private SkyLight entry points for background input. Public callers check the capability before
+/// dispatch, so an OS update cannot silently weaken targeting or report a missing call as delivered.
 enum SkyLight {
     private typealias PostToPid = @convention(c) (pid_t, CGEvent) -> Void
     private typealias SetAuthenticationMessage = @convention(c) (CGEvent, AnyObject) -> Void
@@ -37,15 +38,48 @@ enum SkyLight {
     private static let getProcessForPID = symbol("GetProcessForPID", GetProcessForPID.self)
     private static let objcMsgSend = symbol("objc_msgSend", AuthMessageFactory.self)
 
+    static var pointerUnavailableReason: String? {
+        if postToPid == nil { return "SLEventPostToPid is unavailable on this macOS version" }
+        if setWindowLocationFn == nil { return "CGEventSetWindowLocation is unavailable; window-local targeting cannot be guaranteed" }
+        if setIntegerField == nil { return "SLEventSetIntegerValueField is unavailable; window addressing cannot be guaranteed" }
+        return focusUnavailableReason
+    }
+
+    static var keyboardUnavailableReason: String? {
+        if postToPid == nil { return "SLEventPostToPid is unavailable on this macOS version" }
+        guard setAuthenticationMessage != nil, objcMsgSend != nil,
+              let cls = NSClassFromString("SLSEventAuthenticationMessage"),
+              class_respondsToSelector(object_getClass(cls), NSSelectorFromString("messageWithEventRecord:pid:version:"))
+        else { return "Authenticated background keyboard events are unavailable on this macOS version" }
+        return focusUnavailableReason
+    }
+
+    private static var focusUnavailableReason: String? {
+        if postEventRecordTo == nil { return "SLPSPostEventRecordTo is unavailable; safe key-window targeting cannot be guaranteed" }
+        if getFrontProcess == nil { return "The foreground process cannot be determined safely" }
+        if getProcessForPID == nil && (getWindowOwner == nil || getConnectionPSN == nil) {
+            return "The target process cannot be resolved safely"
+        }
+        return nil
+    }
+
+    static func requirePointerSupport() throws {
+        if let reason = pointerUnavailableReason { throw SCError.notAllowed(reason + ". Use a semantic AX action or the browser backend.") }
+    }
+
+    static func requireKeyboardSupport() throws {
+        if let reason = keyboardUnavailableReason { throw SCError.notAllowed(reason + ". Use set_value or a semantic AX action, or the browser backend.") }
+    }
+
     /// Keyboard events need the authentication envelope for Chromium to accept them as live input.
     /// Mouse events must not carry it: it bypasses the session tap Chromium's window handler reads.
-    static func post(_ event: CGEvent, to pid: pid_t, authenticated: Bool) {
-        guard let postToPid else {
-            event.postToPid(pid)
-            return
-        }
-        if authenticated { attachAuthenticationMessage(event, pid: pid) }
+    @discardableResult
+    static func post(_ event: CGEvent, to pid: pid_t, authenticated: Bool) -> Bool {
+        HumanInputMonitor.stamp(event)
+        guard let postToPid else { return false }
+        if authenticated && !attachAuthenticationMessage(event, pid: pid) { return false }
         postToPid(pid, event)
+        return true
     }
 
     static func setWindowLocation(_ event: CGEvent, _ point: CGPoint) {
@@ -61,16 +95,17 @@ enum SkyLight {
     }
 
     /// `messageWithEventRecord:pid:version:` only exists from macOS 15, hence the responds check.
-    private static func attachAuthenticationMessage(_ event: CGEvent, pid: pid_t) {
+    private static func attachAuthenticationMessage(_ event: CGEvent, pid: pid_t) -> Bool {
         guard let setAuthenticationMessage, let objcMsgSend,
               let cls = NSClassFromString("SLSEventAuthenticationMessage")
-        else { return }
+        else { return false }
         let selector = NSSelectorFromString("messageWithEventRecord:pid:version:")
         guard class_respondsToSelector(object_getClass(cls), selector),
               let record = eventRecord(event),
               let message = objcMsgSend(cls, selector, record, pid, 0)?.takeUnretainedValue()
-        else { return }
+        else { return false }
         setAuthenticationMessage(event, message)
+        return true
     }
 
     /// `__CGEvent` is `{CFRuntimeBase, uint32_t, SLSEventRecord *}`; the record pointer's offset
@@ -96,22 +131,28 @@ enum SkyLight {
     /// next click as a normal click; no window is reordered and no Space followed. A record must never
     /// reach the real frontmost process (it would resign active mid-typing), so this returns nil and
     /// posts nothing when the target is front or its state is unknown. Serialized until `restore`.
-    static func focusWithoutRaise(pid: pid_t, wid: CGWindowID) -> FocusHandoff? {
+    static func focusWithoutRaise(pid: pid_t, wid: CGWindowID) throws -> FocusHandoff? {
         focusLock.lock()
+        var handedOff = false
+        defer { if !handedOff { focusLock.unlock() } }
+        // Another app's handoff can hold this lock while task control or human ownership changes.
+        // Revalidate after waiting, before posting even a synthetic focus record.
+        try NativeSafety.check(pid: pid, wid: wid, input: true)
         guard let front = frontProcess(), let target = processSerialNumber(pid: pid, wid: wid),
               !samePSN(front, target), postFocusRecord(to: target, wid: wid, focus: true)
         else {
-            focusLock.unlock()
             return nil
         }
+        handedOff = true
         return FocusHandoff(targetPSN: target, targetWindow: wid)
     }
 
     /// Takes the synthetic focus back from the target only. Skipped when the user switched to the
-    /// target meanwhile: it is then really frontmost and must not be told it lost focus.
+    /// target meanwhile or foreground identity is unknown: never tell a possible foreground app
+    /// that it lost focus. Every path still releases the serialization lock.
     static func restore(_ handoff: FocusHandoff) {
         defer { focusLock.unlock() }
-        if let front = frontProcess(), samePSN(front, handoff.targetPSN) { return }
+        guard let front = frontProcess(), !samePSN(front, handoff.targetPSN) else { return }
         _ = postFocusRecord(to: handoff.targetPSN, wid: handoff.targetWindow, focus: false)
     }
 

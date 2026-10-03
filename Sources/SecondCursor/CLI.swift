@@ -19,6 +19,10 @@ enum CLI {
                                         writing a .bak first. --dry-run shows only our entry (token shortened)
                                         and what else the file keeps, without writing.
                                         --with-hook (cursor only) also adds the turn-end hook to ~/.cursor/hooks.json.
+          install-browser               Install the bundled browser bridge and extension into this account.
+          self-test [--browser] [--json] Run a read-only connection check; --browser additionally opens a
+                                        disposable test tab, clicks its button, verifies the result, and closes it.
+          --show-tasks                  Open the task panel in the running app.
           --turn-ended [--session <id>] Tell the app the agent's turn ended (for agent stop hooks). Reads and
                                         ignores stdin. Always exits 0.
           --pause, --resume             Pause or resume the agent.
@@ -117,13 +121,19 @@ enum LocalHTTP {
 
     static func post(_ config: SCConfig, path: String, body: Data, headers: [String: String] = [:],
                      timeout: TimeInterval) -> Result<(status: Int, body: Data), Error> {
+        exchange(request(config, path: path, body: body, headers: headers, timeout: timeout))
+            .map { (status: $0.status, body: $0.body) }
+    }
+
+    static func exchange(_ request: URLRequest) -> Result<(status: Int, headers: [AnyHashable: Any], body: Data), Error> {
         let done = DispatchSemaphore(value: 0)
         let box = ResultBox()
-        session.dataTask(with: request(config, path: path, body: body, headers: headers, timeout: timeout)) { data, response, error in
+        session.dataTask(with: request) { data, response, error in
             if let error {
                 box.result = .failure(error)
             } else {
-                box.result = .success(((response as? HTTPURLResponse)?.statusCode ?? 0, data ?? Data()))
+                let response = response as? HTTPURLResponse
+                box.result = .success((response?.statusCode ?? 0, response?.allHeaderFields ?? [:], data ?? Data()))
             }
             done.signal()
         }.resume()
@@ -131,35 +141,83 @@ enum LocalHTTP {
         return box.result
     }
 
-    /// One MCP JSON-RPC request; returns its `result` object or a readable error.
-    static func mcp(_ config: SCConfig, id: Int, method: String, params: [String: Any],
-                    timeout: TimeInterval) -> Result<[String: Any], CLIError> {
-        let payload: [String: Any] = ["jsonrpc": "2.0", "id": id, "method": method, "params": params]
-        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return .failure(.message("bad request")) }
-        let headers = ["Accept": "application/json", "MCP-Protocol-Version": protocolVersion]
-        switch post(config, path: SecondCursorServer.path, body: body, headers: headers, timeout: timeout) {
-        case .failure(let error):
-            return .failure(CLIError(error))
-        case .success(let response):
-            let message = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
-            if let result = message?["result"] as? [String: Any], response.status == 200 {
-                return .success(result)
-            }
-            let detail = (message?["error"] as? [String: Any])?["message"] as? String
-                ?? String(decoding: response.body.prefix(200), as: UTF8.self)
-            return .failure(response.status == 401 ? .unauthorized : .message("HTTP \(response.status): \(detail)"))
-        }
-    }
-
     private final class ResultBox: @unchecked Sendable {
-        var result: Result<(status: Int, body: Data), Error> = .failure(URLError(.unknown))
+        var result: Result<(status: Int, headers: [AnyHashable: Any], body: Data), Error> = .failure(URLError(.unknown))
     }
 }
 
-enum CLIError: Error {
+/// One short-lived HTTP MCP connection. Setup and diagnostics use the same handshake as external clients.
+final class LocalMCPConnection {
+    let config: SCConfig
+    private var sessionID: String?
+    private var nextID = 0
+
+    init(config: SCConfig) { self.config = config }
+
+    func initialize(name: String) throws -> [String: Any] {
+        let result = try rpc(method: "initialize", params: [
+            "protocolVersion": LocalHTTP.protocolVersion, "capabilities": [String: Any](),
+            "clientInfo": ["name": name, "version": "1"],
+        ])
+        guard (result["serverInfo"] as? [String: Any])?["name"] as? String == "second-cursor" else {
+            throw CLIError.message("The service on this port did not identify itself as Second Cursor.")
+        }
+        return result
+    }
+
+    func call(_ name: String, arguments: [String: Any] = [:], timeout: TimeInterval = 15) throws -> [String: Any] {
+        let result = try rpc(method: "tools/call", params: ["name": name, "arguments": arguments], timeout: timeout)
+        let text = (result["content"] as? [[String: Any]])?.first(where: { $0["type"] as? String == "text" })?["text"] as? String ?? ""
+        if result["isError"] as? Bool == true { throw CLIError.message(text.isEmpty ? "\(name) failed" : text) }
+        guard let object = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else {
+            throw CLIError.message("\(name) returned an unreadable result")
+        }
+        return object
+    }
+
+    func close() {
+        guard let sessionID else { return }
+        self.sessionID = nil
+        var request = LocalHTTP.request(config, path: SecondCursorServer.path, body: Data(),
+                                        headers: ["MCP-Session-Id": sessionID], timeout: 5)
+        request.httpMethod = "DELETE"
+        _ = LocalHTTP.exchange(request)
+    }
+
+    func rpc(method: String, params: [String: Any], timeout: TimeInterval = 5) throws -> [String: Any] {
+        nextID += 1
+        let body = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": nextID, "method": method, "params": params])
+        var headers = ["Accept": "application/json", "MCP-Protocol-Version": LocalHTTP.protocolVersion]
+        if let sessionID { headers["MCP-Session-Id"] = sessionID }
+        let request = LocalHTTP.request(config, path: SecondCursorServer.path, body: body, headers: headers, timeout: timeout)
+        let response: (status: Int, headers: [AnyHashable: Any], body: Data)
+        do { response = try LocalHTTP.exchange(request).get() }
+        catch { throw CLIError(error) }
+        if response.status == 401 { throw CLIError.unauthorized }
+        let message = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
+        guard response.status == 200, let result = message?["result"] as? [String: Any] else {
+            let detail = (message?["error"] as? [String: Any])?["message"] as? String ?? "unreadable response"
+            throw CLIError.message("HTTP \(response.status): \(detail)")
+        }
+        if method == "initialize" {
+            sessionID = response.headers.first(where: { String(describing: $0.key).lowercased() == "mcp-session-id" })?.value as? String
+        }
+        return result
+    }
+}
+
+enum CLIError: LocalizedError {
     case notRunning
     case unauthorized
     case message(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notRunning: return "Second Cursor is not running. Open the app and retry."
+        case .unauthorized: return "The running app rejected this configuration. Quit and reopen Second Cursor, then retry."
+        case .message(let text): return text
+        }
+    }
 
     init(_ error: Error) {
         if let error = error as? URLError, error.code == .cannotConnectToHost {

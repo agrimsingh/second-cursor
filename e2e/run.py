@@ -11,6 +11,7 @@ Usage:  e2e/run.py [scenario ...] [--installed] [--browser | --no-browser]
         --installed    target the user's running app and config instead (also SC_E2E_TARGET=installed)
         --browser      always start the isolated test browser (default: only when a selected scenario
                        uses browser tools); --no-browser never starts it
+        --headed-browser show the isolated browser window when browser scenarios run (default: headless)
         --approvals    human-attended only: the test instance uses "approvals": "prompt" and may show real
                        approval dialogs (default "allow"; scenarios may override to "deny")
         --on-screen    also run the checks that need a window on the user's screen (a launch that leaves the
@@ -88,6 +89,7 @@ class MCP:
         self.next_id = 1
         self.lock = threading.Lock()
         self.protocol = PROTOCOL_VERSION
+        self.session_id = None
 
     def raw(self, payload, token="default"):
         token = self.token if token == "default" else token
@@ -98,9 +100,13 @@ class MCP:
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
         req = urllib.request.Request(self.url, data=json.dumps(payload).encode(), headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                if payload.get("method") == "initialize" and resp.status == 200:
+                    self.session_id = resp.headers.get("Mcp-Session-Id") or self.session_id
                 return resp.status, resp.headers.get("Content-Type", ""), resp.read().decode()
         except urllib.error.HTTPError as e:
             return e.code, e.headers.get("Content-Type", ""), e.read().decode(errors="replace")
@@ -243,11 +249,12 @@ class TestInstance:
             subprocess.run([app.binary, "--pause"], env=app.env)
     """
 
-    def __init__(self, config_overrides=None, app=None, browser=False, timeout=30):
+    def __init__(self, config_overrides=None, app=None, browser=False, timeout=30, headed_browser=False):
         self.app = pathlib.Path(app or APP_BUNDLE).expanduser().resolve()
         self.binary = self.app / "Contents/MacOS/SecondCursor"
         self.overrides = dict(config_overrides or {})
         self.want_browser, self.timeout = browser, timeout
+        self.headed_browser = bool(headed_browser)
         self.home = self.pid = self.port = self.token = self.url = self.mcp = self.config = self.browser = None
         self.started = False
         self.start()
@@ -346,11 +353,14 @@ class TestInstance:
                 raise
         return self
 
-    def start_browser(self, timeout=45):
-        """Starts an isolated headless Chrome for Testing whose extension reaches this instance, and waits
-        until the instance reports the connection."""
+    def start_browser(self, timeout=45, headed=None):
+        """Start isolated Chrome for Testing and wait for its extension connection. `headed` overrides
+        the instance's visibility setting only when launching a new browser."""
+        headed = self.headed_browser if headed is None else bool(headed)
         if self.browser is None:
-            self.browser = load_start_browser().launch(sc_home=self.home, app=self.app)
+            self.browser = load_start_browser().launch(sc_home=self.home, app=self.app, headed=headed)
+        elif self.browser.headed != headed:
+            raise RuntimeError("test browser is already running with a different visibility setting")
         deadline = time.time() + timeout
         while time.time() < deadline:
             if not self.browser.running():
@@ -476,6 +486,22 @@ class Context:
         if on_agent_display and not window.get("on_agent_display") and observe()["main_space_full_screen"]:
             raise Skip("the user is viewing a full-screen app, so the new window opened on a desktop Space macOS "
                        "won't let it leave (see launch_on_hidden_space); rerun from a desktop Space")
+        # TextEdit can finish adjusting its frame after launch_app returns (for example 658 -> 656 px wide).
+        # Wait for that fixture setup to settle before taking the snapshot used by coordinate actions.
+        deadline, stable_since = time.monotonic() + 3, time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            current = next((w for w in self.call("list_windows", app="TextEdit")["windows"]
+                            if w["id"] == window["id"]), None)
+            if current is None:
+                raise AssertionError(f"scratch TextEdit window {window['id']} disappeared during setup")
+            if current["frame"] != window["frame"]:
+                stable_since = time.monotonic()
+            window = current
+            if time.monotonic() - stable_since >= 0.3:
+                break
+        else:
+            raise AssertionError(f"scratch TextEdit window {window['id']} did not settle within 3s")
         return window
 
     def tree(self, window_id, **opts):
@@ -572,8 +598,13 @@ def textedit_background(ctx):
     ctx.check("type_text inserted text", "gamma" in ctx.tree(wid, include_screenshot=False))
 
     pressed = ctx.call("press_key", window_id=wid, keys="cmd+a")
-    ctx.check("cmd+a pressed the Select All menu item and the app confirmed it",
-              pressed.get("route") == "ax_menu_shortcut" and pressed.get("verified") is True, pressed)
+    delivery = {key: pressed.get(key) for key in ("ok", "route", "uncertain", "outcome")}
+    ctx.check("cmd+a dispatched the Select All menu item without uncertain delivery",
+              pressed.get("ok") is True and pressed.get("route") == "ax_menu_shortcut"
+              and not pressed.get("uncertain"), delivery)
+    ctx.check("the menu acknowledgement alone does not claim a verified effect",
+              pressed.get("outcome", {}).get("state") == "observed"
+              and pressed.get("outcome", {}).get("verified") is False, delivery)
     ctx.call("type_text", window_id=wid, text="replaced")
     tree = ctx.tree(wid)
     ctx.check("cmd+a chord selected all, typing replaced the selection", 'value="replaced"' in tree, tree[:400])
@@ -1053,6 +1084,9 @@ def untitled_window(ctx, window):
     ctx.call("get_window_state", window_id=window["id"])
     ctx.call("press_key", window_id=window["id"], keys="cmd+n", observe="none")
     untitled = ctx.wait_for_window("TextEdit", pid=window["pid"], title="Untitled")
+    # A new document opens on the user's desktop even when its sibling is hosted. Keep both
+    # fixture windows on the agent display before exercising background window selection.
+    ctx.call("move_to_agent_display", window_id=untitled["id"])
     ctx.call("get_window_state", window_id=untitled["id"])
     return untitled
 
@@ -1065,6 +1099,10 @@ def app_target_pins_observed_window(ctx):
     pid = first["pid"]
     windows = {first["id"]: "one", untitled_window(ctx, first)["id"]: ""}
     one, two = windows
+    # The setup's cmd+n automatically claimed its window for the MCP transport session. Hand the scratch
+    # windows back before testing the independent session's observation pinning and ownership.
+    for wid in windows:
+        ctx.call("bind_target", target=f"window:{wid}", action="release")
     sid = ctx.call("session", action="create")["session_id"]
     ctx.cleanups.append(lambda: ctx.mcp.call("session", action="close", session_id=sid))
 
@@ -1074,12 +1112,54 @@ def app_target_pins_observed_window(ctx):
         ctx.check(f"{tool} by app before this session observed the app is refused",
                   error and "observe the app first" in error, error)
 
-    for wid in (one, two, one):
+    def independent_states():
+        # Read by window ID through the transport session, so verifying both documents cannot move sid's pin.
+        states = {}
+        for window_id in windows:
+            tree = ctx.tree(window_id, include_screenshot=False)
+            index = element_index(tree, "AXTextArea")
+            ctx.require("each document exposes its text area for independent verification", index is not None, tree[:300])
+            inspected = ctx.call("inspect_element", window_id=window_id, element_index=index)
+            selection = inspected.get("selection")
+            ctx.require("each document exposes its selection for independent verification",
+                        isinstance(selection, dict) and "offset" in selection and "length" in selection, inspected)
+            states[window_id] = {"text": inspected["text"], "selection": selection}
+        return states
+
+    for step, wid in enumerate((one, two, one), 1):
         tree = ctx.call("get_window_state", window_id=wid, session_id=sid, full=True)["tree"]
         area = element_index(tree, "AXTextArea")
         ctx.require("text area is indexed", area is not None, tree[:300])
+        before = independent_states()
+        value = f"pinned document {wid}, edit {step}"
+        edited = ctx.call("set_value", app="TextEdit", session_id=sid, element_index=area, value=value)
+        windows[wid] = value
+        after = independent_states()
+        other = two if wid == one else one
+        ctx.check(f"set_value by app addresses the window just observed ({wid})",
+                  edited.get("window_id") == wid and edited.get("route") == "ax_value", edited)
+        ctx.check(f"independent reads prove only document {wid} changed",
+                  {w: state["text"] for w, state in after.items()} == windows and after[other] == before[other], after)
+
+        tree = ctx.call("get_window_state", window_id=wid, session_id=sid, full=True)["tree"]
+        area = element_index(tree, "AXTextArea")
+        ctx.call("select_text", window_id=wid, session_id=sid, element_index=area,
+                 text=value, selection_type="cursor_before", observe="none")
+        before_key = independent_states()
+        ctx.require("the keyboard probe starts with the caret before nonempty text",
+                    before_key[wid]["selection"] == {"offset": 0, "length": 0}, before_key)
         pressed = ctx.call("press_key", app="TextEdit", session_id=sid, keys="right", observe="none")
         ctx.check(f"press_key by app acts on the window just observed ({wid})", pressed.get("window_id") == wid, pressed)
+        after_key = independent_states()
+        ctx.check(f"the right key moved only document {wid}'s caret by one character",
+                  after_key[wid] == {"text": value, "selection": {"offset": 1, "length": 0}}
+                  and after_key[other] == before_key[other], after_key)
+        # Independent reads refresh only the transport session. The caret/focus changed since sid's
+        # snapshot, so refresh that session before a text-area click can fall back to coordinates.
+        tree = ctx.call("get_window_state", window_id=wid, session_id=sid,
+                        full=True, include_screenshot=False)["tree"]
+        area = element_index(tree, "AXTextArea")
+        ctx.require("the fresh click snapshot exposes the text area", area is not None, tree[:300])
         clicked = ctx.call("click", app="TextEdit", session_id=sid, element_index=area, observe="none")
         ctx.check(f"click by app with an element index acts on that window ({wid})", clicked.get("window_id") == wid, clicked)
         text = ctx.call("inspect_element", app="TextEdit", session_id=sid, element_index=area)["text"]
@@ -1386,7 +1466,24 @@ def batch_layout_guard(ctx):
     ctx.kill_on_exit(calc["app"]["pid"])
     window = ctx.wait_for_window("Calculator", pid=calc["app"]["pid"])
     wid = window["id"]
-    start_w = window["frame"]["width"]
+    # Calculator persists its mode across processes, so Scientific may already be active at launch.
+    # Establish Basic and let its resize finish before capturing the batch's initial layout.
+    ctx.call("press_key", window_id=wid, keys="cmd+1", observe="none")
+    deadline, previous, stable = time.monotonic() + 3, None, 0
+    while time.monotonic() < deadline:
+        initial = ctx.call("get_window_state", window_id=wid, full=True, include_screenshot=False)
+        frame = initial["window"]["frame"]
+        geometry = tuple(frame[key] for key in ("x", "y", "width", "height"))
+        stable = stable + 1 if geometry == previous else 1
+        if stable >= 5:
+            break
+        previous = geometry
+        time.sleep(0.1)
+    ctx.require("Calculator's initial geometry was stable for five observations", stable >= 5, previous)
+    ctx.require("Calculator starts in Basic mode before the Scientific resize",
+                element_index(initial["tree"], "AXButton", "7") is not None
+                and element_index(initial["tree"], "AXButton", "X Squared") is None, initial["tree"][:500])
+    start_w = initial["window"]["frame"]["width"]
 
     # cmd+2 switches Calculator to Scientific, which resizes the window; the following pixel click
     # would land on stale coordinates, so the guard should stop the batch before it runs.
@@ -1860,6 +1957,11 @@ def browser_snapshot_hints(ctx):
                 # The fixture's own script sets most of the secrets, so its source is left out of the search.
                 "html export": re.sub(r"<script>.*?</script>", "", command("export", format="html")["content"], flags=re.S),
             }
+            # The dynamic fixture port can contain a short numeric secret (e.g. 56737 contains CVC 737). Only
+            # normalize the exact fixture origin; every value, attribute, and surrounding byte stays searchable.
+            # A leaked field containing 737 still fails, including beside an otherwise legitimate fixture URL.
+            reads = {name: text.replace(base, "http://fixture.test").replace(
+                base.replace("127.0.0.1", "localhost"), "http://fixture.test") for name, text in reads.items()}
             return {name: [s for s in secrets if s in text] for name, text in reads.items() if any(s in text for s in secrets)}
 
         leaked = leaks()
@@ -2408,21 +2510,25 @@ ACTION_TOOLS = {"launch_app", "batch", "click", "drag", "type_text", "set_value"
 
 
 class Run:
-    def __init__(self, config_overrides=None, browser=None, installed=None):
+    def __init__(self, config_overrides=None, browser=None, installed=None, headed_browser=None):
         """Runs against a fresh TestInstance (merged with `config_overrides`) unless `installed`
         (default: --installed or SC_E2E_TARGET=installed) targets the user's running app.
         `browser`: True always starts the isolated test browser, False never, None (default, or the
-        --browser / --no-browser flags) starts it when a selected scenario uses browser tools."""
+        --browser / --no-browser flags) starts it when a selected scenario uses browser tools.
+        `headed_browser`: show its disposable browser window; defaults to --headed-browser or False."""
         if installed is None:
             installed = "--installed" in sys.argv or os.environ.get("SC_E2E_TARGET") == "installed"
         if browser is None and {"--browser", "--no-browser"} & set(sys.argv):
             browser = "--browser" in sys.argv
+        if headed_browser is None:
+            headed_browser = "--headed-browser" in sys.argv
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.dir = ROOT / "artifacts" / stamp
         (self.dir / "screenshots").mkdir(parents=True)
         self.current = "setup"
         self.transcript = Transcript(self.dir / "transcript.jsonl", self)
         self.browser, self.instance, self.notes = browser, None, []
+        self.browser_runtime = None
         self.saved_sc_home = os.environ.get("SC_HOME")
         if installed:
             if config_overrides:
@@ -2434,7 +2540,7 @@ class Run:
         else:
             if "--approvals" in sys.argv:
                 config_overrides = {"approvals": "prompt", **(config_overrides or {})}
-            self.instance = TestInstance(config_overrides)
+            self.instance = TestInstance(config_overrides, headed_browser=headed_browser)
             # Scenarios read these module globals and run APP_BINARY --pause/--resume without an env,
             # so point both at the test instance.
             globals().update(CONFIG_PATH=self.instance.config_path, ACTION_LOG=self.instance.action_log)
@@ -2461,21 +2567,34 @@ class Run:
         return count
 
     def invariants(self, before, after, seconds):
-        """A change only counts as a failure when the user provided no input during the scenario;
-        otherwise it is recorded as inconclusive, since the user may have caused it."""
-        user_input = after["seconds_since_user_input"] < seconds
-        user_mouse = after["seconds_since_user_mouse"] < seconds
+        """Movement without observed HID activity fails; overlapping human activity is inconclusive.
+        Include both observer reads, whose time is excluded from the scenario execution duration."""
+        started = before.get("observation_started_at_monotonic")
+        finished = after.get("observation_finished_at_monotonic")
+        interval = seconds
+        timed_samples = (isinstance(started, (int, float)) and isinstance(finished, (int, float))
+                         and 0 <= finished - started < float("inf"))
+        if timed_samples:
+            interval = finished - started
+        timing = {"interval_seconds": interval,
+                  "source": "observer_monotonic" if timed_samples else "scenario_elapsed_legacy"}
+        if timed_samples:
+            timing.update(before_started=started, before_finished=before.get("observation_finished_at_monotonic"),
+                          after_started=after.get("observation_started_at_monotonic"), after_finished=finished)
+        user_input = after["seconds_since_user_input"] <= interval
+        user_mouse = after["seconds_since_user_mouse"] <= interval
 
-        def check(label, changed, user_active, detail):
-            return {"label": label, "ok": not changed or user_active, "inconclusive": changed and user_active, "detail": detail}
+        def check(label, changed, user_active, detail, idle_seconds):
+            return {"label": label, "ok": not changed or user_active, "inconclusive": changed and user_active,
+                    "detail": detail, "observation_timing": timing, "hid_idle_seconds": idle_seconds}
 
         return [
             check("frontmost app unchanged", before["frontmost"]["pid"] != after["frontmost"]["pid"], user_input,
-                  f"{before['frontmost']['name']} -> {after['frontmost']['name']}"),
+                  f"{before['frontmost']['name']} -> {after['frontmost']['name']}", after["seconds_since_user_input"]),
             check("active Space unchanged", before["active_space"] != after["active_space"], user_input,
-                  f"{before['active_space']} -> {after['active_space']}"),
+                  f"{before['active_space']} -> {after['active_space']}", after["seconds_since_user_input"]),
             check("cursor untouched", before["cursor"] != after["cursor"], user_mouse,
-                  f"{before['cursor']} -> {after['cursor']}"),
+                  f"{before['cursor']} -> {after['cursor']}", after["seconds_since_user_mouse"]),
         ]
 
     def run(self, names):
@@ -2514,6 +2633,8 @@ class Run:
         invariants = self.invariants(before, observe(), seconds)
         if status == "PASS" and not all(c["ok"] for c in ctx.checks + invariants):
             status = "FAIL"
+        if status == "PASS" and any(c.get("inconclusive") for c in ctx.checks + invariants):
+            status = "INCONCLUSIVE"
         self.results.append({"scenario": fn.__name__, "status": status, "seconds": round(seconds, 1), "error": error,
                              "checks": ctx.checks, "invariants": invariants, "screenshots": ctx.screenshots})
         print(f"{status:4}  {fn.__name__}  ({seconds:.1f}s){'  ' + error.splitlines()[0] if error else ''}")
@@ -2524,7 +2645,10 @@ class Run:
             return
         try:
             self.instance.start_browser()
-            self.notes.append(f"Isolated test browser connected (Chrome pid {self.instance.browser.pid}).")
+            browser = self.instance.browser
+            self.browser_runtime = {"pid": browser.pid, **browser.metadata}
+            visibility = "headed" if browser.headed else "headless"
+            self.notes.append(f"Isolated {visibility} test browser connected ({browser.version}, pid {browser.pid}).")
         except Exception as e:
             if self.browser:
                 raise
@@ -2543,7 +2667,8 @@ class Run:
 
     def write_report(self):
         (self.dir / "results.json").write_text(json.dumps(
-            {"target": self.target, "notes": self.notes, "baseline": self.baseline, "results": self.results}, indent=2))
+            {"target": self.target, "notes": self.notes, "baseline": self.baseline,
+             "browser_runtime": self.browser_runtime, "results": self.results}, indent=2))
         lines = [f"# Second Cursor E2E — {self.dir.name}", "",
                  f"Target: {self.target}", "", *[f"- {note}" for note in self.notes], *([""] if self.notes else []),
                  f"Frontmost at start: {self.baseline['frontmost']['name']} · active Space {self.baseline['active_space']} · "

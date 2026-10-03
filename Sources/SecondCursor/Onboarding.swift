@@ -50,7 +50,9 @@ final class OnboardingPanel: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private var timer: Timer?
     private var step: Step = .accessibility
+    private var requestedStep: Step?
     private var sawMissing = false
+    private var completionWorkItem: DispatchWorkItem?
     private var settingsFrame: CGRect?
     private let titleLabel = NSTextField(labelWithString: "")
     private let reasonLabel = NSTextField(wrappingLabelWithString: "")
@@ -75,11 +77,14 @@ final class OnboardingPanel: NSObject, NSWindowDelegate {
             requestName, object: SCPaths.supportDir.path, userInfo: nil, deliverImmediately: true)
     }
 
-    func show() {
+    func show(step requestedStep: Step? = nil) {
         let panel = self.panel ?? makePanel()
         self.panel = panel
+        completionWorkItem?.cancel()
+        completionWorkItem = nil
+        self.requestedStep = requestedStep
         sawMissing = false
-        step = Step.allCases.first { !$0.isGranted } ?? .accessibility
+        step = requestedStep ?? Step.allCases.first { !$0.isGranted } ?? .accessibility
         refresh()
         settingsFrame = Self.settingsWindowFrame()
         position(panel, next: settingsFrame)
@@ -93,6 +98,8 @@ final class OnboardingPanel: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         timer?.invalidate()
         timer = nil
+        completionWorkItem?.cancel()
+        completionWorkItem = nil
     }
 
     private func tick() {
@@ -106,10 +113,11 @@ final class OnboardingPanel: NSObject, NSWindowDelegate {
 
     private func refresh() {
         let missing = Step.allCases.filter { !$0.isGranted }
-        if !missing.isEmpty {
+        let requestedMissing = requestedStep.map { !$0.isGranted } ?? !missing.isEmpty
+        if requestedMissing {
             sawMissing = true
         }
-        if step.isGranted, let next = missing.first {
+        if requestedStep == nil, step.isGranted, let next = missing.first {
             step = next
         }
         for (candidate, row) in rows {
@@ -120,13 +128,20 @@ final class OnboardingPanel: NSObject, NSWindowDelegate {
             row.icon.contentTintColor = granted ? .systemGreen : .tertiaryLabelColor
             row.label.font = candidate == step ? .boldSystemFont(ofSize: 12) : .systemFont(ofSize: 12)
         }
-        if missing.isEmpty && sawMissing {
-            titleLabel.stringValue = "Second Cursor is ready"
-            reasonLabel.stringValue = "Both permissions are on. Your agent can now use apps in the background."
+        if !requestedMissing && sawMissing {
+            titleLabel.stringValue = requestedStep.map { "\($0.name) is on" } ?? "Permissions are ready"
+            reasonLabel.stringValue = requestedStep == nil
+                ? "Both permissions are on. Return to Setup to check your agent and browser connection."
+                : "The permission is on. Return to Setup to finish connecting Second Cursor."
             hintLabel.stringValue = ""
             timer?.invalidate()
             timer = nil
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.panel?.close() }
+            if completionWorkItem == nil {
+                let work = DispatchWorkItem { [weak self] in self?.panel?.close() }
+                completionWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+            }
+            fitKeepingTop()
             return
         }
         titleLabel.stringValue = step.isGranted ? "\(step.name) is on" : "Allow \(step.name)"
@@ -152,7 +167,7 @@ final class OnboardingPanel: NSObject, NSWindowDelegate {
             contentRect: NSRect(x: 0, y: 0, width: 440, height: 240),
             styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel],
             backing: .buffered, defer: false)
-        panel.title = "Second Cursor Setup"
+        panel.title = "Second Cursor Permissions"
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.hidesOnDeactivate = false

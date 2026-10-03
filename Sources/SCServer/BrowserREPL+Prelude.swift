@@ -563,10 +563,13 @@ extension BrowserREPL {
     and(other) { return this.#then([{ and: this.#relative(other, "and") }], `.and(${other})`); }
     or(other) { return this.#then([{ or: this.#relative(other, "or") }], `.or(${other})`); }
 
-    #act(name, operation, args, options, retry = ACTIONABLE) {
+    async #act(name, operation, args, options, retry = ACTIONABLE) {
       const page = internals.get(this.#page);
-      return page.retry(`locator.${name}`, this.#desc, options?.timeout, retry,
+      const result = await page.retry(`locator.${name}`, this.#desc, options?.timeout, retry,
         () => page.command(operation, { locator: { chain: this.#chain }, ...args }));
+      if (result?.outcome?.state === "uncertain")
+        throw new Error(`locator.${name}: the requested ${result.outcome.verification} was not verified after the page handled the input; inspect the control before continuing`);
+      return result;
     }
     #query(extra) {
       const page = internals.get(this.#page);
@@ -587,6 +590,10 @@ extension BrowserREPL {
       const o = allow(options, ["button", "modifiers", "timeout", "force", "noWaitAfter"], "dblclick");
       await this.#act("dblclick", "click", { button: o.button, count: 2, modifiers: modifiers(o.modifiers),
         force: o.force, wait_navigation: !o.noWaitAfter }, o);
+    }
+    async hover(options) {
+      const o = allow(options, ["modifiers", "timeout", "force"], "hover");
+      await this.#act("hover", "hover", { modifiers: modifiers(o.modifiers), force: o.force }, o);
     }
     async fill(value, options) {
       const o = allow(options, ["timeout", "force", "noWaitAfter"], "fill");
@@ -680,7 +687,7 @@ extension BrowserREPL {
   const NO_ELEMENT_SCRIPT = "there is no page JavaScript; use the locator's own methods";
   for (const name of ["evaluate", "evaluateAll", "evaluateHandle", "elementHandle", "elementHandles", "dispatchEvent"])
     Locator.prototype[name] = notAvailable(`locator.${name}`, NO_ELEMENT_SCRIPT);
-  for (const [name, hint] of [["hover", "click or focus the element instead"], ["dragTo", ""], ["tap", "use click"],
+  for (const [name, hint] of [["dragTo", "use browser_command drag for a pointer drag"], ["tap", "use click"],
     ["setInputFiles", "file uploads need the user's approval"], ["blur", ""], ["highlight", ""], ["screenshot", "use page.screenshot()"],
     ["innerHTML", "read text with innerText() or the page with page.snapshot()"], ["outerHTML", "read text with innerText() or the page with page.snapshot()"]])
     Locator.prototype[name] = notAvailable(`locator.${name}`, hint);
@@ -833,7 +840,10 @@ extension BrowserREPL {
           await self.#command("scroll", { direction: vertical ? (dy < 0 ? "up" : "down") : (dx < 0 ? "left" : "right"),
             amount: Math.max(1, Math.round(Math.abs(distance) / 100)) });
         },
-        move: notAvailable("mouse.move", "click locators or coordinates instead"),
+        move: async (x, y, options) => {
+          allow(options, [], "mouse.move");
+          await self.#command("hover", { x: Number(x), y: Number(y) });
+        },
         down: notAvailable("mouse.down", ""),
         up: notAvailable("mouse.up", ""),
       }, "mouse"));

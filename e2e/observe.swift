@@ -20,6 +20,9 @@ func mainSpaceIsFullScreen() -> Bool {
     return (current["type"] as? NSNumber)?.intValue == 4
 }
 
+// Bracket all reads in a clock shared across observer subprocesses. Scenario execution time alone
+// excludes these reads and can misclassify human input during either boundary as an agent violation.
+let observationStarted = ProcessInfo.processInfo.systemUptime
 let cursor = CGEvent(source: nil)!.location
 let front = NSWorkspace.shared.frontmostApplication
 
@@ -41,17 +44,21 @@ let approvalWindows = (CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNull
               (bounds["Width"] as? Double ?? 0) < 1000 else { return nil }
         return ["id": id, "title": info[kCGWindowName as String] ?? "", "bounds": bounds]
     }
-let state: [String: Any] = [
+var state: [String: Any] = [
+    "observation_started_at_monotonic": observationStarted,
     "second_cursor_windows": approvalWindows,
     "cursor": ["x": cursor.x, "y": cursor.y],
     "frontmost": ["name": front?.localizedName ?? "", "bundle_id": front?.bundleIdentifier ?? "", "pid": front?.processIdentifier ?? 0],
     "active_space": CGSGetActiveSpace(CGSMainConnectionID()),
     "main_space_full_screen": mainSpaceIsFullScreen(),
-    "seconds_since_user_mouse": CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .mouseMoved),
+    // A held button produces dragged events instead of mouseMoved, but still moves the human cursor.
+    "seconds_since_user_mouse": [CGEventType.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        .map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }.min()!,
     "seconds_since_user_key": CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown),
     // kCGAnyInputEventType (~0) also covers clicks and trackpad gestures such as Space swipes.
     "seconds_since_user_input": CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: unsafeBitCast(UInt32.max, to: CGEventType.self)),
     "displays": displays,
 ]
+state["observation_finished_at_monotonic"] = ProcessInfo.processInfo.systemUptime
 let data = try! JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)

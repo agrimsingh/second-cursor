@@ -16,6 +16,55 @@ const ownership = () =>
     .then((x) => x.ownership ?? {}));
 const saveOwnership = async () =>
   chrome.storage.session.set({ ownership: await ownership() });
+let controlsPromise = null;
+const controls = () => (controlsPromise ??= chrome.storage.session.get("sessionControls").then(x => x.sessionControls ?? {}));
+
+/** Persist pause across service-worker restarts. Closing is terminal, so already queued work cannot recreate tabs. */
+export async function setSessionControl(session, state, generation) {
+  const all = await controls();
+  const previous = all[session];
+  if (Number.isInteger(generation) && generation <= (previous?.generation ?? -1))
+    return { ...previous, changed: false };
+  if (all[session]?.state === "closed" && state !== "closed")
+    throw new BridgeError("not_allowed", "The browser session is closed");
+  all[session] = { state, generation: Number.isInteger(generation) ? generation : (previous?.generation ?? 0) + 1 };
+  await chrome.storage.session.set({ sessionControls: all });
+  return { ...all[session], changed: true };
+}
+
+export const sessionControlGeneration = async session => (await controls())[session]?.generation ?? 0;
+const activeInputs = new Map();
+export async function beginAgentInput(tabId, session, generation) {
+  await requireSessionInput(session);
+  if (generation !== await sessionControlGeneration(session))
+    throw new BridgeError("not_allowed", "Browser task control changed while input was queued; read the page and submit it again");
+  const token = { session, generation };
+  if (tabId != null) activeInputs.set(tabId, token);
+  return token;
+}
+export function endAgentInput(tabId, token) {
+  if (activeInputs.get(tabId) === token) activeInputs.delete(tabId);
+}
+
+export async function sessionIsActive(session) {
+  return !["paused", "closed"].includes((await controls())[session]?.state);
+}
+
+export async function requireSessionInput(session) {
+  const state = (await controls())[session]?.state;
+  if (state === "paused" || state === "closed")
+    throw new BridgeError("not_allowed", `Browser session is ${state}; ${state === "paused" ? "resume the task before sending input" : "open a new task"}`);
+}
+
+/** Rechecked at each CDP input, after cursor animation and between drag/key events, not only at dispatch. */
+export async function requireAgentInput(tabId, session = null) {
+  await requireAgentTab(tabId, session);
+  const owner = (await ownership())[tabId]?.session ?? session ?? "legacy";
+  await requireSessionInput(owner);
+  const active = activeInputs.get(tabId);
+  if (active && (active.session !== owner || active.generation !== await sessionControlGeneration(owner)))
+    throw new BridgeError("not_allowed", "Browser task control changed during input; read the page and submit it again");
+}
 let persistQueue = Promise.resolve();
 let groupQueue = Promise.resolve();
 
@@ -173,7 +222,9 @@ export async function requireAgentTab(tabId, session = null) {
       "claim expired; claim again (requires approval)",
     );
   }
-  if (session && owner && owner.session !== session)
+  if (!owner)
+    throw new BridgeError("not_allowed", "Tab has no current session owner; claim it again before use");
+  if (session && owner.session !== session)
     throw new BridgeError("not_allowed", "Tab belongs to another session");
   if (isClaim(owner)) await touchClaim(owner);
   try {
@@ -289,6 +340,13 @@ const SETTLE_PROBE = `(() => {
     new MutationObserver(changed).observe(document, { subtree: true, attributeFilter: ["aria-expanded", "aria-selected",
       "aria-checked", "aria-pressed", "aria-current", "aria-hidden", "aria-disabled", "aria-activedescendant", "hidden",
       "open", "disabled"] });
+    // Native checkbox/radio checked is a property, not an attribute. Count its committed change as a reaction;
+    // counting every text input would incorrectly finish before debounced search results arrive.
+    document.addEventListener("change", event => {
+      if (!event.target?.matches?.("input[type=checkbox],input[type=radio]")) return;
+      s.last = performance.now();
+      s.mutated = true;
+    }, true);
     globalThis.__secondCursorSettle = s;
   }
   return { quiet: performance.now() - s.last, mutated: s.mutated, ready: document.readyState };
@@ -407,8 +465,10 @@ export async function listTabs(session = null) {
 }
 
 export async function openTab(rawUrl, session = "legacy") {
+  await requireSessionInput(session);
   const url = normalizeUrl(rawUrl);
   const windowId = await targetWindowId();
+  await requireSessionInput(session);
   const tab =
     windowId === undefined
       ? (await chrome.windows.create({ url, focused: false })).tabs[0]
@@ -429,7 +489,10 @@ export async function openTab(rawUrl, session = "legacy") {
 export async function navigateTab(tabId, rawUrl) {
   await requireAgentTab(tabId);
   const url = normalizeUrl(rawUrl);
-  await settleAround(tabId, () => chrome.tabs.update(tabId, { url }), {
+  await settleAround(tabId, async () => {
+    await requireAgentInput(tabId);
+    return chrome.tabs.update(tabId, { url });
+  }, {
     quietMs: 1000,
     timeoutMs: 20000,
   });
@@ -440,7 +503,7 @@ export async function navigateTab(tabId, rawUrl) {
 
 /** Closes a tab the agent opened. A claimed personal tab is the user's: it is released, never closed. */
 export async function closeTab(tabId) {
-  await requireAgentTab(tabId);
+  await requireAgentInput(tabId);
   if (isClaim((await ownership())[tabId])) {
     await dropTab(tabId);
     return { released: true, closed: false };
@@ -463,6 +526,7 @@ export async function userTabs() {
   };
 }
 export async function claimTab(tabId, session) {
+  await requireSessionInput(session);
   const all = await ownership();
   if (isClaim(all[tabId]) && claimExpired(all[tabId])) await dropTab(tabId);
   const previous = all[tabId];

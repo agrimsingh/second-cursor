@@ -98,37 +98,73 @@ enum Keyboard {
         return KeyChord(keyCode: code, flags: flags, key: key)
     }
 
-    static func press(_ chord: KeyChord, pid: pid_t) {
-        for down in [true, false] {
-            guard let event = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: chord.keyCode, keyDown: down)
-            else { continue }
-            event.flags = chord.flags
-            SkyLight.post(event, to: pid, authenticated: true)
-            usleep(8_000)
+    static func press(_ chord: KeyChord, pid: pid_t, wid: CGWindowID) throws {
+        try SkyLight.requireKeyboardSupport()
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw SCError.actionFailed("Unable to create a keyboard event source; no key was sent.")
         }
+        // Allocate the release before sending the press, so allocation failure cannot leave a key held down.
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: chord.keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: chord.keyCode, keyDown: false) else {
+            throw SCError.actionFailed("Unable to create the keyboard event pair; no key was sent.")
+        }
+        down.flags = chord.flags
+        up.flags = chord.flags
+        try postPair(down: down, up: up, pid: pid, wid: wid)
     }
 
     /// Types each character as a Unicode key event; newlines and tabs become real Return/Tab presses
     /// so web forms see them as keys.
-    static func type(_ text: String, pid: pid_t) {
-        let source = CGEventSource(stateID: .hidSystemState)
+    static func type(_ text: String, pid: pid_t, wid: CGWindowID) throws {
+        try SkyLight.requireKeyboardSupport()
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw SCError.actionFailed("Unable to create a keyboard event source; no text was sent.")
+        }
         for character in text {
             if character == "\n" || character == "\r\n" || character == "\r" {
-                press(KeyChord(keyCode: 36, flags: []), pid: pid)
+                try press(KeyChord(keyCode: 36, flags: []), pid: pid, wid: wid)
                 continue
             }
             if character == "\t" {
-                press(KeyChord(keyCode: 48, flags: []), pid: pid)
+                try press(KeyChord(keyCode: 48, flags: []), pid: pid, wid: wid)
                 continue
             }
             var units = Array(String(character).utf16)
-            for down in [true, false] {
-                guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+                throw SCError.actionFailed("Unable to create the next keyboard event pair; text entry stopped and may be partially complete.")
+            }
+            for event in [down, up] {
                 event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: &units)
                 event.flags = []
-                SkyLight.post(event, to: pid, authenticated: true)
-                usleep(8_000)
             }
+            try postPair(down: down, up: up, pid: pid, wid: wid)
+        }
+    }
+
+    /// Check immediately before each press, including every Unicode character. Once a press is dispatched its
+    /// release must run even if the task is canceled or the human intervenes; only subsequent presses are blocked.
+    private static func postPair(down: CGEvent, up: CGEvent, pid: pid_t, wid: CGWindowID) throws {
+        HumanInputMonitor.stamp(down)
+        HumanInputMonitor.stamp(up)
+        try NativeSafety.check(pid: pid, wid: wid, input: true)
+        guard SkyLight.keyWindow(pid: pid) == wid else {
+            throw SCError.notAllowed("The target stopped being the app's key window; keyboard input stopped before the next key. Observe before continuing.")
+        }
+        guard SkyLight.post(down, to: pid, authenticated: true) else {
+            throw SCError.actionFailed("Authenticated keyboard dispatch failed before key-down; this key was not sent.")
+        }
+        var released = false
+        defer {
+            // A public release is the last cleanup available if the authenticated route fails after key-down.
+            // It does not prove that the target accepted the release, so the caller still receives an error.
+            if !released { up.postToPid(pid) }
+            usleep(8_000)
+        }
+        usleep(8_000)
+        released = SkyLight.post(up, to: pid, authenticated: true)
+        guard released else {
+            throw SCError.actionFailed("Key-down was sent, but authenticated key-up failed. A fallback release was sent; the key state is uncertain. Inspect the app before retrying.")
         }
     }
 }

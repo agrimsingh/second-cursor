@@ -3,6 +3,7 @@ import { hideSession, setCaption, show } from "./cursor.js";
 import { BridgeError } from "./errors.js";
 import { click, pressKey, screenshot, scroll, type } from "./input.js";
 import { snapshot, structuredSnapshot } from "./snapshot.js";
+import { browserRevision } from "./freshness.js";
 import {
   closeTab,
   describe,
@@ -12,6 +13,12 @@ import {
   noteAction,
   noteInput,
   requireAgentTab,
+  beginAgentInput,
+  endAgentInput,
+  requireSessionInput,
+  sessionIsActive,
+  sessionControlGeneration,
+  setSessionControl,
   settleAround,
   settled,
   takeReports,
@@ -30,22 +37,58 @@ const SUPERSEDED_RETRY_MS = 60000;
 const HEALTHY_AFTER_MS = 10000;
 
 const observations = new Map();
+function invalidateSession(session) {
+  for (const key of observations.keys()) if (key.startsWith(session + ":")) observations.delete(key);
+}
+async function validateObservation(params) {
+  if (!params.observation_id) return;
+  const observed = observations.get(`${params.session_id}:${params.tabId}`);
+  if (observed?.id !== params.observation_id)
+    throw new BridgeError("failed", "Stale browser observation; read browser_snapshot again");
+  if (!observed.current || observed.revision !== await browserRevision(params.tabId))
+    throw new BridgeError("failed", "Stale browser observation: the document or viewport changed; read browser_snapshot again");
+}
 chrome.tabs.onRemoved.addListener((id) => {
   for (const key of observations.keys())
     if (key.endsWith(":" + id)) observations.delete(key);
 });
 const handlers = {
-  extended: extended,
+  extended: params => extended(params, () => validateObservation(params)),
   // Sent just before the action it describes, which must not wait for the overlay.
-  "cursor.caption": ({ tabId, caption, session_id }) => {
-    setCaption(tabId, caption, session_id);
+  "cursor.caption": async ({ tabId, caption, session_id }) => {
+    if (await sessionIsActive(session_id)) setCaption(tabId, caption, session_id);
     return {};
   },
-  "session.close": async ({ session_id }) => {
-    for (const key of observations.keys())
-      if (key.startsWith(session_id + ":")) observations.delete(key);
+  "session.close": async ({ session_id, generation }) => {
+    const control = await setSessionControl(session_id, "closed", generation);
+    if (!control.changed) return { closed: control.state === "closed", ...control };
+    invalidateSession(session_id);
     await hideSession(session_id);
     return closeSession(session_id);
+  },
+  "session.pause": async ({ session_id, generation }) => {
+    const control = await setSessionControl(session_id, "paused", generation);
+    if (!control.changed) return { paused: control.state === "paused", ...control };
+    invalidateSession(session_id);
+    await hideSession(session_id);
+    return { paused: true, ...control };
+  },
+  "session.takeover": async ({ session_id, generation }) => {
+    const control = await setSessionControl(session_id, "paused", generation);
+    // Immediate pause and post-drain takeover deliberately share one generation. Repeating takeover only releases
+    // any remaining personal claims; an older takeover must never release claims from a later resumed task.
+    if (control.state !== "paused" || (Number.isInteger(generation) && control.generation !== generation))
+      return { taken_over: false, ...control };
+    invalidateSession(session_id);
+    await hideSession(session_id);
+    const released = await endTurn(session_id);
+    return { taken_over: true, requires_reclaim: released.released > 0, ...released, ...control };
+  },
+  "session.resume": async ({ session_id, generation }) => {
+    const control = await setSessionControl(session_id, "active", generation);
+    if (!control.changed) return { resumed: control.state === "active", ...control };
+    invalidateSession(session_id);
+    return { resumed: true, requires_observation: true, ...control };
   },
   // Only for the app's local approval prompt text; tab ids never come from here to the model.
   "tab.info": async ({ tabId }) => {
@@ -53,8 +96,7 @@ const handlers = {
     return { url: tab.url || tab.pendingUrl || "", title: tab.title || "" };
   },
   "session.end_turn": async ({ session_id }) => {
-    for (const key of observations.keys())
-      if (key.startsWith(session_id + ":")) observations.delete(key);
+    invalidateSession(session_id);
     await hideSession(session_id);
     return endTurn(session_id);
   },
@@ -87,13 +129,17 @@ const handlers = {
       );
     // Like Codex, the cursor is on the tab from the moment the agent works in it, not only once it acts.
     await timing.timed(tabId, "attach", () => attach(tabId));
-    show(tabId, session_id);
+    if (await sessionIsActive(session_id)) show(tabId, session_id);
     await settled(tabId);
     const key = `${session_id}:${tabId}`;
     const previous = observations.get(key);
+    const beforeRevision = await browserRevision(tabId);
+    const capturedAt = Date.now();
     const snapshot = await timing.timed(tabId, "collect", () => structuredSnapshot(tabId));
+    const revision = await browserRevision(tabId);
+    const current = beforeRevision === revision;
     const id = crypto.randomUUID();
-    observations.set(key, { id, outline: snapshot.outline });
+    observations.set(key, { id, outline: snapshot.outline, revision, current });
     let outline = snapshot.outline;
     let is_diff = false;
     if (full === false && previous) {
@@ -116,6 +162,8 @@ const handlers = {
       outline,
       ...(structured && !is_diff ? { elements: snapshot.elements } : {}),
       snapshot_id: id,
+      freshness: { revision, captured_at_ms: capturedAt, age_ms: Date.now() - capturedAt,
+        status: current ? "current" : "changed_during_capture" },
       is_diff,
       diff_base: is_diff ? previous.id : null,
     };
@@ -123,7 +171,7 @@ const handlers = {
   "tab.click": async (params) => {
     const { tabId, ref, x, y } = params;
     await requireAgentTab(tabId);
-    return act(params, () => click(tabId, { ref, x, y }), { quietMs: INPUT_NAVIGATION_MS });
+    return act(params, () => click(tabId, { ref, x, y }, () => validateObservation(params)), { quietMs: INPUT_NAVIGATION_MS });
   },
   "tab.type": async (params) => {
     const { tabId, ref, text, submit } = params;
@@ -165,7 +213,7 @@ async function act(params, action, settleOptions) {
     const at = Date.now();
     await (settleOptions ? settleAround(tabId, action, settleOptions) : action());
     noteAction(tabId, at);
-    return {};
+    return { outcome: { state: "dispatched", verified: false, reason: "Input was dispatched; no postcondition was requested.", verification: "none" } };
   }
   const at = Date.now();
   const blocked = await withDialog(tabId, async () => {
@@ -173,7 +221,7 @@ async function act(params, action, settleOptions) {
   });
   if (blocked?.dialog_open) return blocked;
   noteAction(tabId, at);
-  const reply = {};
+  const reply = { outcome: { state: "dispatched", verified: false, reason: "Input was dispatched; no postcondition was requested.", verification: "none" } };
   try {
     if (observe === "screenshot") await settled(tabId);
     else reply.observation = await handlers["tab.snapshot"]({ tabId, session_id, full: false });
@@ -231,7 +279,12 @@ function changedLines(old, now) {
 }
 
 const ACTIONS = new Set(["tab.click", "tab.type", "tab.pressKey", "tab.scroll"]);
-const EXTENDED_ACTIONS = new Set(["click", "drag", "paste", "press_key", "scroll", "type", "upload"]);
+const EXTENDED_ACTIONS = new Set(["click", "hover", "drag", "fill", "check", "select_option", "select_text",
+  "perform_action", "paste", "press_key", "scroll", "type", "upload", "back", "forward", "reload", "viewport"]);
+// Reads and lifecycle operations address a tab by its owned identity. They must remain usable to inspect or close
+// a page after it changed. Freshness is a precondition for input grounded in a prior UI, not for that recovery.
+const GROUNDED_INPUT = new Set(["click", "hover", "drag", "fill", "check", "select_option", "select_text",
+  "perform_action", "paste", "press_key", "scroll", "type", "upload"]);
 // Replies the app hands to the model; queued [system] lines ride on these and on nothing else, or they are lost.
 const REPORTING = new Set([...ACTIONS, "tabs.open", "tabs.close", "tab.snapshot", "extended"]);
 
@@ -239,8 +292,9 @@ let port = null;
 let retryTimer = null;
 let retryDelay = MIN_RETRY_MS;
 
-async function dispatch(activePort, { id, method, params, receivedAt }) {
+async function dispatch(activePort, { id, method, params, receivedAt, controlGeneration }) {
   let reply;
+  let inputToken;
   const started = performance.now();
   const timingKey = params?.tabId ?? "browser";
   const phases = params?.timings ? timing.begin(timingKey) : null;
@@ -249,16 +303,7 @@ async function dispatch(activePort, { id, method, params, receivedAt }) {
     if (!handler)
       throw new BridgeError("invalid_argument", `Unknown method ${method}`);
     params ??= {};
-    if (
-      params.observation_id &&
-      !["tab.snapshot", "tab.screenshot"].includes(method) &&
-      observations.get(`${params.session_id}:${params.tabId}`)?.id !==
-        params.observation_id
-    )
-      throw new BridgeError(
-        "failed",
-        "Stale browser observation; read browser_snapshot again",
-      );
+    params.session_id ??= "legacy";
     if (params.deadline && Date.now() >= params.deadline)
       throw new BridgeError(
         "failed",
@@ -273,10 +318,16 @@ async function dispatch(activePort, { id, method, params, receivedAt }) {
       )
     )
       await requireAgentTab(params.tabId, params.session_id ?? "legacy");
+    // Ownership precedes freshness: an old cached observation must never reattach a released personal tab.
+    if (ACTIONS.has(method) || (method === "extended" && GROUNDED_INPUT.has(params.operation)))
+      await validateObservation(params);
     const dispatchedAt = Date.now();
     const acts =
       params.tabId != null &&
       (ACTIONS.has(method) || (method === "extended" && EXTENDED_ACTIONS.has(params.operation)));
+    if (acts || ["tabs.open", "tabs.close", "tab.navigate"].includes(method) ||
+        (method === "extended" && ["claim", "dialog", "clipboard"].includes(params.operation)))
+      inputToken = await beginAgentInput(params.tabId, params.session_id, await controlGeneration);
     if (acts) noteInput(params.tabId);
     reply = {
       id,
@@ -284,6 +335,11 @@ async function dispatch(activePort, { id, method, params, receivedAt }) {
         ? withDialog(params.tabId, () => handler(params))
         : handler(params)),
     };
+    if (acts && !reply.result?.outcome)
+      reply.result = { ...reply.result, outcome: { state: "dispatched", verified: false,
+        reason: "Input was dispatched; no postcondition was requested.", verification: "none" } };
+    if (method === "extended" && ["claim", "release"].includes(params.operation))
+      observations.delete(`${params.session_id}:${params.tabId}`);
     const events = REPORTING.has(method) ? takeReports(params.session_id ?? "legacy") : [];
     if (events.length) reply.result = { ...reply.result, events };
     // An action that read the page in this message stamped itself before reading (act).
@@ -303,6 +359,7 @@ async function dispatch(activePort, { id, method, params, receivedAt }) {
       },
     };
   } finally {
+    if (inputToken) endAgentInput(params?.tabId, inputToken);
     if (phases) timing.end(timingKey, phases);
   }
   try {
@@ -324,7 +381,11 @@ function scheduleRetry() {
 const queues = new Map();
 function enqueue(activePort, message) {
   message.receivedAt = performance.now();
-  const key = message.params?.tabId ?? "browser";
+  message.controlGeneration = sessionControlGeneration(message.params?.session_id ?? "legacy");
+  // Control has a separate, per-session lane: a pause never waits behind a tab action or slow tabs.open, while
+  // pause/takeover/resume retain their generation order even across asynchronous storage and release calls.
+  const control = ["session.pause", "session.resume", "session.takeover", "session.close"].includes(message.method);
+  const key = control ? `control:${message.params?.session_id ?? "legacy"}` : message.params?.tabId ?? "browser";
   const next = (queues.get(key) ?? Promise.resolve()).then(() =>
     dispatch(activePort, message),
   );

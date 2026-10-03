@@ -67,18 +67,80 @@ public struct WindowInfo: Codable, Sendable, Equatable {
     }
 }
 
+/// Evidence attached to a capture, kept separate from an application's unobservable repaint time.
+public struct FrameFreshness: Codable, Sendable, Equatable {
+    /// `unverified` means capture completed, but the application's last repaint time is unknown.
+    public var state: String
+    public var capturedAt: Double
+    public var reason: String
+    public var windowOnScreen: Bool?
+    /// Identical pixels do not prove a frozen app, and changed pixels do not prove the expected action succeeded.
+    public var changedSincePreviousCapture: Bool?
+
+    public init(state: String = "unverified", capturedAt: Double = Date().timeIntervalSince1970,
+                reason: String, windowOnScreen: Bool? = nil, changedSincePreviousCapture: Bool? = nil) {
+        self.state = state
+        self.capturedAt = capturedAt
+        self.reason = reason
+        self.windowOnScreen = windowOnScreen
+        self.changedSincePreviousCapture = changedSincePreviousCapture
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case state, reason
+        case capturedAt = "captured_at"
+        case windowOnScreen = "window_on_screen"
+        case changedSincePreviousCapture = "changed_since_previous_capture"
+    }
+}
+
+public struct NativeGestureCapability: Codable, Sendable, Equatable {
+    public var supported: Bool
+    public var reason: String?
+    public var alternative: String?
+
+    public init(supported: Bool, reason: String? = nil, alternative: String? = nil) {
+        self.supported = supported
+        self.reason = reason
+        self.alternative = alternative
+    }
+}
+
+public struct NativeCapabilityProfile: Codable, Sendable, Equatable {
+    public var backend: String
+    public var osVersion: String
+    public var inputMonitoringAvailable: Bool
+    public var capabilities: [String: NativeGestureCapability]
+
+    public init(backend: String = "native_macos", osVersion: String,
+                inputMonitoringAvailable: Bool, capabilities: [String: NativeGestureCapability]) {
+        self.backend = backend
+        self.osVersion = osVersion
+        self.inputMonitoringAvailable = inputMonitoringAvailable
+        self.capabilities = capabilities
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case backend, capabilities
+        case osVersion = "os_version"
+        case inputMonitoringAvailable = "input_monitoring_available"
+    }
+}
+
 /// PNG image. `scale` is image pixels per window point, so a pixel (px, py) maps to window-local point (px / scale, py / scale).
 public struct Screenshot: Sendable, Equatable {
     public var pngData: Data
     public var width: Int
     public var height: Int
     public var scale: Double
+    public var freshness: FrameFreshness?
 
-    public init(pngData: Data, width: Int, height: Int, scale: Double) {
+    public init(pngData: Data, width: Int, height: Int, scale: Double, freshness: FrameFreshness? = nil) {
         self.pngData = pngData
         self.width = width
         self.height = height
         self.scale = scale
+        self.freshness = freshness
     }
 }
 
@@ -127,6 +189,7 @@ public struct WindowSnapshot: Sendable, Equatable {
     /// Set instead of `screenshot` when the capture failed; the tree is still valid.
     public var screenshotError: String?
     public var elements: [ElementInfo] = []
+    public var capabilities: NativeCapabilityProfile?
     /// For `ocr` reads: capture plus recognition time, how many recognized texts were merged, or why it failed.
     public var ocrMS: Int?
     public var ocrCount: Int?
@@ -193,11 +256,14 @@ public struct ActionResult: Codable, Sendable, Equatable {
     public var route: String
     public var verified: Bool?
     public var note: String?
+    /// The action may still execute or only part of it was confirmed. An observation or retry must reconcile it.
+    public var uncertain: Bool?
 
-    public init(route: String, verified: Bool? = nil, note: String? = nil) {
+    public init(route: String, verified: Bool? = nil, note: String? = nil, uncertain: Bool? = nil) {
         self.route = route
         self.verified = verified
         self.note = note
+        self.uncertain = uncertain
     }
 }
 

@@ -1,0 +1,18 @@
+# Native safety acceptance plan
+
+These failure cases define the implementation and verification scope before code changes.
+
+1. A window keeps its size but rearranges controls, scrolls, or opens a sheet after observation. A coordinate action must be refused before dispatch and direct the agent to observe again. Changing only text values, focus, or selection must not expire semantic element references.
+2. A referenced element disappears, changes identity, or becomes disabled. An indexed action must refuse the stale target. An unchanged AX target may remain usable when unrelated controls change.
+3. Recent hardware-like input gives the human ownership of the target process for a two-second quiet interval; mutations must refuse during it. Idle foreground delegation is allowed when monitoring works. When monitoring is unavailable, foreground mutations conservatively refuse. For a different window of the active process, semantic AX actions can proceed while idle, but pointer and keyboard routes must always refuse any temporary key-window change.
+4. Hardware-like input occurs in the target process after observation. The old observation must no longer authorize a mutation. Synthetic Second Cursor input must not invalidate itself. Monitoring availability must be exposed; its absence must not weaken foreground-window protection.
+5. A keyboard or pointer action loses a required private macOS function. It must fail explicitly, without silently downgrading to public posting or returning success for a no-op.
+6. A requested native modifier click or modifier drag cannot be delivered faithfully. Refuse it before posting input and suggest a supported semantic or browser route. Native hover must be advertised as unsupported.
+7. A captured window is off Space or occluded. Capture time must never be described as application repaint time. Expose freshness as unverified, with an off-screen warning where applicable.
+8. Sequential editing through stable AX elements remains functional, as do background unmodified clicks, drags, wheel scrolling and keyboard input in a separate process. Existing focus, drag, and normal editing suites must remain passing.
+9. An app accepts setting focus but does not actually focus the requested element/window. Keyboard input must refuse before the first key, and a new key window mid-string must stop remaining keys. Once key/button down has been delivered, cleanup must still release it after pause or takeover.
+10. Replacing selected text with the identical text must produce one replacement, never an automatic keyboard retry. Verification compares the exact expected document text to the resulting value when prior value/selection are available. AX timeouts return machine-readable uncertainty; an ordinary batch halts until that action can be reconciled.
+
+## Verification
+
+`e2e/native_safety.py` exercises public MCP contracts against disposable native fixtures. Ordinary runs remain noninteractive. Scenarios that take foreground ownership run only with `--takeover`. Tests record refusal before mutation, the target's resulting value/state, and the harness's cursor/frontmost/Space invariants. Existing `e2e/focus.py`, `e2e/clicks.py`, and `e2e/parity.py` provide regression coverage. A structural AX guard checks the first 2,500 nodes and cannot prove pixel freshness in a custom-drawn surface; that limitation remains explicit in the capability profile and result. Synthetic event tests cannot establish real hardware input detection; the human-input monitor reports availability and classifies source-PID-zero events while ignoring our own tagged input.

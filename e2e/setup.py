@@ -238,9 +238,9 @@ def mcp_stdio_concurrent(ctx):
         "window_id": window["id"], "steps": [{"tool": "wait", "args": {"ms": 3000}}], "observe": "none"}})
     fast = rpc("fast", "tools/call", {"name": "status", "arguments": {}})
     started = time.time()
-    code, out, raw, err = stdio(ctx, [slow, fast], env={"SC_HOME": inst.home})
+    code, out, raw, err = stdio(ctx, [rpc("init", "initialize", INITIALIZE), slow, fast], env={"SC_HOME": inst.home})
     elapsed = time.time() - started
-    ids = [m.get("id") for m in out]
+    ids = [m.get("id") for m in out if m.get("id") != "init"]
     ctx.check("both requests are answered", sorted(map(str, ids)) == ["fast", "slow"], ids)
     ctx.check("requests are in flight concurrently: the fast answer is not held behind the slow one",
               ids[:1] == ["fast"], ids)

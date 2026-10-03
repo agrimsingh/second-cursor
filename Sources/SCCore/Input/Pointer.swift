@@ -29,16 +29,17 @@ enum Pointer {
     private static let offscreen = Location(screen: CGPoint(x: -1, y: -1), local: CGPoint(x: -1, y: -1))
 
     /// Each of these returns when its first event that can change anything (a press or a wheel tick) went out: the
-    /// app's answer can come before the call returns.
+    /// app's answer can come before the call returns. A refusal after partial dispatch still releases a held button.
     @discardableResult
     static func click(pid: pid_t, wid: CGWindowID, window: AXUIElement? = nil, at location: Location, button: MouseButton, count: Int,
-                      flags: CGEventFlags = []) -> Date {
+                      flags: CGEventFlags = []) throws -> Date {
+        try requireSupportedModifiers(flags)
         let both = !isBareSurface(pid: pid, wid: wid, window: window, at: location.screen)
-        return withFocus(pid: pid, wid: wid) {
+        return try withFocus(pid: pid, wid: wid) {
             switch button {
-            case .left: leftClick(pid: pid, wid: wid, at: location, count: count, flags: flags, both: both)
-            case .right: buttonClick(pid: pid, wid: wid, at: location, count: count, button: .right, flags: flags, both: both)
-            case .middle: buttonClick(pid: pid, wid: wid, at: location, count: count, button: .center, flags: flags, both: both)
+            case .left: return try leftClick(pid: pid, wid: wid, at: location, count: count, flags: flags, both: both)
+            case .right: return try buttonClick(pid: pid, wid: wid, at: location, count: count, button: .right, flags: flags, both: both)
+            case .middle: return try buttonClick(pid: pid, wid: wid, at: location, count: count, button: .center, flags: flags, both: both)
             }
         }
     }
@@ -47,115 +48,150 @@ enum Pointer {
     /// clicks, so selection, note drawing and slider moves work without the real cursor.
     @discardableResult
     static func drag(pid: pid_t, wid: CGWindowID, window: AXUIElement? = nil, from: Location, to: Location,
-                     flags: CGEventFlags = [], steps: Int = 16) -> Date {
+                     flags: CGEventFlags = [], steps: Int = 16) throws -> Date {
+        try requireSupportedModifiers(flags)
         let both = !isBareSurface(pid: pid, wid: wid, window: window, at: from.screen)
-        return withFocus(pid: pid, wid: wid) {
+        return try withFocus(pid: pid, wid: wid) {
             let source = CGEventSource(stateID: .hidSystemState)
             let group = clickGroupID()
-            func post(_ type: CGEventType, _ location: Location, clickState: Int64, delayMs: UInt32) {
-                guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: location.screen, mouseButton: .left)
-                else { return }
-                stamp(event, pid: pid, wid: wid, location: location, clickState: clickState, buttonNumber: 0, group: group)
-                event.flags = flags
-                deliver(event, pid: pid, both: both)
-                usleep(delayMs * 1000)
-            }
-            post(.mouseMoved, from, clickState: 0, delayMs: 15)
-            post(.leftMouseDown, offscreen, clickState: 1, delayMs: 1)
-            post(.leftMouseUp, offscreen, clickState: 1, delayMs: 100)
+            try postMovedPrimer(pid: pid, wid: wid, at: from, source: source, group: group, both: both)
+            _ = try postPair(pid: pid, wid: wid, at: offscreen, source: source, group: group,
+                             button: .left, clickState: 1, downPhase: 1, upPhase: 2, flags: [], both: both,
+                             downDelay: 1_000, upDelay: 100_000)
+            // Allocate the release before dispatching the down. Even allocation failure, pause, or human takeover
+            // during the drag must leave the app with its button released at the last point we actually delivered.
+            let release = try mouseEvent(.leftMouseUp, pid: pid, wid: wid, at: from, source: source,
+                                         group: group, button: .left, clickState: 1, flags: flags)
+            let down = try mouseEvent(.leftMouseDown, pid: pid, wid: wid, at: from, source: source,
+                                      group: group, button: .left, clickState: 1, flags: flags)
+            try NativeSafety.check(pid: pid, wid: wid, input: true)
+            var last = from
             let pressed = Date()
-            post(.leftMouseDown, from, clickState: 1, delayMs: 40)
+            deliver(down, pid: pid, both: both)
+            defer {
+                release.location = last.screen
+                stamp(release, pid: pid, wid: wid, location: last, clickState: 1, buttonNumber: 0, group: group)
+                // This is cleanup for an already-dispatched down, not a new action: never gate its release.
+                deliver(release, pid: pid, both: both)
+            }
+            usleep(40_000)
             let count = max(steps, 2)
             for step in 1...count {
                 let t = CGFloat(step) / CGFloat(count)
                 func lerp(_ a: CGPoint, _ b: CGPoint) -> CGPoint { CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t) }
-                post(.leftMouseDragged, Location(screen: lerp(from.screen, to.screen), local: lerp(from.local, to.local)), clickState: 1, delayMs: 12)
+                let location = Location(screen: lerp(from.screen, to.screen), local: lerp(from.local, to.local))
+                let event = try mouseEvent(.leftMouseDragged, pid: pid, wid: wid, at: location, source: source,
+                                          group: group, button: .left, clickState: 1, flags: flags)
+                try NativeSafety.check(pid: pid, wid: wid, input: true)
+                last = location
+                deliver(event, pid: pid, both: both)
+                usleep(12_000)
             }
-            post(.leftMouseUp, to, clickState: 1, delayMs: 0)
             return pressed
         }
     }
 
     /// SkyLight delivery is asynchronous: the target needs ~40 ms to take its synthetic focus, and keeps
     /// it ~100 ms after the last event so Chromium's renderer hop consumes the mouse-up before it goes.
-    private static func withFocus<T>(pid: pid_t, wid: CGWindowID, _ body: () -> T) -> T {
-        let handoff = SkyLight.focusWithoutRaise(pid: pid, wid: wid)
-        if handoff != nil { usleep(40_000) }
-        let result = body()
-        if let handoff {
-            usleep(100_000)
-            SkyLight.restore(handoff)
+    private static func withFocus<T>(pid: pid_t, wid: CGWindowID, _ body: () throws -> T) throws -> T {
+        try SkyLight.requirePointerSupport()
+        try NativeSafety.check(pid: pid, wid: wid, input: true)
+        let handoff = try SkyLight.focusWithoutRaise(pid: pid, wid: wid)
+        guard handoff != nil || SkyLight.isFront(pid: pid, wid: wid) else {
+            throw SCError.notAllowed("The target window could not receive safe background pointer focus. Read its state again or use a semantic AX action.")
         }
-        return result
+        defer {
+            if let handoff {
+                usleep(100_000)
+                SkyLight.restore(handoff)
+            }
+        }
+        if handoff != nil { usleep(40_000) }
+        try NativeSafety.check(pid: pid, wid: wid, input: true)
+        return try body()
     }
 
     /// Stamped mouseMoved, then a down/up primer at (-1,-1) that satisfies Chromium's
     /// user-activation gate (and absorbs AppKit's first-click) without hitting any element,
     /// then the real pairs.
-    private static func leftClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, flags: CGEventFlags, both: Bool) -> Date {
+    private static func leftClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, flags: CGEventFlags, both: Bool) throws -> Date {
         let source = CGEventSource(stateID: .hidSystemState)
         let group = clickGroupID()
+        let move = try mouseEvent(.mouseMoved, pid: pid, wid: wid, at: location, source: source,
+                                  group: group, button: .left, clickState: 0, flags: flags)
+        SkyLight.setField(move, Field.mouseEventNumber, 2)
+        try NativeSafety.check(pid: pid, wid: wid, input: true)
+        deliver(move, pid: pid, both: both)
+        usleep(15_000)
+        _ = try postPair(pid: pid, wid: wid, at: offscreen, source: source, group: group,
+                         button: .left, clickState: 1, downPhase: 1, upPhase: 2, flags: [], both: both,
+                         downDelay: 1_000, upDelay: 100_000)
         let pairs = min(max(count, 1), 3)
-        typealias Step = (type: CGEventType, location: Location, phase: Int64, clickState: Int64, delayMs: UInt32)
-        var steps: [Step] = [
-            (.mouseMoved, location, 2, 0, 15),
-            (.leftMouseDown, offscreen, 1, 1, 1),
-            (.leftMouseUp, offscreen, 2, 1, 100),
-        ]
-        let firstPress = steps.count
-        for pair in 1...pairs {
-            steps.append((.leftMouseDown, location, 3, Int64(pair), 1))
-            steps.append((.leftMouseUp, location, 3, Int64(pair), pair < pairs ? 80 : 0))
-        }
         var pressed = Date()
-        for (index, step) in steps.enumerated() {
-            guard let event = CGEvent(mouseEventSource: source, mouseType: step.type, mouseCursorPosition: step.location.screen, mouseButton: .left)
-            else { continue }
-            stamp(event, pid: pid, wid: wid, location: step.location, clickState: step.clickState, buttonNumber: 0, group: group)
-            SkyLight.setField(event, Field.mouseEventNumber, step.phase)
-            event.flags = step.location.screen == offscreen.screen ? [] : flags
-            if index == firstPress { pressed = Date() }
-            deliver(event, pid: pid, both: both)
-            if step.delayMs > 0 { usleep(step.delayMs * 1000) }
+        for pair in 1...pairs {
+            let pairPressed = try postPair(pid: pid, wid: wid, at: location, source: source, group: group,
+                                           button: .left, clickState: Int64(pair), downPhase: 3, upPhase: 3,
+                                           flags: flags, both: both, downDelay: 1_000, upDelay: pair < pairs ? 80_000 : 0)
+            if pair == 1 { pressed = pairPressed }
         }
         return pressed
     }
 
-    private static func buttonClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, button: CGMouseButton, flags: CGEventFlags, both: Bool) -> Date {
+    private static func buttonClick(pid: pid_t, wid: CGWindowID, at location: Location, count: Int, button: CGMouseButton, flags: CGEventFlags, both: Bool) throws -> Date {
         let source = CGEventSource(stateID: .hidSystemState)
         let group = clickGroupID()
-        let (down, up, number): (CGEventType, CGEventType, Int64) = button == .right
-            ? (.rightMouseDown, .rightMouseUp, 1) : (.otherMouseDown, .otherMouseUp, 2)
-        postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: group, both: both)
-        let pressed = Date()
+        try postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: group, both: both)
+        var pressed = Date()
         for pair in 1...min(max(count, 1), 3) {
-            for type in [down, up] {
-                guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: location.screen, mouseButton: button)
-                else { continue }
-                stamp(event, pid: pid, wid: wid, location: location, clickState: Int64(pair), buttonNumber: number, group: group)
-                event.flags = flags
-                deliver(event, pid: pid, both: both)
-                usleep(type == down ? 28_000 : 80_000)
-            }
+            let pairPressed = try postPair(pid: pid, wid: wid, at: location, source: source, group: group,
+                                           button: button, clickState: Int64(pair), flags: flags, both: both,
+                                           downDelay: 28_000, upDelay: 80_000)
+            if pair == 1 { pressed = pairPressed }
         }
+        return pressed
+    }
+
+    /// Construct both halves before the down. Once it is sent, the up is unconditional so a pause or takeover
+    /// cannot leave a control tracking a pressed button. The next pair must pass a fresh safety checkpoint.
+    private static func postPair(pid: pid_t, wid: CGWindowID, at location: Location, source: CGEventSource?, group: Int64,
+                                 button: CGMouseButton, clickState: Int64, downPhase: Int64? = nil, upPhase: Int64? = nil,
+                                 flags: CGEventFlags, both: Bool, downDelay: UInt32, upDelay: UInt32) throws -> Date {
+        let downType: CGEventType = button == .left ? .leftMouseDown : button == .right ? .rightMouseDown : .otherMouseDown
+        let upType: CGEventType = button == .left ? .leftMouseUp : button == .right ? .rightMouseUp : .otherMouseUp
+        let down = try mouseEvent(downType, pid: pid, wid: wid, at: location, source: source,
+                                  group: group, button: button, clickState: clickState, flags: flags)
+        let up = try mouseEvent(upType, pid: pid, wid: wid, at: location, source: source,
+                                group: group, button: button, clickState: clickState, flags: flags)
+        if let downPhase { SkyLight.setField(down, Field.mouseEventNumber, downPhase) }
+        if let upPhase { SkyLight.setField(up, Field.mouseEventNumber, upPhase) }
+        try NativeSafety.check(pid: pid, wid: wid, input: true)
+        let pressed = Date()
+        deliver(down, pid: pid, both: both)
+        if downDelay > 0 { usleep(downDelay) }
+        deliver(up, pid: pid, both: both)
+        if upDelay > 0 { usleep(upDelay) }
         return pressed
     }
 
     /// `ticks` wheel notches at `location`; positive `dy` reveals content above, positive `dx` content to the left.
     @discardableResult
-    static func scroll(pid: pid_t, wid: CGWindowID, at location: Location, dx: Int32, dy: Int32, ticks: Int) -> Date {
+    static func scroll(pid: pid_t, wid: CGWindowID, at location: Location, dx: Int32, dy: Int32, ticks: Int) throws -> Date {
+        try SkyLight.requirePointerSupport()
+        try NativeSafety.check(pid: pid, wid: wid, input: true)
         let source = CGEventSource(stateID: .hidSystemState)
-        postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: clickGroupID(), both: true)
-        let ticked = Date()
-        for _ in 0..<max(ticks, 1) {
+        try postMovedPrimer(pid: pid, wid: wid, at: location, source: source, group: clickGroupID(), both: true)
+        var ticked = Date()
+        for tick in 0..<max(ticks, 1) {
             guard let event = CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0)
-            else { continue }
+            else { throw SCError.actionFailed("Could not construct a scroll event; scrolling stopped.") }
             event.location = location.screen
             SkyLight.setWindowLocation(event, location.local)
             SkyLight.setField(event, Field.windowNumber, Int64(wid))
             SkyLight.setField(event, Field.windowUnderPointer, Int64(wid))
             SkyLight.setField(event, Field.windowUnderPointerThatCanHandle, Int64(wid))
             SkyLight.setField(event, Field.targetPID, Int64(pid))
+            try NativeSafety.check(pid: pid, wid: wid, input: true)
+            if tick == 0 { ticked = Date() }
             deliver(event, pid: pid, both: true)
             usleep(30_000)
         }
@@ -163,12 +199,29 @@ enum Pointer {
     }
 
     /// A window that never saw a move keeps stale cursor-tracking state and ignores the next down.
-    private static func postMovedPrimer(pid: pid_t, wid: CGWindowID, at location: Location, source: CGEventSource?, group: Int64, both: Bool) {
-        guard let event = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: location.screen, mouseButton: .left)
-        else { return }
-        stamp(event, pid: pid, wid: wid, location: location, clickState: 0, buttonNumber: 0, group: group)
+    private static func postMovedPrimer(pid: pid_t, wid: CGWindowID, at location: Location, source: CGEventSource?, group: Int64, both: Bool) throws {
+        let event = try mouseEvent(.mouseMoved, pid: pid, wid: wid, at: location, source: source,
+                                  group: group, button: .left, clickState: 0, flags: [])
+        try NativeSafety.check(pid: pid, wid: wid, input: true)
         deliver(event, pid: pid, both: both)
         usleep(12_000)
+    }
+
+    private static func mouseEvent(_ type: CGEventType, pid: pid_t, wid: CGWindowID, at location: Location,
+                                   source: CGEventSource?, group: Int64, button: CGMouseButton,
+                                   clickState: Int64, flags: CGEventFlags) throws -> CGEvent {
+        guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: location.screen, mouseButton: button)
+        else { throw SCError.actionFailed("Could not construct a pointer event; input stopped.") }
+        let number: Int64 = button == .left ? 0 : button == .right ? 1 : 2
+        stamp(event, pid: pid, wid: wid, location: location, clickState: clickState, buttonNumber: number, group: group)
+        event.flags = flags
+        return event
+    }
+
+    private static func requireSupportedModifiers(_ flags: CGEventFlags) throws {
+        guard flags.isEmpty else {
+            throw SCError.notAllowed("Background pointer modifiers cannot be delivered reliably. Use a semantic AX action or the browser backend.")
+        }
     }
 
     /// AppKit reads the hit point from the window location, which must be window-local: stamping
@@ -194,6 +247,7 @@ enum Pointer {
     /// a caret click lands twice in the same place), but a bare custom surface acts on every copy, so it gets only
     /// the public path (`isBareSurface`).
     private static func deliver(_ event: CGEvent, pid: pid_t, both: Bool) {
+        HumanInputMonitor.stamp(event)
         if both { SkyLight.post(event, to: pid, authenticated: false) }
         event.postToPid(pid)
     }

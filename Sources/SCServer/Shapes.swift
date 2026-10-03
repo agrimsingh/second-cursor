@@ -60,11 +60,24 @@ enum Shape {
     }
 
     static func action(_ result: ActionResult) -> [String: Any] {
-        ["ok": true, "route": result.route, "verified": result.verified ?? NSNull(), "note": result.note ?? NSNull()]
+        ["ok": true, "route": result.route, "verified": result.verified ?? NSNull(),
+         "uncertain": result.uncertain ?? false, "note": result.note ?? NSNull()]
     }
 
     static func screenshot(_ shot: Screenshot) -> [String: Any] {
-        ["width": shot.width, "height": shot.height, "scale": shot.scale]
+        var json: [String: Any] = ["width": shot.width, "height": shot.height, "scale": shot.scale]
+        if let freshness = shot.freshness { json["freshness"] = codable(freshness) }
+        return json
+    }
+
+    static func codable<T: Encodable>(_ value: T) -> Any {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(value),
+            let json = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        else { return NSNull() }
+        return json
     }
 
     static let ok: [String: Any] = ["ok": true]

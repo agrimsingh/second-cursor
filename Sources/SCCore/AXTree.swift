@@ -8,6 +8,7 @@ struct SnapshotElement {
     let role: String
     let inWebArea: Bool
     let key: String
+    let label: String
 }
 
 /// One shown element of a window's accessibility tree, in depth-first order.
@@ -129,6 +130,55 @@ struct TreeBuilder {
             pending.append(contentsOf: children.reversed())
         }
         return hasher.finalize()
+    }
+
+    /// Geometry, topology and non-editable content, excluding caret/focus/selection and editable values.
+    /// Rechecked before coordinate actions even when an app posts no AX notifications. Coordinates are local
+    /// to the window, so moving the whole window does not unnecessarily invalidate them.
+    static func layoutFingerprint(window: AXUIElement, maxNodes: Int = 2500) -> Int {
+        let attributes = [kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute,
+                          kAXPositionAttribute, kAXSizeAttribute, kAXChildrenAttribute, kAXEnabledAttribute,
+                          kAXModalAttribute]
+        let origin = window.frame?.origin ?? .zero
+        var hasher = Hasher()
+        var pending = [(window, 0)]
+        var visited = 0
+        while visited < maxNodes, let (element, depth) = pending.popLast() {
+            visited += 1
+            let values = element.attributes(attributes)
+            let role = values[0] as? String ?? ""
+            hasher.combine(depth)
+            hasher.combine(role)
+            // Document titles often include the edited value or a dirty marker. They are not hit targets.
+            if role != kAXWindowRole {
+                hasher.combine(values[1] as? String)
+                hasher.combine(values[2] as? String)
+            }
+            if !editableRoles.contains(role) { hasher.combine(AX.text(values[3])) }
+            if let point = AX.point(values[4]) {
+                hasher.combine(((point.x - origin.x) * 2).rounded())
+                hasher.combine(((point.y - origin.y) * 2).rounded())
+            }
+            if let size = AX.size(values[5]) {
+                hasher.combine((size.width * 2).rounded())
+                hasher.combine((size.height * 2).rounded())
+            }
+            hasher.combine((values[7] as? NSNumber)?.boolValue)
+            hasher.combine((values[8] as? NSNumber)?.boolValue)
+            let children = values[6] as? [AXUIElement] ?? []
+            hasher.combine(children.count)
+            if depth < 60 { pending.append(contentsOf: children.reversed().map { ($0, depth + 1) }) }
+        }
+        hasher.combine(pending.isEmpty)
+        return hasher.finalize()
+    }
+
+    static func currentIdentity(_ element: AXUIElement) -> (role: String, label: String, enabled: Bool?) {
+        let values = element.attributes([kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute,
+                                         "AXLabel", kAXPlaceholderValueAttribute, kAXEnabledAttribute])
+        return (values[0] as? String ?? "AXUnknown",
+                values[1...4].lazy.compactMap { $0 as? String }.first { !$0.isEmpty } ?? "",
+                (values[5] as? NSNumber)?.boolValue)
     }
 
     /// The role and attribute of the first element, in walk order from the window itself, whose title, value or
@@ -338,7 +388,7 @@ enum TreeRenderer {
             var line = String(repeating: "  ", count: max(0, node.indent - baseIndent))
             if node.indexed {
                 let index = table.index(forKey: node.key)
-                elements[index] = SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key)
+                elements[index] = SnapshotElement(element: node.element, role: node.role, inWebArea: node.inWebArea, key: node.key, label: node.label)
                 let bounds = node.frame.map { Rect(x: $0.minX-windowOrigin.x, y: $0.minY-windowOrigin.y, width: $0.width, height: $0.height) }
                 structured.append(ElementInfo(index: index, role: node.role, name: node.label, value: node.value.map { String($0.prefix(300)) }, bounds: bounds, actions: node.actions, states: node.states, valueLength: node.value?.utf16.count))
                 indexed += 1

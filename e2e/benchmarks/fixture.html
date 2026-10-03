@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Second Cursor benchmark fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f4f6f8; color: #182331; font: 17px/1.5 system-ui, sans-serif; }
+    main { width: 736px; margin: 40px auto; padding: 32px; background: white; border: 1px solid #c9d1d9; border-radius: 12px; }
+    h1 { margin: 0 0 12px; font-size: 27px; line-height: 1.25; }
+    p { margin: 0 0 20px; }
+    label { display: block; margin-bottom: 6px; font-weight: 600; }
+    input[type="text"], select { display: block; width: 100%; height: 44px; padding: 8px 10px; border: 1px solid #738194; border-radius: 5px; font: inherit; background: white; }
+    .field { margin-bottom: 20px; }
+    .checkbox { display: flex; align-items: center; gap: 10px; margin: 24px 0; }
+    input[type="checkbox"] { width: 22px; height: 22px; margin: 0; }
+    button { min-height: 44px; padding: 10px 18px; border: 1px solid #174997; border-radius: 6px; color: white; background: #1958b5; font: inherit; font-weight: 600; cursor: pointer; }
+    button:disabled { cursor: default; background: #65768d; border-color: #65768d; }
+    :focus-visible { outline: 3px solid #e29b00; outline-offset: 3px; }
+    [hidden] { display: none !important; }
+    .status { min-height: 30px; margin-top: 22px; font-weight: 600; }
+    canvas { display: block; width: 640px; height: 240px; border: 1px solid #738194; border-radius: 6px; touch-action: none; user-select: none; -webkit-user-select: none; }
+    .hint { font-size: 15px; color: #47586b; }
+  </style>
+</head>
+<body>
+  <main>
+    <section id="form-task" hidden aria-labelledby="form-title">
+      <h1 id="form-title">Create a dispatcher work order</h1>
+      <p>Enter <strong>Ada Lovelace</strong> as the name, choose the <strong>Priority</strong> route, confirm the details, then create the work order.</p>
+      <form id="work-order-form">
+        <div class="field">
+          <label for="dispatcher-name">Name</label>
+          <input id="dispatcher-name" name="name" type="text" autocomplete="off" required>
+        </div>
+        <div class="field">
+          <label for="route">Route</label>
+          <select id="route" name="route" required>
+            <option value="">Choose a route</option>
+            <option value="standard">Standard</option>
+            <option value="priority">Priority</option>
+          </select>
+        </div>
+        <label class="checkbox" for="confirm-details">
+          <input id="confirm-details" name="confirmed" type="checkbox" required>
+          Confirm details
+        </label>
+        <button id="create-work-order" type="submit">Create work order</button>
+      </form>
+      <p id="form-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="canvas-task" hidden aria-labelledby="canvas-title">
+      <h1 id="canvas-title">Draw the route</h1>
+      <p>Drag from the green start circle through both gray gates to the blue destination circle, then release.</p>
+      <canvas id="route-canvas" width="640" height="240" aria-label="Route drawing area: drag from the green circle at the left through both gray gates to the blue circle at the right"></canvas>
+      <p class="hint">Keep the pointer pressed for the entire route. Start and destination are centered vertically.</p>
+      <p id="canvas-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="dialog-task" hidden aria-labelledby="dialog-title">
+      <h1 id="dialog-title">Review a draft deletion</h1>
+      <p>Review the deletion and <strong>cancel once</strong>. Review it again and <strong>confirm once</strong> to delete the temporary draft.</p>
+      <button id="review-deletion" type="button">Review deletion</button>
+      <p id="dialog-status" class="status" role="status" aria-live="polite">The temporary draft exists.</p>
+    </section>
+  </main>
+
+  <script>
+    "use strict";
+
+    const requestedTask = new URLSearchParams(location.search).get("task") || "form";
+    const activeTask = ["form", "canvas", "dialog"].includes(requestedTask) ? requestedTask : "form";
+    document.getElementById(`${activeTask}-task`).hidden = false;
+    document.title = `Second Cursor benchmark: ${activeTask}`;
+
+    async function reportEvent(payload) {
+      const response = await fetch("/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) throw new Error(`Event recording failed (${response.status})`);
+    }
+
+    const form = document.getElementById("work-order-form");
+    const createButton = document.getElementById("create-work-order");
+    const formStatus = document.getElementById("form-status");
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (createButton.disabled) return;
+      const name = document.getElementById("dispatcher-name").value.trim();
+      const route = document.getElementById("route").value;
+      const confirmed = document.getElementById("confirm-details").checked;
+      if (name !== "Ada Lovelace" || route !== "priority" || !confirmed) {
+        formStatus.textContent = "Use Ada Lovelace, choose Priority, and confirm the details.";
+        return;
+      }
+      createButton.disabled = true;
+      formStatus.textContent = "Creating work order…";
+      try {
+        await reportEvent({ kind: "work_order", name, route, confirmed });
+        formStatus.textContent = "Work order created";
+      } catch (error) {
+        formStatus.textContent = error.message;
+      }
+    });
+
+    const canvas = document.getElementById("route-canvas");
+    const context = canvas.getContext("2d");
+    const canvasStatus = document.getElementById("canvas-status");
+    const start = { x: 80, y: 120 };
+    const destination = { x: 560, y: 120 };
+    const gates = [{ x: 240, y: 120 }, { x: 400, y: 120 }];
+    let stroke = null;
+    let reportingRoute = false;
+
+    function paintRoute(points = []) {
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.fillStyle = "#f8fafc";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.strokeStyle = "#c8d1dc";
+      context.setLineDash([7, 7]);
+      context.beginPath();
+      context.moveTo(start.x, start.y);
+      context.lineTo(destination.x, destination.y);
+      context.stroke();
+      context.setLineDash([]);
+      for (const gate of gates) {
+        context.fillStyle = "#d2d7de";
+        context.fillRect(gate.x - 25, gate.y - 30, 50, 60);
+        context.strokeStyle = "#687484";
+        context.strokeRect(gate.x - 25, gate.y - 30, 50, 60);
+      }
+      for (const marker of [{ ...start, color: "#218649", label: "START" }, { ...destination, color: "#2563bc", label: "FINISH" }]) {
+        context.beginPath();
+        context.arc(marker.x, marker.y, 26, 0, Math.PI * 2);
+        context.fillStyle = marker.color;
+        context.fill();
+        context.fillStyle = "#182331";
+        context.font = "bold 13px system-ui, sans-serif";
+        context.textAlign = "center";
+        context.fillText(marker.label, marker.x, marker.y + 49);
+      }
+      if (points.length > 0) {
+        context.beginPath();
+        context.moveTo(points[0].x, points[0].y);
+        for (const point of points.slice(1)) context.lineTo(point.x, point.y);
+        context.lineWidth = 4;
+        context.strokeStyle = "#a750ca";
+        context.stroke();
+        context.lineWidth = 1;
+      }
+    }
+
+    function pointerPosition(event) {
+      const rect = canvas.getBoundingClientRect();
+      // The border is excluded so canvas coordinates remain the drawn coordinates.
+      return {
+        x: (event.clientX - rect.left - canvas.clientLeft) * canvas.width / canvas.clientWidth,
+        y: (event.clientY - rect.top - canvas.clientTop) * canvas.height / canvas.clientHeight,
+      };
+    }
+
+    function near(point, target, radius) {
+      return Math.hypot(point.x - target.x, point.y - target.y) <= radius;
+    }
+
+    function segmentCrossesGate(a, b, gate) {
+      // Clip the actual pointer segment against the gate rectangle; a fast pointer
+      // may cross a gate between samples without ever producing a sample inside it.
+      let low = 0;
+      let high = 1;
+      for (const [axis, halfSize] of [["x", 25], ["y", 30]]) {
+        const delta = b[axis] - a[axis];
+        const minimum = gate[axis] - halfSize;
+        const maximum = gate[axis] + halfSize;
+        if (delta === 0) {
+          if (a[axis] < minimum || a[axis] > maximum) return false;
+        } else {
+          const first = (minimum - a[axis]) / delta;
+          const second = (maximum - a[axis]) / delta;
+          low = Math.max(low, Math.min(first, second));
+          high = Math.min(high, Math.max(first, second));
+          if (low > high) return false;
+        }
+      }
+      return true;
+    }
+
+    function validRoute(completedStroke) {
+      const points = completedStroke.points;
+      return completedStroke.moveSamples >= 5 && completedStroke.trusted &&
+        near(points[0], start, 30) && near(points[points.length - 1], destination, 30) &&
+        gates.every((gate) => points.slice(1).some((point, index) => segmentCrossesGate(points[index], point, gate)));
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || stroke !== null || reportingRoute) return;
+      event.preventDefault();
+      stroke = { pointerId: event.pointerId, points: [pointerPosition(event)], moveSamples: 0, trusted: event.isTrusted };
+      canvas.setPointerCapture(event.pointerId);
+      canvasStatus.textContent = "Drawing route…";
+      paintRoute(stroke.points);
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (stroke === null || stroke.pointerId !== event.pointerId) return;
+      event.preventDefault();
+      const coalesced = typeof event.getCoalescedEvents === "function" ? event.getCoalescedEvents() : [];
+      const samples = coalesced.length > 0 ? coalesced : [event];
+      for (const sample of samples) {
+        stroke.points.push(pointerPosition(sample));
+        stroke.moveSamples += 1;
+        stroke.trusted = stroke.trusted && sample.isTrusted;
+      }
+      paintRoute(stroke.points);
+    });
+
+    canvas.addEventListener("pointerup", async (event) => {
+      if (stroke === null || stroke.pointerId !== event.pointerId) return;
+      event.preventDefault();
+      stroke.points.push(pointerPosition(event));
+      stroke.trusted = stroke.trusted && event.isTrusted;
+      const completedStroke = stroke;
+      stroke = null;
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      paintRoute(completedStroke.points);
+      reportingRoute = true;
+      canvasStatus.textContent = "Checking route…";
+      try {
+        await reportEvent({ kind: "canvas_route", points: completedStroke.points, trusted: completedStroke.trusted });
+        canvasStatus.textContent = validRoute(completedStroke) ? "Route complete" : "Route incomplete. Try again.";
+      } catch (error) {
+        canvasStatus.textContent = error.message;
+      } finally {
+        reportingRoute = false;
+      }
+    });
+
+    canvas.addEventListener("pointercancel", (event) => {
+      if (stroke === null || stroke.pointerId !== event.pointerId) return;
+      stroke = null;
+      canvasStatus.textContent = "Route interrupted. Try again.";
+      paintRoute();
+    });
+    canvas.addEventListener("dragstart", (event) => event.preventDefault());
+    paintRoute();
+
+    const reviewButton = document.getElementById("review-deletion");
+    const dialogStatus = document.getElementById("dialog-status");
+    reviewButton.addEventListener("click", async () => {
+      if (reviewButton.disabled) return;
+      const accepted = window.confirm("Delete the temporary draft?");
+      reviewButton.disabled = true;
+      dialogStatus.textContent = accepted ? "Deleting draft…" : "Recording cancellation…";
+      try {
+        await reportEvent({ kind: accepted ? "draft_deleted" : "dialog_cancelled" });
+        dialogStatus.textContent = accepted ? "Draft deleted" : "Deletion cancelled. The temporary draft still exists.";
+        if (!accepted) reviewButton.disabled = false;
+      } catch (error) {
+        dialogStatus.textContent = error.message;
+      }
+    });
+  </script>
+</body>
+</html>

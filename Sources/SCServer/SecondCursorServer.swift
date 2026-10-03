@@ -18,7 +18,7 @@ public final class SecondCursorServer: @unchecked Sendable {
 
     public static let host = "127.0.0.1"
     public static let path = "/mcp"
-    static let version = "0.2.0"
+    static let version = "0.3.0"
 
     static let instructions = """
         Second Cursor operates macOS apps in the background without moving the user's cursor, \
@@ -79,10 +79,8 @@ public final class SecondCursorServer: @unchecked Sendable {
                         return .data(try JSONEncoder().encode(result),headers:["Content-Type":"application/json"])
                     } catch { return .error(statusCode:400,.invalidRequest("Malformed request: \(error.localizedDescription)")) }
                 }
-                Self.forwardCancellation(request, token: config.token, router: router)
-                let response = await Self.handle(
-                    request, pipeline: pipeline, router: router, tools: tools, instructions: instructions)
-                return Self.identifyingClient(response, to: request)
+                return await Self.handleMCP(request, token: config.token, pipeline: pipeline,
+                    router: router, tools: tools, instructions: instructions)
             }
         } catch let error as IOError where error.errnoCode == EADDRINUSE {
             throw StartError.portInUse(config.port)
@@ -106,7 +104,15 @@ public final class SecondCursorServer: @unchecked Sendable {
             if let refusal = validator.validate(request, context: context) { return refusal }
         }
         guard request.method == "POST" else { return .error(statusCode: 405, .invalidRequest("POST required")) }
-        var session = "legacy"
+        var session = ClientRequest.client(request.headers) ?? "legacy"
+        if session != "legacy" {
+            do { try router.sessions.validateTransport(session) }
+            catch Sessions.TransportValidationError.unknownOrClosed {
+                return .error(statusCode: 404, .invalidRequest("MCP session is unknown or closed"))
+            } catch {
+                return .error(statusCode: 500, .internalError("Could not renew MCP session; keep its ID and restore journal access"))
+            }
+        }
         if let body = request.body, !body.isEmpty {
             guard let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
                 return .error(statusCode: 400, .invalidRequest("Body must be a JSON object"))
@@ -120,6 +126,8 @@ public final class SecondCursorServer: @unchecked Sendable {
                 return .error(statusCode: 400, .invalidRequest("session_id must be a non-empty string"))
             }
         }
+        do { try router.sessions.validate(session) }
+        catch { return .error(statusCode: 404, .invalidRequest("Session is unknown or closed")) }
         let result = await router.endTurn(session: session)
         guard let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) else {
             return .error(statusCode: 500, .internalError("Could not encode the turn-ended result"))
@@ -142,20 +150,59 @@ public final class SecondCursorServer: @unchecked Sendable {
         }
     }
 
-    /// The transport is stateless, but an id a client echoes on every request tells its cancellations from another's.
-    private static func identifyingClient(_ response: HTTPResponse, to request: HTTPRequest) -> HTTPResponse {
-        guard case .data(let data, var headers) = response, let body = request.body,
-            (try? JSONSerialization.jsonObject(with: body) as? [String: Any])?["method"] as? String == "initialize"
+    /// HTTP connections are short-lived; the MCP header is the durable runtime ownership boundary.
+    /// An explicit tool session is a deliberate host override authorized by the local bearer token and
+    /// the opaque session ID. It is never substituted for or automatically closed with the transport.
+    private static func handleMCP(_ request: HTTPRequest, token: String,
+                                  pipeline: StandardValidationPipeline, router: ToolRouter,
+                                  tools: [Tool], instructions: String?) async -> HTTPResponse {
+        let context = HTTPValidationContext(httpMethod: request.method)
+        for validator: any HTTPRequestValidator in [OriginValidator.localhost(), StaticBearerTokenValidator(token: token)] {
+            if let refusal = validator.validate(request, context: context) { return refusal }
+        }
+        let body = request.body.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+        let initializing = body?["method"] as? String == "initialize" && request.method == "POST"
+        let existing = ClientRequest.client(request.headers)
+        if let existing {
+            do { try router.sessions.validateTransport(existing) }
+            catch Sessions.TransportValidationError.unknownOrClosed {
+                return .error(statusCode: 404, .invalidRequest(
+                    "MCP session is unknown or closed; initialize a new session explicitly. Do not retry an uncertain mutation."))
+            } catch {
+                return .error(statusCode: 500, .internalError("Could not renew MCP session; keep its ID and restore journal access"))
+            }
+        } else if !initializing {
+            return .error(statusCode: 400, .invalidRequest("Mcp-Session-Id is required; initialize first"))
+        }
+        if request.method == "DELETE", let existing {
+            do {
+                try await router.closeSession(session: existing)
+                return .ok()
+            } catch {
+                return .error(statusCode: 500, .internalError("Could not close MCP session"))
+            }
+        }
+        // Let MCP validate initialization before allocating a durable session. A malformed or unsupported
+        // initialize must not leak an unreachable session on disk.
+        Self.forwardCancellation(request, token: token, router: router)
+        let response = await handle(request, pipeline: pipeline, router: router, tools: tools,
+                                    instructions: instructions, session: existing)
+        guard initializing, case .data(let data, var headers) = response,
+              let reply = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], reply["result"] != nil
         else { return response }
-        headers[HTTPHeaderName.sessionID] = UUID().uuidString
-        return .data(data, headers: headers)
+        do {
+            headers[HTTPHeaderName.sessionID] = try existing ?? router.sessions.create(transport: true)
+            return .data(data, headers: headers)
+        } catch {
+            return .error(statusCode: 500, .internalError("Could not persist MCP session; no session was created"))
+        }
     }
 
     /// One MCP `Server` per HTTP request: the stateless transport keys in-flight requests by
     /// JSON-RPC id and a long-lived `Server` refuses a second `initialize`, so sharing one
     /// instance breaks reconnecting clients and collides ids across concurrent clients.
     private static func handle(_ request: HTTPRequest, pipeline: StandardValidationPipeline, router: ToolRouter,
-                               tools: [Tool], instructions: String?) async -> HTTPResponse {
+                               tools: [Tool], instructions: String?, session: String?) async -> HTTPResponse {
         let transport = StatelessHTTPServerTransport(validationPipeline: pipeline)
         let server = Server(
             name: "second-cursor",
@@ -167,7 +214,18 @@ public final class SecondCursorServer: @unchecked Sendable {
             ListTools.Result(tools: tools)
         }
         await server.withMethodHandler(CallTool.self) { params in
-            await router.call(name: params.name, arguments: params.arguments ?? [:])
+            guard let session else {
+                return CallTool.Result(content: [.text(text: "Initialize an MCP session before calling tools", annotations: nil, _meta: nil)], isError: true)
+            }
+            var arguments = params.arguments ?? [:]
+            if let explicit = arguments["session_id"], !explicit.isNull {
+                guard let id = explicit.stringValue, !id.isEmpty, id != "legacy" else {
+                    return CallTool.Result(content: [.text(text: "session_id must identify an explicit task session; legacy is reserved for /api", annotations: nil, _meta: nil)], isError: true)
+                }
+            } else {
+                arguments["session_id"] = .string(session)
+            }
+            return await router.call(name: params.name, arguments: arguments)
         }
         do {
             try await server.start(transport: transport)
