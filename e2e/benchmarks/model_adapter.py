@@ -30,7 +30,7 @@ class AdapterDeadline(AdapterInterrupted):
     pass
 
 
-def validate_request(request, engine):
+def validate_request(request, engine, model_host="codex"):
     if not isinstance(request, dict) or request.get("protocol") != report.CONTRACT:
         raise ValueError("Unsupported benchmark request")
     if (request.get("task_id") not in report.TASKS or not isinstance(request.get("prompt"), str)
@@ -41,6 +41,8 @@ def validate_request(request, engine):
     if request.get("engine") != engine + "-model":
         raise ValueError("Adapter backend disagrees with the requested engine")
     config = report.validate_model_config(request.get("model_config"))
+    if model_host not in report.MODEL_HOSTS or config.get("model_host", "codex") != model_host:
+        raise ValueError("Adapter model host differs from the requested configuration")
     if request.get("model") != config["model"] or request.get("timeout_seconds") != config["timeout_seconds"]:
         raise ValueError("Request model/budget disagrees with model configuration")
     if request.get("runner_sha256") != runner_fingerprint():
@@ -113,7 +115,8 @@ def validate_upfront_result(result):
 
 def run_adapter(request, args):
     started = time.monotonic()
-    config = validate_request(request, args.engine)
+    model_host = getattr(args, "model_host", "codex")
+    config = validate_request(request, args.engine, model_host)
     observation_mode, upfront_calls = observation_plan(request, args, config)
     catalog_mode = catalog_plan(request, args)
     if threading.current_thread() is not threading.main_thread() or signal.getitimer(signal.ITIMER_REAL)[0]:
@@ -198,9 +201,15 @@ def run_adapter(request, args):
         remaining = work_deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Engine setup exhausted the trial budget")
-        host = CodexModelHost(HostConfig(model=config["model"], reasoning_effort=config["reasoning_effort"],
+        host_config = HostConfig(model=config["model"], reasoning_effort=config["reasoning_effort"],
             max_steps=config["max_steps"] - len(upfront_calls), timeout_seconds=remaining,
-            model_host_version=config["model_host_version"], codex_binary=args.codex_binary))
+            model_host_version=config["model_host_version"], codex_binary=args.codex_binary)
+        if model_host == "cursor-sdk":
+            from benchmarks.cursor_model_host import CursorModelHost
+            host = CursorModelHost(host_config, model_params=config["model_params"],
+                                   node_binary=args.node_binary, sdk_root=args.cursor_sdk_root)
+        else:
+            host = CodexModelHost(host_config)
         host_offset = (time.monotonic() - started) * 1000
 
         def event(event):
@@ -268,10 +277,16 @@ def run_adapter(request, args):
                      final_response=data.get("final_response", ""), error=data.get("error"),
                      host_status=data["status"])
         identity_fields = ("model", "reasoning_effort", "model_host_version")
+        actual_identity = dict(data)
+        if model_host == "cursor-sdk":
+            identity_fields += ("model_host", "model_params")
+            isolated_identity = data.get("isolation") if isinstance(data.get("isolation"), dict) else {}
+            actual_identity.update({key: isolated_identity.get(key)
+                                    for key in ("model_host", "model_params")})
         if data["status"] == "completed":
-            if any(data.get(key) != config[key] for key in identity_fields):
+            if any(actual_identity.get(key) != config[key] for key in identity_fields):
                 raise ValueError("Actual model host identity differs from the pinned configuration")
-        elif any(data.get(key) is not None and data[key] != config[key] for key in identity_fields):
+        elif any(actual_identity.get(key) is not None and actual_identity[key] != config[key] for key in identity_fields):
             # Setup can fail before the host learns the provider model. Preserve
             # that root cause; a reported mismatch is additional failure evidence.
             final["identity_error"] = "Actual model host identity differs from the pinned configuration"
@@ -314,6 +329,9 @@ def run_adapter(request, args):
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--engine", required=True, choices=("second-cursor", "cua-driver"))
+    cli.add_argument("--model-host", choices=report.MODEL_HOSTS, default="codex")
+    cli.add_argument("--node-binary", default="node")
+    cli.add_argument("--cursor-sdk-root")
     cli.add_argument("--codex-binary", default="codex")
     cli.add_argument("--cua-binary", default="cua-driver")
     cli.add_argument("--observation-mode", choices=sorted(OBSERVATION_MODES), default="on-demand")

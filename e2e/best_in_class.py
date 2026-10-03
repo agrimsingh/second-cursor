@@ -26,6 +26,7 @@ TASKS = ("native_notes", "browser_work_order", "canvas_route", "transient_dialog
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 INTERFACE_TRACKS = ("native-tools", "screenshot-actions")
 MODEL_CONFIG_FIELDS = ("model", "reasoning_effort", "max_steps", "timeout_seconds", "model_host_version")
+MODEL_HOSTS = ("codex", "cursor-sdk")
 
 
 def finite_number(value, *, positive=False):
@@ -55,17 +56,61 @@ def validate_model_config(config):
         raise ValueError("Model timeout_seconds must be finite and positive")
     if not pinned_identifier(config["model_host_version"]):
         raise ValueError("Model configuration needs an explicit model_host_version fingerprint")
+    host = config.get("model_host", "codex")
+    if host not in MODEL_HOSTS:
+        raise ValueError("Unknown model host")
+    if host == "codex" and "model_params" in config:
+        raise ValueError("Codex does not accept Cursor model parameters")
+    if host == "cursor-sdk":
+        params = config.get("model_params")
+        if (not isinstance(params, dict) or any(not isinstance(key, str) or not key.strip()
+                or not isinstance(value, str) or not value.strip() for key, value in params.items())):
+            raise ValueError("Cursor model parameters must be a mapping of nonempty strings")
+        effort_keys = {"effort", "reasoning_effort"}.intersection(params)
+        if (len(effort_keys) != 1 or params[next(iter(effort_keys))] != config["reasoning_effort"]
+                or params.get("fast") not in {"true", "false"}):
+            raise ValueError("Cursor model parameters require exactly one matching effort or reasoning_effort and explicit fast=true|false")
+        # Parameter names differ across models. The live host catalog must
+        # validate every supplied and required parameter before starting a run.
     # Retain any additional model sampling settings, so comparison cannot silently
     # ignore a newly introduced setting that differs between the two runs.
     return dict(config)
 
 
+def parse_model_params(values):
+    params = {}
+    for item in values or []:
+        if not isinstance(item, str) or "=" not in item:
+            raise ValueError("Model parameters must be KEY=VALUE")
+        key, value = item.split("=", 1)
+        if not key.strip() or not value.strip() or key in params:
+            raise ValueError("Model parameters must have unique nonempty keys and values")
+        params[key] = value
+    return params
+
+
+def model_selection_for(args):
+    """Keep the legacy Codex configuration unchanged; pin Cursor's extra settings."""
+    host = getattr(args, "model_host", "codex")
+    if host not in MODEL_HOSTS:
+        raise ValueError("Unknown model host")
+    values = getattr(args, "model_param", None)
+    if host == "codex":
+        if values:
+            raise ValueError("Codex does not accept Cursor model parameters")
+        return {}
+    return {"model_host": host, "model_params": parse_model_params(values)}
+
+
 def model_config_for(args):
+    selection = model_selection_for(args)
     if not getattr(args, "model", None):
+        if selection:
+            raise ValueError("Cursor model trials require an explicit model")
         return None
     return validate_model_config({"model": args.model, "reasoning_effort": getattr(args, "reasoning_effort", None),
                                   "max_steps": getattr(args, "max_steps", None), "timeout_seconds": args.timeout,
-                                  "model_host_version": getattr(args, "model_host_version", None)})
+                                  "model_host_version": getattr(args, "model_host_version", None), **selection})
 
 
 def write_json(path, value):
@@ -560,6 +605,8 @@ def parser():
     task_cli.add_argument("--engine", default="second-cursor-scripted")
     task_cli.add_argument("--engine-version")
     task_cli.add_argument("--model")
+    task_cli.add_argument("--model-host", choices=MODEL_HOSTS, default="codex")
+    task_cli.add_argument("--model-param", action="append", help="Explicit Cursor model parameter KEY=VALUE; repeat per parameter")
     task_cli.add_argument("--reasoning-effort", choices=REASONING_EFFORTS,
                           help="Explicit model reasoning setting, required for model runs")
     task_cli.add_argument("--max-steps", type=int, default=40, help="Maximum total control-tool attempts per trial, including upfront observations")

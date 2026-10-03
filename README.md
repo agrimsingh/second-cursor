@@ -134,6 +134,8 @@ Desktop and browser acceptance suites run against a disposable test instance. Th
 
 `python3 e2e/model_efficiency.py --model gpt-6.1-sol --reasoning-effort high --rounds 5 --list` previews a separate Second Cursor experiment comparing observations requested by the model with observations supplied upfront. Remove `--list` to run ten fresh Calculator → TextEdit trials in alternating order. Both modes count every observation in time and call budgets, preserve independent outcome checks, and report the model's final-response delay separately when the tool trace proves the completed edit. See [the acceptance criteria](docs/acceptance-model-efficiency.md).
 
+The optional [Cursor model host](e2e/cursor_host/README.md) runs Grok 4.5/4.7 Fast through the same scoped driver and independent judges. It pins the SDK, complete model selection, and separate host identity. Grok 4.7 passed one native pilot; Grok 4.5 passed its transport smoke test. See [verification and limits](docs/verification-cursor-model-host-2026-10-04.md); these results do not establish a model ranking.
+
 Add `--experiment tool-surface` to compare full and compact catalogs with upfront observations enabled in both. The compact catalog represents actions through the complete batch schema and retains all observation tools; the engine still checks each nested action against its original allowlist. Results from the two experiments stay separate.
 
 ```bash

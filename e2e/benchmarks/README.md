@@ -4,7 +4,7 @@ Raw verification evidence under `build/` and `e2e/artifacts/` is local and Git-i
 
 ## Shared model runner
 
-`e2e/model_benchmark.py` runs Second Cursor and Cua Driver through the same Codex app-server host implementation, installed host binary, account, model, and reasoning setting. Each trial gets a fresh app-server process, ephemeral conversation, and disposable fixtures. The selected pilot configuration is `gpt-6.1-sol` with `high` reasoning. Cua Driver was updated to 0.33.0 for this comparison; every run records and checks the actual driver version.
+By default, `e2e/model_benchmark.py` runs Second Cursor and Cua Driver through the same Codex app-server host implementation, installed host binary, account, model, and reasoning setting. Each trial gets a fresh app-server process, ephemeral conversation, and disposable fixtures. The selected pilot configuration is `gpt-6.1-sol` with `high` reasoning. Cua Driver was updated to 0.33.0 for this comparison; every run records and checks the actual driver version. The optional [Cursor SDK host](../cursor_host/README.md) supports explicit Grok Fast variants with a separate pinned host/model identity; cross-driver comparisons still require identical configurations.
 
 From the repository root, inspect the exact schedule without starting a model or touching the desktop:
 

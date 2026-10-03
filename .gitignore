@@ -5,3 +5,4 @@ build/
 e2e/artifacts/
 e2e/.bin/
 __pycache__/
+e2e/cursor_host/node_modules/

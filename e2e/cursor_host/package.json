@@ -1,0 +1,8 @@
+{
+  "name": "second-cursor-benchmark-host",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test bridge.test.mjs" },
+  "engines": { "node": ">=22.13" },
+  "dependencies": { "@cursor/sdk": "1.0.35" }
+}

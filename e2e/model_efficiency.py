@@ -38,6 +38,10 @@ def parser():
     cli.add_argument("--experiment", choices=EXPERIMENTS, default="observations",
                      help="Vary initial observations, or hold upfront observations fixed and vary the advertised tool catalog")
     cli.add_argument("--model")
+    cli.add_argument("--model-host", choices=report.MODEL_HOSTS, default="codex")
+    cli.add_argument("--model-param", action="append", help="Explicit Cursor model parameter KEY=VALUE; repeat per parameter")
+    cli.add_argument("--node-binary", default=shutil.which("node") or "node")
+    cli.add_argument("--cursor-sdk-root", help="Directory containing the pinned Cursor SDK bridge and dependency install")
     cli.add_argument("--reasoning-effort", choices=report.REASONING_EFFORTS)
     cli.add_argument("--configured-model", action="store_true")
     cli.add_argument("--rounds", type=int, default=5, help="Matched pairs; each pair runs both profiles")

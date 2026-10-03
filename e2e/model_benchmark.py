@@ -27,7 +27,8 @@ def runner_fingerprint():
     digest = hashlib.sha256()
     for path in [ROOT / "model_benchmark.py", ROOT / "model_efficiency.py", ROOT / "best_in_class.py", ROOT / "run.py", ROOT / "start-browser.py",
                  *(ROOT / "benchmarks" / name for name in
-                 ("model_adapter.py", "model_host.py", "engines.py", "completion_timing.py", "tool_surface.py"))]:
+                 ("model_adapter.py", "model_host.py", "cursor_model_host.py", "engines.py", "completion_timing.py", "tool_surface.py")),
+                 *(ROOT / "cursor_host" / name for name in ("bridge.mjs", "package.json", "package-lock.json"))]:
         digest.update(path.relative_to(ROOT).as_posix().encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -39,6 +40,11 @@ def version(command):
     if result.returncode or not result.stdout.strip():
         raise ValueError(f"Cannot determine version of {command}")
     return result.stdout.strip()
+
+
+def cursor_host_version(*, sdk_root=None, node_binary="node"):
+    from benchmarks.cursor_model_host import host_version
+    return host_version(sdk_root=sdk_root, node_binary=node_binary)
 
 
 def configured_model():
@@ -59,6 +65,10 @@ def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--engine", choices=("both", "second-cursor", "cua-driver"), default="both")
     cli.add_argument("--model")
+    cli.add_argument("--model-host", choices=report.MODEL_HOSTS, default="codex")
+    cli.add_argument("--model-param", action="append", help="Explicit Cursor model parameter KEY=VALUE; repeat per parameter")
+    cli.add_argument("--node-binary", default=shutil.which("node") or "node")
+    cli.add_argument("--cursor-sdk-root", help="Directory containing the pinned Cursor SDK bridge and dependency install")
     cli.add_argument("--reasoning-effort", choices=report.REASONING_EFFORTS)
     cli.add_argument("--configured-model", action="store_true", help="Pin this user's configured Codex model and effort")
     cli.add_argument("--rounds", type=int, default=3)
@@ -80,15 +90,21 @@ def parser():
 
 
 def build_plan(args):
+    selection = report.model_selection_for(args)
+    host_kind = getattr(args, "model_host", "codex")
     if args.configured_model:
+        if host_kind != "codex":
+            raise ValueError("--configured-model is supported only for the Codex model host")
         if args.model or args.reasoning_effort:
             raise ValueError("Use either --configured-model or explicit --model/--reasoning-effort")
         args.model, args.reasoning_effort = configured_model()
     if args.rounds < 1 or args.seed < 0:
         raise ValueError("rounds must be positive and seed must be nonnegative")
-    host_version = version(args.codex_binary)
+    host_version = (cursor_host_version(sdk_root=getattr(args, "cursor_sdk_root", None),
+                                       node_binary=getattr(args, "node_binary", "node"))
+                    if host_kind == "cursor-sdk" else version(args.codex_binary))
     config = report.validate_model_config({"model": args.model, "reasoning_effort": args.reasoning_effort,
-        "max_steps": args.max_steps, "timeout_seconds": args.timeout, "model_host_version": host_version})
+        "max_steps": args.max_steps, "timeout_seconds": args.timeout, "model_host_version": host_version, **selection})
     engines = ["second-cursor", "cua-driver"] if args.engine == "both" else [args.engine]
     observation_mode = getattr(args, "observation_mode", "on-demand")
     catalog_mode = getattr(args, "catalog_mode", "full")
@@ -114,6 +130,10 @@ def build_plan(args):
             adapter = [sys.executable, str(ROOT / "benchmarks/model_adapter.py"), "--engine", engine,
                        "--codex-binary", args.codex_binary, "--cua-binary", args.cua_binary,
                        "--observation-mode", observation_mode, "--catalog-mode", catalog_mode]
+            if host_kind == "cursor-sdk":
+                adapter.extend(["--model-host", host_kind, "--node-binary", args.node_binary])
+                if args.cursor_sdk_root:
+                    adapter.extend(["--cursor-sdk-root", args.cursor_sdk_root])
             command = [sys.executable, str(ROOT / "best_in_class.py"), "tasks", "--rounds", "1",
                        "--adapter-command", json.dumps(adapter), "--engine", engine + "-model",
                        "--engine-version", identities[engine], "--model", config["model"],
@@ -124,6 +144,10 @@ def build_plan(args):
                        "--seed", str(args.seed + index),
                        "--headed-browser", "--native-placement", args.native_placement,
                        "--browser-identity", json.dumps(pinned_browser), "--adapter-browser"]
+            if host_kind == "cursor-sdk":
+                command.extend(["--model-host", host_kind])
+                for key, value in sorted(config["model_params"].items()):
+                    command.extend(["--model-param", f"{key}={value}"])
             for task in tasks:
                 command.extend(["--task", task])
             runs.append({"engine": engine, "round": index + 1, "case_seed": args.seed + index,
