@@ -27,10 +27,24 @@ python3 e2e/model_benchmark.py --engine second-cursor --task native_notes \
 
 For Grok 4.7, use `--model grok-4.7 --reasoning-effort medium` with
 `--model-param reasoning_effort=medium --model-param fast=true --model-param context=256k`.
+For Opus 5.5 Fast, use `--model claude-opus-5-5 --reasoning-effort low` with
+`--model-param effort=low --model-param fast=true --model-param context=300k`;
+change both effort arguments to `medium` for the medium configuration.
 Grok 4.5 uses `effort` and has no context parameter. The bridge requires every
 parameter exposed by the live catalog, rejects unknown settings and fallback
 models, and verifies the SDK's returned model selection. Add `--list` to inspect
 the prepared schedule without starting the model or desktop fixtures.
+
+To interleave both Opus configurations, use the model sweep:
+
+```sh
+python3 e2e/model_sweep.py --profile opus-5.5-fast-low \
+  --profile opus-5.5-fast-medium --rounds 3 --timeout 90 --list
+```
+
+Remove `--list` to run six native trials. For four browser trials, use the same
+profiles with `--rounds 1 --task browser_work_order --task transient_dialog`.
+The existing five Grok/Sol profiles remain the default when no `--profile` is given.
 
 The current benchmark contract supports models with an explicit `effort` or
 `reasoning_effort` parameter and an explicit Fast setting. Other Cursor parameter

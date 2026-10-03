@@ -49,6 +49,8 @@ class SweepTests(unittest.TestCase):
         plan = self.plan()
         self.assertEqual(plan["trial_count"], 10)
         self.assertEqual(plan["tasks"], ["native_notes"])
+        self.assertEqual(list(plan["profiles"]), ["grok-4.5-fast-low", "grok-4.5-fast-medium",
+                                               "grok-4.7-fast-medium", "sol-6.1-medium", "sol-6.1-high"])
         for profile, child in plan["profile_plans"].items():
             self.assertEqual(child["observation_mode"], "upfront")
             self.assertEqual(child["catalog_mode"], "full")
@@ -56,6 +58,49 @@ class SweepTests(unittest.TestCase):
             declared = sweep.PROFILES[profile]
             self.assertEqual(child["model_config"]["model"], declared["model"])
             self.assertEqual(child["model_config"].get("model_params", {}), declared.get("model_params", {}))
+
+    def test_selected_opus_profiles_pin_params_and_schedule_only_selection(self):
+        names = ["opus-5.5-fast-medium", "opus-5.5-fast-low"]
+        plan = self.plan("--profile", names[0], "--profile", names[1])
+        self.assertEqual(list(plan["profiles"]), names)
+        self.assertEqual(list(plan["profile_plans"]), names)
+        self.assertEqual(plan["trial_count"], 4)
+        self.assertEqual([item["profile"] for item in plan["runs"]], names + list(reversed(names)))
+        for name, effort in zip(names, ("medium", "low")):
+            config = plan["profile_plans"][name]["model_config"]
+            self.assertEqual(config["model_host"], "cursor-sdk")
+            self.assertEqual(config["model"], "claude-opus-5-5")
+            self.assertEqual(config["reasoning_effort"], effort)
+            self.assertEqual(config["model_params"], {"context": "300k", "effort": effort, "fast": "true"})
+
+    def test_selection_rejects_duplicates_unknowns_and_empty_profiles(self):
+        with self.assertRaises(ValueError):
+            self.plan("--profile", "opus-5.5-fast-low", "--profile", "opus-5.5-fast-low")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            sweep.parser().parse_args(["--profile", "unknown"])
+        for names in ([], ["unknown"], ["sol-6.1-high", "sol-6.1-high"]):
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                sweep.select_profiles(names)
+
+    def test_selected_profile_validation_rejects_missing_extra_and_changed_params(self):
+        names = ["opus-5.5-fast-low", "opus-5.5-fast-medium"]
+        plan = self.plan("--profile", names[0], "--profile", names[1])
+        for selected in (names[:1], names + ["sol-6.1-high"], list(reversed(names))):
+            with self.subTest(selected=selected), self.assertRaises(ValueError):
+                sweep.validate_profile_plans(plan["profile_plans"], selected)
+        for key, value in (("context", "1m"), ("effort", "high"), ("fast", "false")):
+            plans = copy.deepcopy(plan["profile_plans"])
+            plans[names[0]]["model_config"]["model_params"][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                sweep.validate_profile_plans(plans, names)
+
+    def test_selected_opus_child_cannot_change_params(self):
+        plan = self.plan("--profile", "opus-5.5-fast-low")
+        item = plan["runs"][0]
+        payload = self.payload(plan, item)
+        payload["model_config"]["model_params"]["fast"] = "false"
+        with self.assertRaises(ValueError):
+            sweep.validate_child(plan, item, payload, {"returncode": 0, "timed_out": False})
 
     def test_browser_selection_uses_on_demand_for_every_profile(self):
         plan = self.plan("--task", "native_notes", "--task", "browser_work_order")

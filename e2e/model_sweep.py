@@ -26,7 +26,13 @@ PROFILES = {
                              "model_params": {"reasoning_effort": "medium", "fast": "true", "context": "256k"}},
     "sol-6.1-medium": {"model_host": "codex", "model": "gpt-6.1-sol", "reasoning_effort": "medium"},
     "sol-6.1-high": {"model_host": "codex", "model": "gpt-6.1-sol", "reasoning_effort": "high"},
+    "opus-5.5-fast-low": {"model_host": "cursor-sdk", "model": "claude-opus-5-5", "reasoning_effort": "low",
+                          "model_params": {"context": "300k", "effort": "low", "fast": "true"}},
+    "opus-5.5-fast-medium": {"model_host": "cursor-sdk", "model": "claude-opus-5-5", "reasoning_effort": "medium",
+                             "model_params": {"context": "300k", "effort": "medium", "fast": "true"}},
 }
+DEFAULT_PROFILES = ("grok-4.5-fast-low", "grok-4.5-fast-medium", "grok-4.7-fast-medium",
+                    "sol-6.1-medium", "sol-6.1-high")
 VARYING_CONFIG = {"model_host", "model", "reasoning_effort", "model_params", "model_host_version"}
 MATCHED_FIELDS = ("engines", "selected_engines", "tasks", "runner_sha256", "trial_count", "interface_track",
                   "contract", "track", "native_placement", "browser_visibility", "browser_identity",
@@ -38,6 +44,9 @@ MEASUREMENTS = ("wall_ms", "tool_ms", "verified_completion_ms", "post_verificati
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--rounds", type=int, default=3)
+    cli.add_argument("--profile", action="append", choices=PROFILES,
+                     help="Run only these profiles, in the supplied order; repeat to select multiple. "
+                          "Defaults to the original five Grok/Sol profiles.")
     cli.add_argument("--task", action="append", choices=report.TASKS)
     cli.add_argument("--seed", type=int, default=1, help="First matched case identity, not a sampling seed")
     cli.add_argument("--native-placement", choices=("desktop", "agent-display", "textedit-off-space"), default="desktop")
@@ -61,13 +70,25 @@ def build_schedule(profiles, rounds, seed):
             for index in range(rounds) for profile in (names if index % 2 == 0 else list(reversed(names)))]
 
 
-def validate_profile_plans(plans):
+def select_profiles(names=None):
+    names = list(DEFAULT_PROFILES if names is None else names)
+    if not names or any(not isinstance(name, str) or name not in PROFILES for name in names):
+        raise ValueError("Select at least one known model profile")
+    if len(set(names)) != len(names):
+        raise ValueError("Selected model profiles must be unique")
+    return {name: copy.deepcopy(PROFILES[name]) for name in names}
+
+
+def validate_profile_plans(plans, profile_names=None):
+    profiles = select_profiles(profile_names)
+    if list(plans) != list(profiles):
+        raise ValueError("Profile plans must match the selected profiles and their order")
     baseline = next(iter(plans.values()))
     shared_config = {key: value for key, value in baseline["model_config"].items() if key not in VARYING_CONFIG}
     host_versions = {}
     for profile, plan in plans.items():
         config = report.validate_model_config(plan["model_config"])
-        expected = PROFILES[profile]
+        expected = profiles[profile]
         actual = {"model_host": config.get("model_host", "codex"), "model": config["model"],
                   "reasoning_effort": config["reasoning_effort"]}
         if "model_params" in config:
@@ -86,9 +107,10 @@ def validate_profile_plans(plans):
 
 
 def build_plan(args):
-    schedule = build_schedule(PROFILES, args.rounds, args.seed)
+    profiles = select_profiles(args.profile)
+    schedule = build_schedule(profiles, args.rounds, args.seed)
     plans = {}
-    for profile, config in PROFILES.items():
+    for profile, config in profiles.items():
         selected = copy.deepcopy(args)
         selected.engine = "second-cursor"
         selected.cua_binary = "cua-driver"
@@ -100,7 +122,7 @@ def build_plan(args):
         selected.reasoning_effort = config["reasoning_effort"]
         selected.model_param = [f"{key}={value}" for key, value in config.get("model_params", {}).items()]
         plans[profile] = pilot.build_plan(selected)
-    validate_profile_plans(plans)
+    validate_profile_plans(plans, profiles)
     baseline = next(iter(plans.values()))
     runs = []
     for slot in schedule:
@@ -110,7 +132,7 @@ def build_plan(args):
         runs.append({**item, **slot})
     return {**{field: copy.deepcopy(baseline[field]) for field in MATCHED_FIELDS},
             "kind": "model-host-sweep-plan", "comparison_axis": "model-plus-host",
-            "profiles": copy.deepcopy(PROFILES), "profile_plans": plans, "runs": runs,
+            "profiles": profiles, "profile_plans": plans, "runs": runs,
             "rounds": args.rounds, "trial_count": len(runs) * len(baseline["tasks"]),
             "note": "Model-plus-host comparison: Cursor SDK and Codex have different orchestration and tool framing. "
                     "Every trial starts fresh fixtures and a fresh host. Fixed tasks and case identities do not randomize "
