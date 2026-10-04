@@ -72,12 +72,20 @@
       <label for="ordinary-textarea">Delivery note</label>
       <textarea id="ordinary-textarea">SC_LABEL_PRIVACY_PUBLIC_NOTE</textarea>
     </div>
+    <div id="private-shadow" class="case"></div>
+    <div id="public-shadow" class="case"></div>
   </div>
   <script>
     // Preserve old markup values while clearing the live property, as a page can
     // do after consuming a credential. Reads must classify the value they emit.
     document.getElementById("cleared-input").value = "";
     document.getElementById("cleared-textarea").value = "";
+    // IDs are local to each shadow tree. A native sensitive label in one root
+    // must not hide an unrelated ordinary value in the other root.
+    document.getElementById("private-shadow").attachShadow({mode: "open"}).innerHTML =
+      '<label for="shadow-shared">Password</label><input id="shadow-shared" aria-label="Shadow account code" value="SC_LABEL_PRIVACY_SECRET_SHADOW_VALUE">';
+    document.getElementById("public-shadow").attachShadow({mode: "open"}).innerHTML =
+      '<label for="shadow-shared">Display name</label><input id="shadow-shared" aria-label="Shadow display name" value="SC_LABEL_PRIVACY_PUBLIC_SHADOW">';
   </script>
 </body>
 </html>

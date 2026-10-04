@@ -18,6 +18,7 @@
     {"id":"tasks","script":"best_in_class.py","args":["tasks"],"group":"quiet","format":"tasks","scenarios":["native_notes","browser_work_order","canvas_route","transient_dialog"]},
     {"id":"workspace-workflows","script":"workspace_workflows.py","args":["--seed","1"],"group":"quiet","format":"tasks","scenarios":["workspace_reconcile","workspace_handoff","workspace_recovery"]},
     {"id":"focus","script":"focus.py","group":"takeover","scenarios":["focus_native_actions","focus_concurrent_handoffs","focus_chrome_occluded","press_key_aliases"]},
+    {"id":"cross-app-interruptions","script":"cross_app_workflows.py","args":["--seed","73","--rounds","1","--mode","interleaved"],"group":"takeover","scenarios":["cross_app_interleaved_73"]},
     {"id":"same-app-focus","script":"benchmarks/native_attended.py","group":"takeover","scenarios":["native_input_ownership"]},
     {"id":"task-ui","script":"task_ui.py","args":["--ui"],"group":"takeover","scenarios":["task_panel_controls","task_panel_history","setup_panel_checks"]},
     {"id":"approvals","script":"review.py","group":"approvals","scenarios":["private_browser_access","approval_lifecycle"]},

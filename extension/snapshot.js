@@ -112,6 +112,41 @@ async function domFacts(send) {
       const pairs = nodes.attributes[node] ?? [];
       for (let k = 0; k < pairs.length; k += 2) if (strings[pairs[k]].toLowerCase() === name) return strings[pairs[k + 1]];
     };
+    // Option values may be absent from AX. Native/related labels, including
+    // superseded ones, come from AX name sources below: Chrome resolves their
+    // tree scope correctly, while DOMSnapshot flattens shadow roots away.
+    const descendants = nodes.parentIndex.map(() => []);
+    for (let node = 0; node < nodes.parentIndex.length; node++) {
+      const parent = nodes.parentIndex[node];
+      if (parent >= 0) descendants[parent].push(node);
+    }
+    const textContent = (node) => nodes.nodeType[node] === 3
+      ? strings[nodes.nodeValue?.[node]] ?? ""
+      : descendants[node].map(textContent).join("");
+    const sensitivityName = (node) => [attr(node, "aria-label"), attr(node, "placeholder"), attr(node, "title")]
+      .filter(Boolean).join(" ");
+    const sensitiveSelects = new Set();
+    for (let node = 0; node < nodes.parentIndex.length; node++) {
+      const tag = strings[nodes.nodeName[node]];
+      if (!["INPUT", "TEXTAREA", "SELECT"].includes(tag)) continue;
+      if (isSecretField({ type: attr(node, "type"), autocomplete: attr(node, "autocomplete"),
+        name: sensitivityName(node), value: "present" })) {
+        note(nodes.backendNodeId[node], { secret: true });
+        if (tag === "SELECT") sensitiveSelects.add(node);
+      }
+    }
+    const selected = new Set(nodes.optionSelected?.index ?? []);
+    for (let node = 0; node < nodes.parentIndex.length; node++) {
+      if (strings[nodes.nodeName[node]] !== "OPTION") continue;
+      let owner = nodes.parentIndex[node];
+      while (owner >= 0 && strings[nodes.nodeName[owner]] !== "SELECT") owner = nodes.parentIndex[owner];
+      const value = attr(node, "value") ?? textContent(node);
+      if (!sensitiveSelects.has(owner) && !isSecretField({ value })) continue;
+      note(nodes.backendNodeId[node], { secret: true });
+      // A mixed select keeps its ordinary choices readable; only its selected
+      // value is masked when a sensitive option is selected.
+      if (owner >= 0 && selected.has(node)) note(nodes.backendNodeId[owner], { secretValue: true });
+    }
     const cursor = (node) => {
       for (let n = node; n >= 0; n = nodes.parentIndex[n]) if (box.has(n)) return style(n, 0);
       return "";
@@ -129,8 +164,6 @@ async function domFacts(send) {
       // The cursor is inherited, so only the element that sets it is the target, unless it listens itself.
       if ((style(node, 0) === "pointer" && (listens.has(node) || cursor(parent) !== "pointer")) || attr(node, "onclick") !== undefined)
         note(nodes.backendNodeId[node], { hint: "clickable" });
-      if ((tag === "INPUT" || tag === "TEXTAREA") && isSecretField({ type: attr(node, "type"), autocomplete: attr(node, "autocomplete") }))
-        note(nodes.backendNodeId[node], { secret: true });
       const [x, y, width, height] = layout.bounds[box.get(node)];
       if (tag === "IFRAME" && (width <= 2 || height <= 2)) note(nodes.backendNodeId[node], { tiny: true });
       // The page's own scrolling belongs to the viewport, not to <html> or <body>.
@@ -166,12 +199,22 @@ function annotate(node, byId, inControl = false, inSecret = false) {
   const role = node.role?.value ?? "";
   const native = isNative(node, role);
   if (node.hint && (node.ignored || inControl || native || NOT_REFERENCEABLE.has(role) || role === "LabelText")) node.hint = "";
-  if (isSecretField({ name: node.name?.value, value: node.value?.value })) node.secret = true;
+  // Keep superseded but valid naming sources as sensitivity evidence. Chrome
+  // may omit DOM facts during a detach; the AX sources still protect values.
+  const sourceNames = (node.name?.sources ?? []).filter(source => !source.invalid).flatMap(source => [
+    source.value?.value, ...(source.value?.relatedNodes ?? []).map(related => related.text),
+    ...(source.nativeSourceValue?.relatedNodes ?? []).map(related => related.text),
+    source.attribute === "aria-label" ? source.attributeValue?.value : "",
+  ]);
+  const name = [node.name?.value, ...sourceNames].filter(Boolean).join(" ");
+  const field = ["textbox", "searchbox", "combobox", "PopUpButton", "listbox", "spinbutton"].includes(role);
+  if (isSecretField({ name, value: node.value?.value }) || (field && isSecretField({ name, value: "present" }))) node.secret = true;
   node.withinSecret = inSecret;
   for (const child of children(node, byId)) annotate(child, byId, inControl || native, inSecret || !!node.secret);
 }
 
-const redact = (node, value) => (value && node.secret ? REDACTED : value);
+const redact = (node, value) => (value && (node.secret || node.secretValue || node.withinSecret) ? REDACTED : value);
+const readName = (node, value) => value && node.secret && ["option", "MenuListOption"].includes(node.role?.value) ? REDACTED : value;
 
 // Containers whose line a repeated name may drop; landmarks, lists, tables and headings always keep theirs.
 const WRAPPERS = new Set(["group", "generic", "region", "article", "listitem", "figure", "section"]);
@@ -186,6 +229,7 @@ function hasControlInside(node, byId) {
 
 function visibleText(node, byId, out = []) {
   for (const child of children(node, byId)) {
+    if (child.secret || child.withinSecret) continue;
     const role = child.role?.value ?? "";
     if (SKIPPED.has(role)) continue;
     if (role === "StaticText") {
@@ -208,6 +252,7 @@ const joinTexts = (texts) =>
 
 /** A control with no controls inside keeps its accessible name and useful visible text on one line. */
 function controlLabel(node, byId) {
+  if (node.secret) return readName(node, clean(node.name?.value, MAX_CONTROL_TEXT));
   const texts = visibleText(node, byId);
   const name = clean(node.name?.value, Infinity);
   if (!texts.length) return clean(name, MAX_CONTROL_TEXT);
@@ -262,7 +307,7 @@ export function renderOutline(nodes) {
   // not repeated below it.
   const visit = (node, depth, context) => {
     const role = node.role?.value ?? "";
-    if (SKIPPED.has(role)) return [];
+    if (SKIPPED.has(role) || node.withinSecret) return [];
     const inside = (d, c) => mergeText(children(node, byId).flatMap((child) => visit(child, d, c)));
     // A frame's document reads as the content of its iframe line.
     if (node.ignored || (role === "RootWebArea" && node !== root)) return inside(depth, context);
@@ -274,7 +319,7 @@ export function renderOutline(nodes) {
       const label = node.value?.value && property(node, "editable") ? clean(node.name?.value, MAX_CONTROL_TEXT) : controlLabel(node, byId);
       return [line(node, role, depth, label, true)];
     }
-    const name = clean(node.name?.value);
+    const name = readName(node, clean(node.name?.value));
     if (role === "StaticText") return name && !context.includes(name) ? [line(node, role, depth, name, false)] : [];
     if ((role === "image" || role === "img") && !name) return [];
     if (!interactive && !name && !STRUCTURAL.has(role)) return inside(depth, context);
@@ -395,7 +440,7 @@ export async function structuredSnapshot(tabId) {
   const elements=nodes.filter(n=>!n.ignored&&n.backendDOMNodeId&&!n.withinSecret).map(n=>{
     const value=redact(n,String(n.value?.value??""));
     return {
-      ref:n.ref,role:n.role?.value??"",name:n.name?.value??"",value:value.slice(0,300),
+      ref:n.ref,role:n.role?.value??"",name:readName(n,n.name?.value??""),value:value.slice(0,300),
       value_length:value.length,
       states:Object.fromEntries(["disabled","focused","selected","expanded","checked","editable"].map(k=>[k,property(n,k)??null])),
       actions:isInteractive(n,n.role?.value)?["click",...(property(n,"editable")?["fill","type","select_text"]:[])]:[]

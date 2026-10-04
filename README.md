@@ -161,12 +161,13 @@ python3 e2e/transport_recovery.py  # automatic MCP sessions and durable operatio
 python3 e2e/native_safety.py   # native capabilities and stale-layout/input refusals
 python3 e2e/text_batch.py      # native selection, insertion, Unicode and interruption guards
 python3 e2e/invoice_workflow.py # kill/restart the SDK after a real invoice submission
+python3 e2e/cross_app_workflows.py --takeover --seed 73 --rounds 3 # browser -> existing native document amid synthetic foreground activity
 node --test sdk/agent-recovery.test.mjs # checkpoint durability and refusal/recovery cases, no GUI
 python3 e2e/browser_reliability.py # freshness, hover, verified form state, settling
 python3 e2e/browser_target_contracts.py # editable focus, iframe/shadow targets, dropdown contracts
 python3 e2e/browser_command_contracts.py # public argument schema and semantic locator contracts
 python3 e2e/browser_role_properties.py # seeded HTML/AX parity and stale-reference action sequences
-python3 e2e/browser_label_privacy.py # synthetic label/option redaction across DOM read paths
+python3 e2e/browser_label_privacy.py # synthetic label/option redaction across DOM and AX snapshot read paths
 node --test e2e/extension_tests/*.test.mjs # isolated browser logic regressions, no GUI
 python3 e2e/release_setup.py   # portable bundle, setup diagnostics and disposable browser check
 python3 e2e/task_ui.py --ui   # deliberately opens the disposable Tasks and Setup panels
@@ -174,6 +175,8 @@ python3 e2e/focus.py --takeover   # focus safety; takes focus and covers the scr
 ```
 
 Background suites put fixture windows on the agent display. `focus.py --takeover`, `native_safety.py --takeover`, `task_ui.py --ui`, `setup.py --ui`, and `run.py --on-screen` explicitly permit foreground fixture activity. Run those attended checks separately from unattended timing measurements.
+
+The cross-app suite uses a visible isolated browser, a disposable TextEdit document with existing content, and two foreground canary editors. Its seeded schedule switches canary windows and inserts synthetic text while the public-tool driver reconciles a stale invoice, handles unavailable save confirmation, pauses/resumes, preserves an external document edit, and saves the derived summary. `--mode recovery`, `--mode pause-resume`, and `--mode stale-plan` isolate the stages; the default `--mode interleaved` combines them and discards a native append acknowledgement to exercise journal reconciliation. Event-based focus/text checks detect transient corruption, and an independent judge reads the browser ledger and saved native file. Run it only while away from the Mac; synthetic in-process activity does not establish physical human-input detection or model reasoning quality. See [the acceptance scope](docs/acceptance-cross-app-workflows.md) and [the 12-case verification](docs/verification-cross-app-workflows-2026-10-05.md). It is also available as `best_in_class.py gate --profile release --suite cross-app-interruptions --takeover`.
 
 `SC_E2E_APP=build/SecondCursor.app` tests another bundle, and `--installed` targets your running app instead (opt-in). `python3 e2e/setup.py` runs `install-mcp` against a temporary `HOME` and checks that your real client configs are unchanged.
 

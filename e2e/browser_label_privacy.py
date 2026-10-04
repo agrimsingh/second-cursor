@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live privacy regressions through nested public browser_command arguments.
+"""Live privacy regressions through public DOM and AX browser reads.
 
 Only disposable synthetic values are used. All calls after opening the fixture
 are reads; no evaluation, raw CDP, or fixture mutation is injected. Full results
@@ -23,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 PUBLIC_INPUT = "SC_LABEL_PRIVACY_PUBLIC_INPUT"
 PUBLIC_NOTE = "SC_LABEL_PRIVACY_PUBLIC_NOTE"
 PUBLIC_OPTION = "SC_LABEL_PRIVACY_PUBLIC_STANDARD"
+PUBLIC_SHADOW = "SC_LABEL_PRIVACY_PUBLIC_SHADOW"
 
 
 def fingerprints():
@@ -54,6 +55,22 @@ class Evidence:
         self.data["calls"].append(entry)
         try:
             result = self.ctx.call("browser_command", **arguments)
+        except ToolError as error:
+            entry["error"] = str(error)
+            self.private(label + " error", str(error))
+            self.check(label + " completes successfully", False, str(error))
+            return None
+        entry["result"] = result
+        self.private(label, result)
+        return result
+
+    def snapshot(self, tab, *, structured):
+        label = "structured AX snapshot" if structured else "AX outline snapshot"
+        arguments = {"tab_id": tab, "full": True, "structured": structured}
+        entry = {"label": label, "tool": "browser_snapshot", "arguments": arguments}
+        self.data["calls"].append(entry)
+        try:
+            result = self.ctx.call("browser_snapshot", **arguments)
         except ToolError as error:
             entry["error"] = str(error)
             self.private(label + " error", str(error))
@@ -137,8 +154,43 @@ def browser_label_sources_and_option_reads_preserve_privacy(ctx):
     evidence = Evidence(ctx)
     try:
         with FixtureServer() as base:
-            tab = ctx.call("browser_open", url=base + "/browser-label-privacy.html")["tab"]["id"]
+            opened = ctx.call("browser_open", url=base + "/browser-label-privacy.html")
+            tab = opened["tab"]["id"]
             ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tab))
+            evidence.data["calls"].append({"label": "open fixture", "tool": "browser_open", "result": opened})
+            evidence.private("browser_open initial observation", opened)
+            for structured in (False, True):
+                ax = evidence.snapshot(tab, structured=structured)
+                if ax is None:
+                    continue
+                evidence.check("AX outline preserves ordinary input and textarea values",
+                               PUBLIC_INPUT in ax.get("outline", "") and PUBLIC_NOTE in ax.get("outline", ""))
+                evidence.check("AX outline preserves the ordinary value beside a separately labelled shadow tree",
+                               PUBLIC_SHADOW in ax.get("outline", ""))
+                if not structured:
+                    continue
+                rows = ax.get("elements", [])
+                for name in ("Account nickname", "Account code", "Account alias", "Shadow account code"):
+                    fields = [row for row in rows if row.get("role") == "textbox" and row.get("name") == name]
+                    evidence.check("AX " + name + " keeps its public name and masks its value",
+                                   len(fields) == 1 and fields[0].get("value") == "[redacted]"
+                                   and fields[0].get("value_length") == len("[redacted]"), fields)
+                shadow_fields = [row for row in rows if row.get("role") == "textbox" and row.get("name") == "Shadow display name"]
+                evidence.check("AX native labels do not cross separate shadow trees with duplicate local IDs",
+                               len(shadow_fields) == 1 and shadow_fields[0].get("value") == PUBLIC_SHADOW, shadow_fields)
+                for name in ("Archived account code", "Archived recovery text"):
+                    fields = [row for row in rows if row.get("role") == "textbox" and row.get("name") == name]
+                    evidence.check("AX " + name + " preserves its cleared live value",
+                                   len(fields) == 1 and fields[0].get("value") == "", fields)
+                for name in ("Card number", "Payment choice", "Shipping route"):
+                    fields = [row for row in rows if row.get("role") == "listbox" and row.get("name") == name]
+                    evidence.check("AX " + name + " retains its public select identity", len(fields) == 1, fields)
+                evidence.check("AX mixed select preserves its ordinary selected option",
+                               any(row.get("role") in ("option", "MenuListOption") and row.get("name") == "Standard shipping"
+                                   and row.get("states", {}).get("selected") is True for row in rows), rows)
+                evidence.check("AX mixed select masks the sensitive unselected option name",
+                               any(row.get("role") in ("option", "MenuListOption") and row.get("name") == "[redacted]"
+                                   and row.get("states", {}).get("selected") is False for row in rows), rows)
             tree = evidence.command(tab, "dom_snapshot", "whole DOM snapshot")
             if tree is not None:
                 rows = tree.get("elements", [])
