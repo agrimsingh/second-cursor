@@ -164,6 +164,9 @@ python3 e2e/invoice_workflow.py # kill/restart the SDK after a real invoice subm
 node --test sdk/agent-recovery.test.mjs # checkpoint durability and refusal/recovery cases, no GUI
 python3 e2e/browser_reliability.py # freshness, hover, verified form state, settling
 python3 e2e/browser_target_contracts.py # editable focus, iframe/shadow targets, dropdown contracts
+python3 e2e/browser_command_contracts.py # public argument schema and semantic locator contracts
+python3 e2e/browser_role_properties.py # seeded HTML/AX parity and stale-reference action sequences
+python3 e2e/browser_label_privacy.py # synthetic label/option redaction across DOM read paths
 node --test e2e/extension_tests/*.test.mjs # isolated browser logic regressions, no GUI
 python3 e2e/release_setup.py   # portable bundle, setup diagnostics and disposable browser check
 python3 e2e/task_ui.py --ui   # deliberately opens the disposable Tasks and Setup panels
@@ -173,6 +176,8 @@ python3 e2e/focus.py --takeover   # focus safety; takes focus and covers the scr
 Background suites put fixture windows on the agent display. `focus.py --takeover`, `native_safety.py --takeover`, `task_ui.py --ui`, `setup.py --ui`, and `run.py --on-screen` explicitly permit foreground fixture activity. Run those attended checks separately from unattended timing measurements.
 
 `SC_E2E_APP=build/SecondCursor.app` tests another bundle, and `--installed` targets your running app instead (opt-in). `python3 e2e/setup.py` runs `install-mcp` against a temporary `HOME` and checks that your real client configs are unchanged.
+
+The seeded browser properties compare generated HTML against Chrome's accessibility tree and exercise old references after nodes are replaced, removed, or renamed. Failures retain their seed and action sequence; this bounded generator has no automatic shrinking. See [the browser property verification](docs/verification-browser-properties-2026-10-05.md) for the bug it exposed and the separate model rerun.
 
 `python3 e2e/agent_smoke.py --run` checks that a real model can use the tools. It has the Cursor Agent CLI compute 7 × 6 in Calculator and append the result to a TextEdit window, through a project-level MCP config that points at a test instance, then verifies the result independently. The fixture windows open on the agent display, off your screen. Each report splits the agent loop into model time and tool time. `--models gemini-3.8-flash-medium,composer-2.5-fast --repeat 3` compares models and writes `e2e/artifacts/agent-compare-<ts>.md`. It spends model usage, so without `--run` it only prints what it would do.
 

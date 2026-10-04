@@ -94,6 +94,7 @@ class HostResult:
     error: str | None = None
     isolation: dict[str, Any] = dataclasses.field(default_factory=dict)
     milestones_ms: dict[str, float] = dataclasses.field(default_factory=dict)
+    tool_telemetry: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -157,6 +158,138 @@ def tool_response(result: Any) -> dict[str, Any]:
     if not items:
         items = [{"type": "inputText", "text": "(empty tool response)"}]
     return {"success": not bool(result.get("isError", False)), "contentItems": items}
+
+
+class _ToolTelemetry:
+    """Observe app-server tool lifecycles without creating actuator measurements.
+
+    A dynamic item ID is correlated only when it exactly matches a callback call
+    ID, tool name and arguments. Unmatched identities never imply extra driver
+    calls or a known total. Generic notifications/config/reasoning are excluded.
+    """
+    def __init__(self, emit: Callable[[dict[str, Any]], None]):
+        self.emit = emit
+        self.items: dict[str, dict[str, Any]] = {}
+        self.callbacks: dict[str, dict[str, Any]] = {}
+        self.seen: set[str] = set()
+        self.problems: set[str] = set()
+
+    @staticmethod
+    def arguments(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError:
+                pass
+        return value
+
+    def callback(self, call_id: str, name: str, arguments: dict[str, Any], status: str) -> None:
+        if call_id not in self.callbacks:
+            # Scoped engines may sanitize arguments in place. Freeze the model's
+            # original JSON identity before dispatch, preserving JSON value types.
+            self.callbacks[call_id] = {"name": name, "arguments_json": json.dumps(
+                arguments, sort_keys=True, allow_nan=False)}
+        self.callbacks[call_id]["status"] = status
+
+    def observe(self, item: dict[str, Any], phase: str, at_ms: float) -> None:
+        item_id, name = item.get("id"), item.get("tool")
+        event = {"type": "host_tool", "phase": phase, "item_id": item_id,
+                 "name": name, "namespace": item.get("namespace"),
+                 "arguments": self.arguments(item.get("arguments")),
+                 "status": item.get("status"), "success": item.get("success"),
+                 "duration_ms": item.get("durationMs")}
+        # Keep diagnostic tool text, never arbitrary host fields or image/audio
+        # payloads. Callback evidence already retains actuator output in full.
+        content = item.get("contentItems")
+        if isinstance(content, list):
+            event["output_text"] = [entry["text"][:4000] for entry in content[:32]
+                                    if isinstance(entry, dict) and entry.get("type") == "inputText"
+                                    and isinstance(entry.get("text"), str)]
+            event["output_content_types"] = [entry.get("type") for entry in content[:32]
+                                             if isinstance(entry, dict) and isinstance(entry.get("type"), str)]
+        try:
+            fingerprint = json.dumps(event, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError):
+            self.problems.add("malformed_dynamic_item")
+            self.emit({"type": "host_tool", "phase": phase, "at_ms": at_ms,
+                       "telemetry_error": "Malformed dynamic tool item; outcome unknown"})
+            return
+        if fingerprint in self.seen:
+            return
+        self.seen.add(fingerprint)
+        self.emit({**event, "at_ms": at_ms})
+        if not isinstance(item_id, str) or not item_id or not isinstance(name, str) or not name:
+            self.problems.add("unidentified_dynamic_item")
+            return
+        if (event["namespace"] is not None and not isinstance(event["namespace"], str)
+                or event["success"] is not None and type(event["success"]) is not bool):
+            self.problems.add("malformed_dynamic_item")
+        identity = {"name": name, "namespace": None if event["namespace"] == "" else event["namespace"],
+                    "arguments_json": json.dumps(event["arguments"], sort_keys=True, allow_nan=False)}
+        record = self.items.setdefault(item_id, {**identity, "terminal": None, "error_observed": False})
+        if any(record[key] != value for key, value in identity.items()):
+            self.problems.add("dynamic_item_identity_conflict")
+        if phase == "completed":
+            terminal = {key: event[key] for key in ("status", "success")}
+            if record["terminal"] is not None and record["terminal"] != terminal:
+                self.problems.add("dynamic_item_terminal_conflict")
+            record["error_observed"] |= terminal["status"] == "failed" or terminal["success"] is False
+            record["terminal"] = terminal
+
+    def summary(self, turn_completed: bool) -> dict[str, Any]:
+        matched = {key for key in self.items.keys() & self.callbacks.keys()
+                   if self.items[key]["namespace"] in (None, "")
+                   and all(self.items[key][field] == self.callbacks[key][field]
+                           for field in ("name", "arguments_json"))}
+        unmatched_host = self.items.keys() - matched
+        unmatched_callbacks = self.callbacks.keys() - matched
+        host_errors, host_successes, unknown = set(), set(), set()
+        problems = set(self.problems)
+        for key, item in self.items.items():
+            terminal = item["terminal"]
+            if item["error_observed"]:
+                host_errors.add(key)
+            if terminal and terminal["status"] == "completed" and terminal["success"] is True:
+                host_successes.add(key)
+            if (not terminal or terminal["status"] not in ("completed", "failed")
+                    or (terminal["status"] == "completed" and type(terminal["success"]) is not bool)):
+                unknown.add(key)
+            if terminal and terminal["status"] == "failed" and terminal["success"] is True:
+                problems.add("contradictory_dynamic_outcome")
+        callback_errors = {key for key, item in self.callbacks.items() if item["status"] in {"error", "timeout"}}
+        for key in matched:
+            if ((key in callback_errors and key in host_successes)
+                    or (self.callbacks[key]["status"] == "completed" and key in host_errors)):
+                problems.add("callback_dynamic_outcome_conflict")
+        if unmatched_callbacks:
+            problems.add("unmatched_callback_identity")
+        if unmatched_host & host_successes:
+            problems.add("host_success_without_callback")
+        if unknown:
+            problems.add("missing_or_unknown_dynamic_terminal")
+        if any(item["status"] == "inProgress" for item in self.callbacks.values()):
+            problems.add("unfinished_callback")
+        if not turn_completed:
+            problems.add("turn_not_completed")
+        if not self.items:
+            problems.add("dynamic_tool_stream_unobserved")
+        coverage = "complete" if not problems else "partial" if self.items else "unobserved"
+        # With unresolved IDs, either side may describe the same error. This is
+        # a lower bound, not the sum of two potentially overlapping counts.
+        matched_errors = matched & (host_errors | callback_errors)
+        lower_bound = len(matched_errors) + max(len(host_errors - matched), len(callback_errors - matched))
+        return {"schema_version": 1, "source": "codex-app-server/dynamicToolCall",
+                "coverage": coverage, "coverage_reasons": sorted(problems),
+                "coverage_basis": "Observed host tool lifecycles and callbacks; provider-internal attempts are not measured",
+                "error_scope": "Host refusals and callback transport status; semantic action failures remain in adapter tool ok",
+                "host_observed_attempts": len(self.items), "callback_calls": len(self.callbacks),
+                "matched_calls": len(matched), "unmatched_host_items": len(unmatched_host),
+                "unmatched_callback_calls": len(unmatched_callbacks),
+                "host_observed_errors": len(host_errors), "callback_errors": len(callback_errors),
+                "host_only_errors": len(host_errors - matched) if coverage == "complete" else None,
+                "known_host_only_errors": len(host_errors - matched) if self.items and not unmatched_callbacks else None,
+                "unknown_host_outcomes": len(unknown), "known_error_lower_bound": lower_bound,
+                "errors": lower_bound if coverage == "complete" else None}
 
 
 class _RPC:
@@ -312,6 +445,7 @@ class CodexModelHost:
         milestones: dict[str, float] = {}
         pending_thread_notifications: list[tuple[dict[str, Any], float]] = []
         pending_turn_notifications: list[tuple[dict[str, Any], float]] = []
+        telemetry = _ToolTelemetry(emit)
 
         def now_ms() -> float:
             return (time.monotonic() - start) * 1000
@@ -366,12 +500,14 @@ class CodexModelHost:
                 seen_calls.add(call_id)
                 tool_calls += 1
                 call_start = now_ms()
+                telemetry.callback(call_id, name, arguments, "inProgress")
                 emit({"type": "tool_request", "call_id": call_id, "name": name,
                       "arguments": arguments, "start_ms": call_start})
                 try:
                     raw = execute_tool(name, arguments)
                     response = tool_response(raw)
                 except TrialDeadline:
+                    telemetry.callback(call_id, name, arguments, "timeout")
                     emit({"type": "tool", "call_id": call_id, "name": name, "arguments": arguments,
                           "start_ms": call_start, "end_ms": now_ms(), "status": "timeout"})
                     raise
@@ -381,6 +517,7 @@ class CodexModelHost:
                     raw = {"content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}],
                            "isError": True}
                     response = tool_response(raw)
+                telemetry.callback(call_id, name, arguments, "completed" if response["success"] else "error")
                 emit({"type": "tool", "call_id": call_id, "name": name, "arguments": arguments,
                       "start_ms": call_start, "end_ms": now_ms(),
                       "status": "completed" if response["success"] else "error", "result": raw})
@@ -402,6 +539,8 @@ class CodexModelHost:
                     raise IsolationError(f"Unexpected built-in item type: {kind}")
                 if kind != "userMessage":
                     model_activity(observed_ms)
+                if kind == "dynamicToolCall":
+                    telemetry.observe(item, "completed" if method == "item/completed" else "started", observed_ms)
                 if kind == "agentMessage" and method == "item/completed":
                     text = item.get("text", "")
                     item_id = item.get("id", str(len(final_messages)))
@@ -570,4 +709,5 @@ class CodexModelHost:
         return HostResult(status=status, final_response="\n".join(final_messages.values()),
                           model=reported_model, reasoning_effort=self.config.reasoning_effort,
                           model_host_version=actual_version, usage=usage, tool_calls=tool_calls,
-                          wall_ms=wall_ms, error=error, isolation=isolation, milestones_ms=milestones)
+                          wall_ms=wall_ms, error=error, isolation=isolation, milestones_ms=milestones,
+                          tool_telemetry=telemetry.summary("turn_completed" in milestones))

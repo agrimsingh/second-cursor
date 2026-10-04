@@ -279,7 +279,7 @@ def run_adapter(request, args):
         final.update(status="completed" if data["status"] == "completed" else "failed",
                      usage=data.get("usage"), isolation=data.get("isolation", {}),
                      final_response=data.get("final_response", ""), error=data.get("error"),
-                     host_status=data["status"])
+                     host_status=data["status"], tool_telemetry=data.get("tool_telemetry"))
         identity_fields = ("model", "reasoning_effort", "model_host_version")
         actual_identity = dict(data)
         if model_host == "cursor-sdk":

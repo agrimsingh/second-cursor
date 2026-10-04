@@ -115,29 +115,9 @@ function domOperation(p, isSecretField, anchor) {
       throw Error("Frame is cross-origin; resolve it through a frame context");
   }
   const root = doc;
-  const role = (e) =>
-    e.getAttribute("role") ||
-    {
-      BUTTON: "button",
-      A: "link",
-      TEXTAREA: "textbox",
-      SELECT: "combobox",
-      IMG: "img",
-      H1: "heading",
-      H2: "heading",
-      IFRAME: "iframe",
-    }[e.tagName] ||
-    (e.tagName === "INPUT"
-      ? {
-          checkbox: "checkbox",
-          radio: "radio",
-          range: "slider",
-          number: "spinbutton",
-          search: "searchbox",
-          button: "button",
-          submit: "button",
-        }[e.type] || "textbox"
-      : "");
+  // Flat locators and metadata share the same implicit roles as chained locators.
+  // The helper is initialized before any operation calls this closure.
+  const role = (e) => ariaRole(e);
   const labelText = (l) => {
     const clone = l.cloneNode(true);
     clone
@@ -145,19 +125,18 @@ function domOperation(p, isSecretField, anchor) {
       .forEach((e) => e.remove());
     return clone.textContent.trim();
   };
-  const name = (e) =>
-    e.getAttribute("aria-label") ||
-    (e.getAttribute("aria-labelledby") || "")
-      .split(/\s+/)
-      .map((id) => doc.getElementById(id)?.textContent || "")
-      .join(" ")
-      .trim() ||
-    [...(e.labels ?? [])].map(labelText).join(" ").trim() ||
-    e.getAttribute("alt") ||
-    e.getAttribute("title") ||
-    (e.matches("input[type=button],input[type=submit]") ? e.value : "") ||
-    e.innerText ||
-    "";
+  const contentName = (e) =>
+    labelOf(e) || e.getAttribute("alt") || e.getAttribute("title") ||
+    (e.matches("input[type=button],input[type=submit]") ? e.value : "") || e.innerText || "";
+  const name = (e) => {
+    const r = role(e);
+    // Landmarks and form controls do not acquire an accessible name from their
+    // contents. Use the same semantic name for matching and returned metadata.
+    // Paragraph/list-item names historically carry the DOM snapshot's prose
+    // summary; keep those readable while correcting newly exposed landmarks.
+    if (r && !NAME_FROM_CONTENT.has(r) && r !== "paragraph" && r !== "listitem") return accName(e, r);
+    return contentName(e);
+  };
   const visible = (e) =>
     !!e.getClientRects().length && getComputedStyle(e).visibility !== "hidden";
   // Password and payment card values stay out of reads, as in browser_snapshot.
@@ -166,13 +145,37 @@ function domOperation(p, isSecretField, anchor) {
     isSecretField({
       type: e.type,
       autocomplete: e.getAttribute("autocomplete"),
-      name: name(e) || e.getAttribute("placeholder"),
+      // Superseded ARIA and native labels remain sensitivity signals even when
+      // an accessible-name override gives the field a different public name.
+      name: [name(e) || e.getAttribute("placeholder"), contentName(e), e.getAttribute("aria-label"),
+        ...[...(e.labels ?? [])].map(labelText)].filter(Boolean).join(" "),
       value,
     });
   const optionSecret = (e, o) => secret(e, o.value) || secret(e, o.label);
+  const sensitiveOption = (e) => {
+    if (e.tagName !== "OPTION") return false;
+    const select = e.closest("select");
+    return !!select && optionSecret(select, e);
+  };
+  const sensitiveValue = (e, value = e.value) =>
+    secret(e, value) || sensitiveOption(e) ||
+    (e.tagName === "SELECT" && [...e.selectedOptions].some((o) => optionSecret(e, o)));
   const valueOf = (e) =>
-    e.value && (secret(e) || (e.tagName === "SELECT" && [...e.selectedOptions].some((o) => optionSecret(e, o))))
+    e.value && sensitiveValue(e)
       ? "[redacted]" : String(e.value);
+  // These serializers run only after matching. Aggregate SELECT text can expose
+  // unselected options, while its ordinary selected value may still be public.
+  const readText = (e, value) => {
+    const text = String(value ?? "");
+    return text && (secret(e, text) || sensitiveOption(e) ||
+      (e.tagName === "SELECT" && [...e.options].some((o) => optionSecret(e, o))))
+      ? "[redacted]" : text;
+  };
+  const readName = (e, value) => sensitiveOption(e) && value ? "[redacted]" : value;
+  const readAttribute = (e, key, value) =>
+    value && ((key === "value" && sensitiveValue(e, value)) ||
+      (sensitiveOption(e) && ["value", "label", "aria-label", "title", "alt"].includes(key)))
+      ? "[redacted]" : value;
   const matches = (a, b) =>
     p.locator?.exact === false ? a.includes(b) : a.trim() === b;
   // Chained locators (browser_repl) follow Playwright: text is case-insensitive substring unless exact, exact is
@@ -236,10 +239,7 @@ function domOperation(p, isSecretField, anchor) {
         : tag === "HEADER"
           ? "banner"
           : "contentinfo";
-    if (tag === "SECTION")
-      return e.hasAttribute("aria-label") || e.hasAttribute("aria-labelledby")
-        ? "region"
-        : "";
+    if (tag === "SECTION") return labelOf(e) ? "region" : "";
     if (tag === "SELECT") return e.multiple || e.size > 1 ? "listbox" : "combobox";
     if (tag === "IMG") return e.getAttribute("alt") === "" ? "presentation" : "img";
     return (
@@ -255,6 +255,7 @@ function domOperation(p, isSecretField, anchor) {
         FIGURE: "figure",
         FORM: "form",
         HR: "separator",
+        IFRAME: "iframe",
         LI: "listitem",
         MAIN: "main",
         MENU: "list",
@@ -376,9 +377,9 @@ function domOperation(p, isSecretField, anchor) {
     const attributes = ["id", "type", "role", "aria-label", "data-testid", "href"]
       .filter((a) => e.hasAttribute(a))
       .slice(0, 3)
-      .map((a) => ` ${a}="${e.getAttribute(a).slice(0, 40)}"`)
+      .map((a) => ` ${a}="${readAttribute(e, a, e.getAttribute(a)).slice(0, 40)}"`)
       .join("");
-    const text = normalized(e.innerText ?? e.textContent).slice(0, 80);
+    const text = normalized(readText(e, e.innerText ?? e.textContent)).slice(0, 80);
     return `<${e.localName}${attributes}>${text ? ` "${text}"` : ""}`;
   };
   const inOrder = (list) =>
@@ -523,7 +524,7 @@ function domOperation(p, isSecretField, anchor) {
             },
           ];
         const r = role(e),
-          n = name(e);
+          n = readName(e, name(e));
         if (
           !r &&
           !e.matches(
@@ -595,7 +596,7 @@ function domOperation(p, isSecretField, anchor) {
             texts: found
               .slice(0, 1000)
               .map((e) =>
-                (p.texts === "content" ? e.textContent : ownText(e)).slice(0, 100000),
+                readText(e, p.texts === "content" ? e.textContent : ownText(e)).slice(0, 100000),
               ),
           }
         : {}),
@@ -617,12 +618,12 @@ function domOperation(p, isSecretField, anchor) {
   if (p.operation === "inspect") {
     const text =
         p.text_kind === "content"
-          ? e.textContent || ""
+          ? readText(e, e.textContent)
           : p.text_kind === "inner"
-            ? (e.innerText ?? e.textContent ?? "")
+            ? readText(e, e.innerText ?? e.textContent)
             : e.matches("input,textarea,select")
               ? valueOf(e)
-              : e.innerText || e.textContent || "",
+              : readText(e, e.innerText || e.textContent),
       offset = p.offset ?? 0,
       length = p.length ?? 4000;
     if (offset < 0 || length < 0 || length > 100000)
@@ -634,7 +635,7 @@ function domOperation(p, isSecretField, anchor) {
       total_length: text.length,
       has_more: offset + length < text.length,
       role: chained ? ariaRole(e) : role(e),
-      name: chained ? accName(e, ariaRole(e)) : name(e),
+      name: readName(e, chained ? accName(e, ariaRole(e)) : name(e)),
       enabled: chained ? enabled(e) : !e.disabled,
       visible: chained ? shown(e) : visible(e),
       checked: "checked" in e ? e.checked : null,
@@ -642,7 +643,7 @@ function domOperation(p, isSecretField, anchor) {
       attributes: Object.fromEntries(
         [...e.attributes].map((x) => [
           x.name,
-          x.name === "value" && x.value && secret(e) ? "[redacted]" : x.value,
+          readAttribute(e, x.name, x.value),
         ]),
       ),
     };
@@ -768,7 +769,7 @@ function domOperation(p, isSecretField, anchor) {
   }
   if (p.operation === "select_text") {
     // How often a text matches would reveal a redacted value a guess at a time.
-    if (secret(e))
+    if (sensitiveValue(e))
       throw Error("select_text is not available on password and payment card fields");
     const text = "value" in e ? e.value : e.textContent,
       needle = p.text;

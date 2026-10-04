@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Browser command contracts</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 18px; color: #183025; background: #f5f7f3; font: 14px/1.4 system-ui, sans-serif; }
+    body > header, main { max-width: 1040px; margin: 0 auto; }
+    h1 { margin: 0 0 12px; font-size: 22px; }
+    h2, h3, h4, h5, h6 { margin: 0 0 5px; font-size: 15px; }
+    p { margin: 5px 0; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .grid > section, .grid > article, .controls, .headings { padding: 12px; border: 1px solid #c9d6cc; border-radius: 6px; background: white; }
+    .controls, .headings { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 18px; align-items: start; }
+    label { display: block; margin-bottom: 4px; font-weight: 600; }
+    select, button { font: inherit; padding: 5px 8px; }
+    select { min-width: 150px; }
+    #events { display: block; margin-top: 12px; padding: 10px; border: 1px solid #c9d6cc; background: white; white-space: pre-wrap; }
+    @media (max-width: 700px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  </style>
+</head>
+<body>
+  <header id="top-header" aria-label="Site header"><h1>Browser command contracts</h1></header>
+  <main>
+    <div class="grid">
+      <article>
+        <header id="nested-header" aria-label="Article header"><strong>Article introduction</strong></header>
+        <p>The article header belongs to this article.</p>
+      </article>
+      <section id="named-region" aria-label="Account summary">
+        <p>Account balance: 125 credits.</p>
+      </section>
+      <section id="labelled-region" aria-labelledby="labelled-heading">
+        <h2 id="labelled-heading">Shipment details</h2>
+        <p>Shipment status: Ready.</p>
+      </section>
+      <section id="unnamed"><p>Unnamed section content.</p></section>
+      <section id="empty" aria-label=""><p>Empty-label section content.</p></section>
+      <section id="whitespace" aria-label="   "><p>Whitespace-label section content.</p></section>
+      <section id="unresolved" aria-labelledby="missing-label"><p>Unresolved-label section content.</p></section>
+      <section class="duplicate-region" aria-label="Duplicate region">
+        <p>First duplicate region.</p>
+        <button id="duplicate-first" type="button">Record first click</button>
+      </section>
+      <section class="duplicate-region" aria-label="Duplicate region">
+        <p>Second duplicate region.</p>
+        <button id="duplicate-second" type="button">Record second click</button>
+      </section>
+      <section id="explicit-note" role="note" aria-label="Explicit note"><p>Explicit note content.</p></section>
+    </div>
+    <div class="headings">
+      <h3 id="heading3">Depth three</h3>
+      <h4 id="heading4">Depth four</h4>
+      <h5 id="heading5">Depth five</h5>
+      <h6 id="heading6">Depth six</h6>
+    </div>
+    <div class="controls">
+      <div>
+        <label for="multiple">Channels</label>
+        <select id="multiple" aria-label="Channels" multiple size="3">
+          <option value="email" selected>Email</option>
+          <option value="sms">SMS</option>
+          <option value="push">Push</option>
+        </select>
+      </div>
+      <div>
+        <label for="single">Priority</label>
+        <select id="single" aria-label="Priority">
+          <option value="normal" selected>Normal</option>
+          <option value="express">Express</option>
+        </select>
+      </div>
+    </div>
+    <output id="events" aria-live="polite">No input events</output>
+  </main>
+  <script>
+    (() => {
+      let count = 0;
+      const events = document.getElementById("events");
+      function record(event) {
+        count += 1;
+        events.textContent = `${count} input events; latest: ${event.type} on ${event.currentTarget.id}`;
+      }
+      for (const id of ["multiple", "single"]) {
+        const control = document.getElementById(id);
+        control.addEventListener("input", record);
+        control.addEventListener("change", record);
+      }
+      for (const control of document.querySelectorAll(".duplicate-region button")) {
+        control.addEventListener("click", record);
+      }
+    })();
+  </script>
+</body>
+</html>

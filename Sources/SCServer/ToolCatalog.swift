@@ -548,7 +548,7 @@ enum ToolCatalog {
         Tool(
             name: "browser_command",
             description:
-                "Extended browser control. Use dom_snapshot/inspect for grounded locators; mutations require an agent-owned or explicitly claimed tab. Unknown/ambiguous locators fail. See browser_command(operation=capabilities).",
+                "Extended browser control. inspect requires arguments.locator; select_option requires arguments.locator and arguments.value. Snapshot refs work with browser_click/browser_type, not as top-level targets for inspect/select_option. Tab operations require an agent-owned or explicitly claimed tab. Call operation=capabilities for other operations and approval requirements.",
             inputSchema: schema(
                 [
                     "browser_id": string("Instance from browser_instances; required when more than one is connected"),
@@ -562,11 +562,7 @@ enum ToolCatalog {
                             "downloads", "logs", "history", "export", "assets", "viewport", "screenshot", "cdp",
                             "batch", "clipboard",
                         ]),
-                    "arguments": .object([
-                        "type": "object",
-                        "description":
-                            "Operation-specific fields. Call operation=capabilities for argument help and approval requirements.",
-                    ]),
+                    "arguments": browserCommandArguments,
                 ], required: ["operation"])),
         Tool(
             name: "browser_repl",
@@ -584,6 +580,43 @@ enum ToolCatalog {
                 ]) { $1 }),
             annotations: .init(readOnlyHint: true)),
     ]
+
+    /// Describe the public DOM contract at tools/list time; models should not need
+    /// a rejected call to discover how a locator differs from an outline ref.
+    /// Other extended operations keep their existing fields and capabilities help.
+    private static let browserCommandArguments: Value = [
+        "type": "object",
+        "description":
+            "inspect: {\"locator\":{\"role\":\"region\",\"name\":\"Details\"}}. select_option: {\"locator\":{\"label\":\"Route\"},\"value\":\"Priority\"}. inspect/select_option/check require locator, not top-level ref; option labels go in value, not top-level label. Other operation fields remain supported; capabilities lists them.",
+        "properties": .object([
+            "locator": [
+                "type": "object",
+                "description": "Target observed page content; refine ambiguous matches to one element.",
+                "properties": .object([
+                    "selector": string("CSS selector, e.g. #details or section."),
+                    "role": string("ARIA role, e.g. button, combobox, region. A named HTML section is region; section is a tag, not an ARIA role."),
+                    "name": string("Observed accessible name."),
+                    "label": string("Form control's label, not an option label."),
+                    "text": string("Element text."),
+                    "placeholder": string("Control placeholder."),
+                    "test_id": string("Observed data-testid."),
+                    "exact": ["type": "boolean", "description": "Complete text/name/label match; false allows substring."],
+                    "nth": integer("Zero-based match; observe alternatives first."),
+                    "visible": ["type": "boolean"],
+                    "frame": stringOrStringArray("Observed frame selector or nested frame selectors."),
+                ]),
+                "additionalProperties": true,
+            ],
+            "value": stringOrStringArray("select_option: exact option value or label (normalized whitespace); values take precedence. Multiple options require a multiple-select control. Inspect for available/selected/disabled options."),
+            "text": string("fill/type/paste/select_text: text to enter or select."),
+        ]),
+        "additionalProperties": true,
+    ]
+
+    private static func stringOrStringArray(_ description: String) -> Value {
+        ["description": .string(description),
+         "anyOf": [["type": "string"], ["type": "array", "items": ["type": "string"]]]]
+    }
 
     /// Scalars only: Gemini through Cursor stringifies nested free-form objects. The router also takes expect as a
     /// JSON string.

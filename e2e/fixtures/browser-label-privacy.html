@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Browser label privacy fixture</title>
+  <style>
+    body { font: 15px/1.5 system-ui, sans-serif; margin: 24px; color: #24372f; background: #f8faf7; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(200px, 1fr)); gap: 16px; max-width: 1100px; }
+    .case { padding: 12px; background: white; border: 1px solid #c9d6cc; border-radius: 6px; }
+    label, .public-name { display: block; }
+    input, textarea, select { box-sizing: border-box; width: 100%; font: inherit; margin-top: 6px; }
+    select { min-height: 30px; }
+  </style>
+</head>
+<body>
+  <h1>Browser label privacy</h1>
+  <p>Every credential and payment value below is a synthetic regression marker.</p>
+  <!-- Semantic wrappers exercise snapshot names; arbitrary parent-text inspection
+       is outside this control/option regression. -->
+  <div class="grid">
+    <div class="case">
+      <label for="native-aria">Password</label>
+      <input id="native-aria" type="text" aria-label="Account nickname" value="SC_LABEL_PRIVACY_SECRET_NATIVE_ARIA">
+    </div>
+    <div class="case">
+      <label for="native-labelledby">Password</label>
+      <span id="account-code-name" class="public-name">Account code</span>
+      <input id="native-labelledby" type="text" aria-label="Legacy account code" aria-labelledby="account-code-name" value="SC_LABEL_PRIVACY_SECRET_NATIVE_LABELLEDBY">
+    </div>
+    <div class="case">
+      <span id="account-alias-name" class="public-name">Account alias</span>
+      <input id="legacy-aria" type="text" aria-label="Password" aria-labelledby="account-alias-name" value="SC_LABEL_PRIVACY_SECRET_LEGACY_ARIA">
+    </div>
+    <div class="case">
+      <label for="cleared-input">Password</label>
+      <input id="cleared-input" type="text" aria-label="Archived account code" value="SC_LABEL_PRIVACY_SECRET_OLD_INPUT_VALUE">
+    </div>
+    <div class="case">
+      <label for="cleared-textarea">Password</label>
+      <textarea id="cleared-textarea" aria-label="Archived recovery text">SC_LABEL_PRIVACY_SECRET_OLD_TEXTAREA_CONTENT</textarea>
+    </div>
+    <main id="unnamed-main" class="case">
+      <form id="unnamed-form">
+      <label for="sensitive-select">Card number</label>
+      <select id="sensitive-select" aria-label="Card number" size="2">
+        <option id="direct-selected" label="SC_LABEL_PRIVACY_SECRET_DIRECT_SELECTED_LABEL" value="SC_LABEL_PRIVACY_SECRET_DIRECT_SELECTED_VALUE" aria-label="SC_LABEL_PRIVACY_SECRET_DIRECT_SELECTED_ARIA" selected>SC_LABEL_PRIVACY_SECRET_DIRECT_SELECTED_TEXT</option>
+        <option id="direct-unselected" label="SC_LABEL_PRIVACY_SECRET_DIRECT_UNSELECTED_LABEL" value="SC_LABEL_PRIVACY_SECRET_DIRECT_UNSELECTED_VALUE" aria-label="SC_LABEL_PRIVACY_SECRET_DIRECT_UNSELECTED_ARIA">SC_LABEL_PRIVACY_SECRET_DIRECT_UNSELECTED_TEXT</option>
+      </select>
+      </form>
+    </main>
+    <article id="unnamed-article" class="case">
+      <article id="named-article" aria-label="Saved payment choices">
+      <label for="native-select">Card number</label>
+      <span id="payment-choice-name" class="public-name">Payment choice</span>
+      <select id="native-select" aria-label="Legacy payment choice" aria-labelledby="payment-choice-name" size="2">
+        <option id="native-selected" label="SC_LABEL_PRIVACY_SECRET_NATIVE_SELECTED_LABEL" value="SC_LABEL_PRIVACY_SECRET_NATIVE_SELECTED_VALUE" selected>SC_LABEL_PRIVACY_SECRET_NATIVE_SELECTED_TEXT</option>
+        <option id="native-unselected" label="SC_LABEL_PRIVACY_SECRET_NATIVE_UNSELECTED_LABEL" value="SC_LABEL_PRIVACY_SECRET_NATIVE_UNSELECTED_VALUE">SC_LABEL_PRIVACY_SECRET_NATIVE_UNSELECTED_TEXT</option>
+      </select>
+      </article>
+    </article>
+    <form id="named-form" class="case" aria-label="Delivery preferences">
+      <label for="mixed-select">Shipping route</label>
+      <select id="mixed-select" aria-label="Shipping route" size="2">
+        <option id="mixed-ordinary" value="SC_LABEL_PRIVACY_PUBLIC_STANDARD" selected>Standard shipping</option>
+        <option id="mixed-sensitive" label="SC_LABEL_PRIVACY_SECRET_MIXED_LABEL" value="••••" aria-label="SC_LABEL_PRIVACY_SECRET_MIXED_ARIA">SC_LABEL_PRIVACY_SECRET_MIXED_TEXT</option>
+      </select>
+    </form>
+    <div class="case">
+      <label for="ordinary-input">Display name</label>
+      <input id="ordinary-input" type="text" value="SC_LABEL_PRIVACY_PUBLIC_INPUT">
+      <label for="ordinary-textarea">Delivery note</label>
+      <textarea id="ordinary-textarea">SC_LABEL_PRIVACY_PUBLIC_NOTE</textarea>
+    </div>
+  </div>
+  <script>
+    // Preserve old markup values while clearing the live property, as a page can
+    // do after consuming a credential. Reads must classify the value they emit.
+    document.getElementById("cleared-input").value = "";
+    document.getElementById("cleared-textarea").value = "";
+  </script>
+</body>
+</html>

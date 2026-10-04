@@ -422,6 +422,7 @@ BROWSER_ARGUMENTS = {"locator", "ref", "text", "value", "values", "checked", "se
                      "keys", "direction", "amount", "x", "y", "from_x", "from_y", "to_x", "to_y", "button", "count",
                      "delta_x", "delta_y", "timeout_ms", "state", "accept", "prompt_text", "full", "max_elements",
                      "offset", "length", "format", "submit", "caption", "modifiers", "action", "full_page", "clip"}
+BROWSER_LOCATOR_FIELDS = {"selector", "role", "label", "name", "text", "placeholder", "test_id", "exact", "nth", "visible"}
 HIDDEN_FIELDS = {"session", "session_id", "operation_id", "observation_id", "app", "target",
                  "screenshot_out_file", "debug_image_out", "browser_id", "include_menu_bar"}
 SAFE_KEYS = {"return", "enter", "tab", "escape", "esc", "up", "down", "left", "right", "space", "delete",
@@ -656,6 +657,14 @@ class ScopedEngine:
             props["input_route"]["enum"] = ["trusted"]
         if name == "browser_command":
             props["operation"]["enum"] = sorted(BROWSER_OPERATIONS)
+            # Preserve the public argument contract while omitting fields the
+            # existing fixture guard refuses (for example, frame/chain access).
+            argument_props = props["arguments"].get("properties", {})
+            for field in set(argument_props) - BROWSER_ARGUMENTS:
+                argument_props.pop(field)
+            locator_props = argument_props.get("locator", {}).get("properties", {})
+            for field in set(locator_props) - BROWSER_LOCATOR_FIELDS:
+                locator_props.pop(field)
             props["arguments"]["description"] += " Fixture-only benchmark: use visible-page locators, text/value, check/select_option, real drag coordinates, wait, or dialog accept. No script, CDP, files, navigation, or evaluator access." + KEY_SCOPE_DESCRIPTION
         for field in ("keys", "key"):
             if field in props:
@@ -694,7 +703,7 @@ class ScopedEngine:
 
     @staticmethod
     def _locator(locator):
-        if not isinstance(locator, dict) or set(locator) - {"selector", "role", "label", "name", "text", "placeholder", "test_id", "exact", "nth", "visible"}:
+        if not isinstance(locator, dict) or set(locator) - BROWSER_LOCATOR_FIELDS:
             raise ScopeError("Only rendered-page semantic or simple CSS locators are permitted")
         if locator.get("visible", True) is not True:
             raise ScopeError("Hidden implementation elements are outside the benchmark")
@@ -771,6 +780,8 @@ class ScopedEngine:
                 raise ScopeError("Browser operation is outside the task allowlist")
             fields = args.get("arguments", {})
             if not isinstance(fields, dict) or set(fields) - BROWSER_ARGUMENTS:
+                if isinstance(fields, dict) and args["operation"] == "select_option" and "label" in fields:
+                    raise ScopeError("select_option requires arguments.locator and arguments.value; put the exact option value or label in value, not a top-level label field")
                 raise ScopeError("Browser operation includes an unsafe argument")
             if args["operation"] == "capabilities" and fields:
                 raise ScopeError("Static browser capability help takes no operation arguments")
@@ -789,7 +800,7 @@ class ScopedEngine:
             if "locator" in fields:
                 fields["locator"] = self._locator(fields["locator"])
             if args["operation"] == "inspect" and "locator" not in fields:
-                raise ScopeError("Inspect requires a rendered-page locator")
+                raise ScopeError("inspect requires arguments.locator for a rendered-page element; top-level ref is unsupported")
             if "arguments" in args:
                 args["arguments"] = fields
             self._keys(fields)

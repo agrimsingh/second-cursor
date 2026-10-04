@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Seeded browser semantics fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font: 15px/1.5 system-ui,sans-serif; margin: 24px; color: #24372f; background: #f8faf7; }
+    main { max-width: 1020px; margin: auto; }
+    button,input,select { font: inherit; padding: 8px; margin: 5px; }
+    button,[role=button],[role=switch] { cursor: pointer; }
+    #generated-cases { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
+    article { border: 1px solid #ccd8ce; border-radius: 6px; padding: 14px; background: white; }
+    article h2 { font-size: 13px; color: #526657; margin: 0 0 8px; }
+    .candidate { display: block; min-height: 36px; padding: 8px; border: 1px solid #a7b9ab; }
+    .unnamed { min-height: 20px; }
+    #mutation-panel { padding: 15px 0; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+    :focus-visible { outline: 3px solid #b57920; outline-offset: 2px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Seeded semantics and element lifetime</h1>
+    <form id="generate-form">
+      <label for="seed">Fixture seed</label><input id="seed" name="seed" type="number" min="0" max="4294967295" value="104729" required>
+      <button type="submit">Generate cases</button>
+    </form>
+    <p id="generation-status" role="status">Waiting for generation</p>
+    <div id="mutation-panel">
+      <h2>Element lifetime controls</h2>
+      <button id="replace-target" type="button">Replace action target</button>
+      <button id="remove-target" type="button">Remove action target</button>
+      <button id="relabel-target" type="button">Relabel action target</button>
+      <button id="restore-target" type="button">Restore action target</button>
+      <div id="mutable-slot"></div>
+      <pre id="mutation-receipts" aria-label="Input receipts"></pre>
+    </div>
+    <div id="generated-cases"></div>
+    <details open><summary>Generated case manifest</summary><pre id="generation-manifest"></pre></details>
+  </main>
+  <script>
+    "use strict";
+    // The plan describes generated HTML, never an expected accessibility role.
+    // Tests obtain their semantic oracle through Chrome's public AX snapshot.
+    function makePlan(seed) {
+      let state = seed >>> 0;
+      const random = () => {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        return state / 4294967296;
+      };
+      const words = ["Cedar", "Harbor", "Juniper", "Maple", "Northstar", "Willow"];
+      const nouns = ["invoice", "shipment", "account", "receipt", "handoff", "release"];
+      const kinds = ["section-label", "section-labelledby", "section-unnamed", "section-empty", "section-unresolved",
+        "heading-native", "heading-explicit", "button-label", "button-labelledby", "button-competing-labels",
+        "button-whitespace", "link", "textbox-label", "search-label", "checkbox-label", "select-single",
+        "select-multiple", "explicit-control", "radio-label", "select-sized"];
+      const plan = kinds.map((kind, index) => ({
+        case_id: `${seed}-${index}`, target_id: `generated-${seed}-${index}`, kind,
+        name: `Property case ${seed}-${index} ${words[Math.floor(random() * words.length)]} ${nouns[Math.floor(random() * nouns.length)]}`,
+        heading_level: 3 + Math.floor(random() * 4),
+        explicit_role: ["button", "switch", "checkbox"][Math.floor(random() * 3)],
+        named: !["section-unnamed", "section-empty", "section-unresolved"].includes(kind),
+      }));
+      for (let index = plan.length - 1; index > 0; index--) {
+        const other = Math.floor(random() * (index + 1));
+        [plan[index], plan[other]] = [plan[other], plan[index]];
+      }
+      return plan;
+    }
+    function node(tag, text) {
+      const value = document.createElement(tag);
+      if (text !== undefined) value.textContent = text;
+      return value;
+    }
+    function addLabels(card, target, spec) {
+      const words = spec.name.split(" ");
+      const first = node("span", words.slice(0, 3).join(" "));
+      const second = node("span", words.slice(3).join(" "));
+      first.id = spec.target_id + "-first";
+      second.id = spec.target_id + "-last";
+      card.append(first, document.createTextNode(" "), second);
+      target.setAttribute("aria-labelledby", `${first.id}  ${second.id}`);
+    }
+    function renderCase(spec) {
+      const card = node("article");
+      card.append(node("h2", `Generated ${spec.case_id}: ${spec.kind}`));
+      let target;
+      const kind = spec.kind;
+      if (kind.startsWith("section-")) {
+        target = node("section", "Section content");
+        if (kind === "section-label") target.setAttribute("aria-label", spec.name);
+        if (kind === "section-labelledby") addLabels(card, target, spec);
+        if (kind === "section-empty") target.setAttribute("aria-label", "  \t ");
+        if (kind === "section-unresolved") target.setAttribute("aria-labelledby", `missing-${spec.case_id}`);
+      } else if (kind === "heading-native") target = node(`h${spec.heading_level}`, spec.name);
+      else if (kind === "heading-explicit") {
+        target = node("div", spec.name); target.setAttribute("role", "heading"); target.setAttribute("aria-level", spec.heading_level);
+      } else if (kind.startsWith("button-")) {
+        target = node("button", "Open record"); target.type = "button";
+        if (kind === "button-label") target.setAttribute("aria-label", spec.name);
+        if (["button-labelledby", "button-competing-labels"].includes(kind)) addLabels(card, target, spec);
+        if (kind === "button-competing-labels") target.setAttribute("aria-label", `Alternative name ${spec.case_id}`);
+        if (kind === "button-whitespace") target.textContent = "  " + spec.name.replace(/ /g, "  \n ") + "  ";
+      } else if (kind === "link") {
+        target = node("a", spec.name); target.href = `#${spec.target_id}`;
+      } else if (kind.startsWith("select-")) {
+        target = node("select"); target.setAttribute("aria-label", spec.name);
+        if (kind === "select-multiple") target.multiple = true;
+        if (kind === "select-sized") target.size = 3;
+        for (const [value, label] of [["a", "Standard"], ["b", "Priority"], ["c", "Hold"]]) {
+          const option = node("option", label); option.value = value; target.append(option);
+        }
+      } else if (kind === "explicit-control") {
+        target = node("div", "Explicit action"); target.tabIndex = 0;
+        target.setAttribute("role", spec.explicit_role); target.setAttribute("aria-label", spec.name);
+        if (spec.explicit_role !== "button") target.setAttribute("aria-checked", "false");
+      } else {
+        target = node("input");
+        target.type = ({ "textbox-label": "text", "search-label": "search", "checkbox-label": "checkbox", "radio-label": "radio" })[kind];
+        if (kind === "search-label") target.setAttribute("aria-label", spec.name);
+        else {
+          const label = node("label", spec.name); label.htmlFor = spec.target_id; card.append(label);
+        }
+      }
+      target.id = spec.target_id;
+      target.className = spec.named ? "candidate" : "unnamed";
+      card.append(target);
+      return card;
+    }
+    let version = 0;
+    let generation = 0;
+    let activeSeed = 0;
+    let receipts = [];
+    const slot = document.getElementById("mutable-slot");
+    function reportReceipts() {
+      document.getElementById("mutation-receipts").textContent = JSON.stringify({ seed: activeSeed, version, present: !!slot.firstElementChild, target_generation: slot.firstElementChild ? Number(slot.firstElementChild.dataset.generation) : null, receipts });
+    }
+    function newTarget() {
+      version++;
+      const target = node("button", `Mutable action ${activeSeed} version ${version}`);
+      const targetGeneration = ++generation;
+      target.dataset.generation = targetGeneration;
+      target.type = "button";
+      target.id = "mutable-target";
+      target.addEventListener("click", event => {
+        receipts.push({ generation: targetGeneration, name: target.textContent, trusted: event.isTrusted });
+        reportReceipts();
+      });
+      slot.replaceChildren(target);
+      reportReceipts();
+    }
+    document.getElementById("replace-target").addEventListener("click", newTarget);
+    document.getElementById("restore-target").addEventListener("click", newTarget);
+    document.getElementById("remove-target").addEventListener("click", () => { slot.replaceChildren(); version++; reportReceipts(); });
+    document.getElementById("relabel-target").addEventListener("click", () => {
+      if (!slot.firstElementChild) return;
+      version++;
+      slot.firstElementChild.textContent = `Mutable action ${activeSeed} version ${version}`;
+      reportReceipts();
+    });
+    function generate(seed) {
+      const plan = makePlan(seed);
+      activeSeed = seed; version = 0; generation = 0; receipts = [];
+      document.getElementById("generated-cases").replaceChildren(...plan.map(renderCase));
+      document.getElementById("generation-manifest").textContent = JSON.stringify({ seed, cases: plan });
+      newTarget();
+      document.getElementById("generation-status").textContent = `Generated ${plan.length} cases for seed ${seed}`;
+    }
+    document.getElementById("generate-form").addEventListener("submit", event => {
+      event.preventDefault();
+      const seed = Number(document.getElementById("seed").value);
+      if (Number.isInteger(seed) && seed >= 0 && seed <= 4294967295) generate(seed);
+    });
+    generate(Number(document.getElementById("seed").value));
+  </script>
+</body>
+</html>
