@@ -43,16 +43,17 @@ class SweepTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sweep.build_schedule(["a", "a"], 1, 0)
 
-    def test_defaults_pin_requested_profiles_and_full_native_tools(self):
+    def test_defaults_pin_existing_profiles_and_workspace_cases(self):
         args = sweep.parser().parse_args([])
-        self.assertEqual((args.rounds, args.timeout, args.max_steps), (3, 120, 40))
+        self.assertEqual((args.rounds, args.timeout, args.max_steps), (3, 300, 100))
         plan = self.plan()
-        self.assertEqual(plan["trial_count"], 10)
-        self.assertEqual(plan["tasks"], ["native_notes"])
+        self.assertEqual(plan["trial_count"], 30)
+        self.assertEqual(plan["tasks"], list(sweep.report.WORKSPACE_TASKS))
+        self.assertIn("generate reproducible case data", plan["note"])
         self.assertEqual(list(plan["profiles"]), ["grok-4.5-fast-low", "grok-4.5-fast-medium",
                                                "grok-4.7-fast-medium", "sol-6.1-medium", "sol-6.1-high"])
         for profile, child in plan["profile_plans"].items():
-            self.assertEqual(child["observation_mode"], "upfront")
+            self.assertEqual(child["observation_mode"], "on-demand")
             self.assertEqual(child["catalog_mode"], "full")
             self.assertEqual(child["selected_engines"], ["second-cursor"])
             declared = sweep.PROFILES[profile]
@@ -64,7 +65,7 @@ class SweepTests(unittest.TestCase):
         plan = self.plan("--profile", names[0], "--profile", names[1])
         self.assertEqual(list(plan["profiles"]), names)
         self.assertEqual(list(plan["profile_plans"]), names)
-        self.assertEqual(plan["trial_count"], 4)
+        self.assertEqual(plan["trial_count"], 12)
         self.assertEqual([item["profile"] for item in plan["runs"]], names + list(reversed(names)))
         for name, effort in zip(names, ("medium", "low")):
             config = plan["profile_plans"][name]["model_config"]
@@ -106,6 +107,14 @@ class SweepTests(unittest.TestCase):
         plan = self.plan("--task", "native_notes", "--task", "browser_work_order")
         self.assertEqual(plan["trial_count"], 20)
         self.assertTrue(all(p["observation_mode"] == "on-demand" for p in plan["profile_plans"].values()))
+
+    def test_explicit_native_regression_retains_upfront_mode_and_explicit_budget(self):
+        plan = self.plan("--task", "native_notes", "--timeout", "120", "--max-steps", "40")
+        self.assertEqual(plan["tasks"], ["native_notes"])
+        self.assertEqual(plan["trial_count"], 10)
+        for child in plan["profile_plans"].values():
+            self.assertEqual(child["observation_mode"], "upfront")
+            self.assertEqual((child["model_config"]["timeout_seconds"], child["model_config"]["max_steps"]), (120, 40))
 
     def test_preflight_rejects_undeclared_model_or_shared_identity_change(self):
         original = sweep.pilot.build_plan
@@ -150,8 +159,8 @@ class SweepTests(unittest.TestCase):
             output = pathlib.Path(temporary)
             def interrupted(*args):
                 initial = json.loads((output / "results.json").read_text())
-                self.assertEqual(initial["scheduled"], 10)
-                self.assertEqual(sum(p["summary"]["statuses"]["NOT_RUN"] for p in initial["profiles"].values()), 10)
+                self.assertEqual(initial["scheduled"], 30)
+                self.assertEqual(sum(p["summary"]["statuses"]["NOT_RUN"] for p in initial["profiles"].values()), 30)
                 raise KeyboardInterrupt
             with mock.patch.object(sweep.report, "artifact_dir", return_value=output), \
                     mock.patch.object(sweep.report, "run_process", side_effect=interrupted) as process, \
@@ -159,9 +168,9 @@ class SweepTests(unittest.TestCase):
                 self.assertEqual(sweep.run_plan(plan), 2)
             result = json.loads((output / "results.json").read_text())
             self.assertEqual(process.call_count, 1)
-            self.assertEqual(result["scheduled"], 10)
+            self.assertEqual(result["scheduled"], 30)
             self.assertFalse(result["evidence_complete"])
-            self.assertEqual(sum(p["summary"]["statuses"].get("NOT_RUN", 0) for p in result["profiles"].values()), 9)
+            self.assertEqual(sum(p["summary"]["statuses"].get("NOT_RUN", 0) for p in result["profiles"].values()), 27)
             self.assertNotIn("winner", result)
 
     def test_failed_child_stays_failed_and_missing_child_is_incomplete(self):

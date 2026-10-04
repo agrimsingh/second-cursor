@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Compare explicitly pinned model and host configurations on Second Cursor.
+"""Compare pinned model and host configurations on seeded Second Cursor workspaces.
 
 This is a model-plus-host comparison, not an isolated inference or driver speed
 benchmark. --list only reads source/runtime identities; it starts no model or UI.
+Legacy regression tasks remain available through explicit --task selections.
 """
 import argparse
 import copy
@@ -47,11 +48,12 @@ def parser():
     cli.add_argument("--profile", action="append", choices=PROFILES,
                      help="Run only these profiles, in the supplied order; repeat to select multiple. "
                           "Defaults to the original five Grok/Sol profiles.")
-    cli.add_argument("--task", action="append", choices=report.TASKS)
-    cli.add_argument("--seed", type=int, default=1, help="First matched case identity, not a sampling seed")
+    cli.add_argument("--task", action="append", choices=report.TASKS,
+                     help="Defaults to workspace reconciliation, handoff and recovery; repeat to select explicit tasks")
+    cli.add_argument("--seed", type=int, default=1, help="First generated workspace case seed or legacy trial ID; not a model sampling seed")
     cli.add_argument("--native-placement", choices=("desktop", "agent-display", "textedit-off-space"), default="desktop")
-    cli.add_argument("--timeout", type=float, default=120)
-    cli.add_argument("--max-steps", type=int, default=40)
+    cli.add_argument("--timeout", type=float, default=300)
+    cli.add_argument("--max-steps", type=int, default=100)
     cli.add_argument("--codex-binary", default=shutil.which("codex") or "codex")
     cli.add_argument("--node-binary", default=shutil.which("node") or "node")
     cli.add_argument("--cursor-sdk-root", help="Pinned Cursor SDK bridge/dependency directory; defaults to e2e/cursor_host")
@@ -115,7 +117,7 @@ def build_plan(args):
         selected.engine = "second-cursor"
         selected.cua_binary = "cua-driver"
         selected.configured_model = False
-        selected.task = args.task or ["native_notes"]
+        selected.task = args.task or list(report.WORKSPACE_TASKS)
         selected.catalog_mode = "full"
         selected.observation_mode = "upfront" if selected.task == ["native_notes"] else "on-demand"
         selected.model_host, selected.model = config["model_host"], config["model"]
@@ -135,8 +137,8 @@ def build_plan(args):
             "profiles": profiles, "profile_plans": plans, "runs": runs,
             "rounds": args.rounds, "trial_count": len(runs) * len(baseline["tasks"]),
             "note": "Model-plus-host comparison: Cursor SDK and Codex have different orchestration and tool framing. "
-                    "Every trial starts fresh fixtures and a fresh host. Fixed tasks and case identities do not randomize "
-                    "fixtures or model sampling. Round order alternates forward/reverse, which limits but does not "
+                    "Every trial starts fresh fixtures and a fresh host. " + report.case_seed_semantics(baseline["tasks"]) + " "
+                    "Round order alternates forward/reverse, which limits but does not "
                     "eliminate order and provider-cache effects, especially with an odd number of rounds."}
 
 
@@ -202,7 +204,7 @@ def write_results(output, plan, profiles, entries):
                      f"{display(summary['wall_ms'])} | {display(summary['verified_completion_ms'])} |")
     if len(plan["tasks"]) > 1:
         lines.extend(["", "Aggregate medians mix task types; use the per-task summaries in results.json for task-specific comparisons."])
-    lines.extend(["", "Small fixed-task samples do not establish an overall winner or general model intelligence. "
+    lines.extend(["", "Small task samples do not establish an overall winner or general model intelligence. "
                   "A configuration with failed or missing trials cannot be declared superior from its successful-only latency. "
                   "Raw per-trial judges, host isolation, usage, tool traces and pinned model parameters remain in the child artifacts."])
     if not result["evidence_complete"]:

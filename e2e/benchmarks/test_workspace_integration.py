@@ -58,7 +58,7 @@ class FakeContext:
 
 
 class WorkspaceIntegrationTests(unittest.TestCase):
-    def test_workspace_tasks_are_opt_in_to_both_clis(self):
+    def test_regression_and_workspace_tasks_remain_available_to_both_clis(self):
         self.assertEqual(report.DEFAULT_TASKS, ("native_notes", "browser_work_order", "canvas_route", "transient_dialog"))
         self.assertEqual(report.TASKS, report.DEFAULT_TASKS + report.WORKSPACE_TASKS)
         self.assertIsNone(report.parser().parse_args(["tasks"]).task)
@@ -80,8 +80,15 @@ class WorkspaceIntegrationTests(unittest.TestCase):
                 patch.object(pilot, "browser_identity", return_value={"binary": "/fixture/browser", "version": "1", "sha256": "a" * 64}):
             return pilot.build_plan(pilot.parser().parse_args(options))
 
-    def test_default_plan_does_not_silently_add_workspace_trials(self):
+    def test_default_model_plan_uses_workspace_tasks_and_appropriate_budgets(self):
         plan = self.plan()
+        self.assertEqual(plan["tasks"], list(report.WORKSPACE_TASKS))
+        self.assertEqual(plan["trial_count"], 12)
+        self.assertEqual((plan["model_config"]["max_steps"], plan["model_config"]["timeout_seconds"]), (100, 300))
+        self.assertIn("generate reproducible case data", plan["case_seed_semantics"])
+
+    def test_explicit_legacy_tasks_preserve_regression_selection(self):
+        plan = self.plan(list(report.DEFAULT_TASKS))
         self.assertEqual(plan["tasks"], list(report.DEFAULT_TASKS))
         self.assertEqual(plan["trial_count"], 16)
         self.assertIn("fixed fixtures", plan["case_seed_semantics"])

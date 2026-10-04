@@ -4,15 +4,17 @@ Raw verification evidence under `build/` and `e2e/artifacts/` is local and Git-i
 
 ## Shared model runner
 
-The opt-in workspace suite adds generated cases that require information from several
+The primary model benchmark uses generated workspace cases that require information from several
 views and preserve unrelated records. Run
 `SC_E2E_APP=build/SecondCursor.app python3 e2e/workspace_workflows.py --rounds 3`
 for a scripted UI regression, or add an explicit model and host configuration for
 context-gathering trials. For example, append
 `--model-host cursor-sdk --model claude-opus-5-5 --reasoning-effort low --model-param effort=low --model-param fast=true --model-param context=300k`.
 `--seed` changes the workspace data; it does not control model sampling. These are
-synthetic workflows, not public benchmark submissions. The legacy four tasks remain
-the default for `model_benchmark.py`. See [workspace acceptance](../../docs/acceptance-workspace-workflows.md).
+synthetic workflows, not public benchmark submissions. `model_benchmark.py` and
+`model_sweep.py` default to these three cases; legacy tasks require explicit `--task`
+selection. The lower-level scripted `best_in_class.py tasks` retains its four-task
+regression default. See [workspace acceptance](../../docs/acceptance-workspace-workflows.md).
 
 Artifacts also pin the effective browser extension loaded by `start-browser.py`,
 including `SC_E2E_EXTENSION` overrides. Its content hash participates in the runner
@@ -26,7 +28,7 @@ From the repository root, inspect the exact schedule without starting a model or
 ```sh
 SC_E2E_APP="$HOME/Applications/SecondCursor.app" python3 e2e/model_benchmark.py \
   --engine both --model gpt-6.1-sol --reasoning-effort high \
-  --rounds 3 --seed 1 --native-placement desktop --max-steps 40 --timeout 300 --list
+  --rounds 3 --seed 1 --max-steps 100 --timeout 300 --list
 ```
 
 Run that schedule by removing `--list`:
@@ -34,10 +36,10 @@ Run that schedule by removing `--list`:
 ```sh
 SC_E2E_APP="$HOME/Applications/SecondCursor.app" python3 e2e/model_benchmark.py \
   --engine both --model gpt-6.1-sol --reasoning-effort high \
-  --rounds 3 --seed 1 --native-placement desktop --max-steps 40 --timeout 300
+  --rounds 3 --seed 1 --max-steps 100 --timeout 300
 ```
 
-With no `--task` filter, both commands select `native_notes`, `browser_work_order`, `canvas_route`, and `transient_dialog`: two engines × four tasks × three rounds = 24 trials. Engine order alternates by round, Second Cursor/Cua then Cua/Second Cursor, followed by Second Cursor/Cua. Seeds identify repeated fixed cases; they do not randomize fixtures or seed provider sampling. The runner defaults to a 240-second trial budget; the commands above explicitly use 300 seconds for both engines. Adapter-owned setup consumes part of that budget, cleanup is bounded separately, and the 40-step limit counts model-requested fixture tool calls. `--list` reads local versions, binary hashes, and fixture metadata but does not run trials.
+With no `--task` filter, both commands select `workspace_reconcile`, `workspace_handoff`, and `workspace_recovery`: two engines × three tasks × three rounds = 18 trials. Engine order alternates by round. Seeds generate matched case data, including names, amounts, assignments, releases, and display order; they do not seed provider sampling. Both runners default to a 300-second trial budget and 100 tool calls. Adapter setup consumes part of that budget, and cleanup is bounded separately. `--list` reads versions, hashes, and fixture metadata without running trials. Explicit `--task native_notes`, `--task browser_work_order`, `--task canvas_route`, and `--task transient_dialog` remain available for regression coverage.
 
 The shared runner defaults to native fixtures on the ordinary desktop and headed Chrome for Testing for both engines. Each browser trial gets a fresh harness-owned profile, process, and active `about:blank` tab. The plan pins `browser_visibility` and `browser_identity` (absolute executable path, version, and SHA-256); each adapter verifies the live process executable and stable process identity before connecting. Second Cursor claims exactly the sole blank tab and cannot open another one. Cua binds the supplied PID/window through public `get_browser_state`; a refused binding never substitutes a different browser. The harness owns browser termination.
 
@@ -85,13 +87,13 @@ Model-driven requests additionally carry `engine`, `engine_version`, `interface_
 
 `catalog_mode` defaults to `full`. The opt-in `compact` native catalog advertises `batch`, `get_window_state`, `inspect_element`, `find_elements`, `screenshot`, and `wait_for`. It retains the complete batch schema and standalone action instructions after checking typed argument coverage. The engine keeps its full allowlist for nested validation; only the model's advertised definitions change. Adapter results retain catalog hashes, advertised names, and canonical byte counts. `model_efficiency.py --experiment tool-surface` compares this profile against the full catalog with upfront observations held constant; the ordinary comparator rejects mixed catalog modes.
 
-`model_sweep.py` separately compares Grok 4.5 Fast low/medium, Grok 4.7 Fast medium, and Sol 6.1 medium/high through Second Cursor. Grok uses the pinned Cursor SDK host; Sol uses the audited Codex host. Install and authenticate the [Cursor host](../cursor_host/README.md) first. Run `python3 e2e/model_sweep.py --rounds 3 --timeout 90 --list` from the repository root to inspect the native schedule; remove `--list` to execute it. Browser coverage uses `--rounds 1 --task browser_work_order --task transient_dialog`. Native-only plans supply upfront observations; browser or mixed plans use on-demand observations. Every profile in a cohort receives the same observation mode, full tool catalog, budgets, fixtures, and driver binary.
+`model_sweep.py` separately compares the same five Grok/Sol profiles through Second Cursor, now on the three workspace cases by default. Grok uses the pinned [Cursor SDK host](../cursor_host/README.md); Sol uses the audited Codex host. `python3 e2e/model_sweep.py --profile sol-6.1-medium --profile sol-6.1-high --rounds 2 --seed 41 --list` previews 12 Sol workspace trials. Omitting `--profile` with the default three rounds schedules 45 trials. Every profile receives the same on-demand observations, full tool catalog, 100-call/300-second budgets, fixtures, and driver binary. An explicit native-only regression still uses upfront observations; `model_efficiency.py` remains the separate native observation/catalog experiment.
 
-The sweep alternates profile order across rounds and explicitly permits only its declared model, host, effort, model parameters, and host-version differences. Each child still passes the ordinary runner's exact-plan validation. `model-sweep-*` artifacts retain all scheduled cases, partial evidence, per-profile reports, and per-task summaries. Failed, inconclusive, and missing cases stay in the denominator; only strict passes with independently verified task success contribute to latency. Cross-host results measure the complete integration, not isolated inference speed. See [the acceptance criteria](../../docs/acceptance-model-sweep.md) and [the initial comparison](../../docs/verification-model-sweep-2026-10-04.md).
+The sweep alternates profile order across rounds and explicitly permits only its declared model, host, effort, model parameters, and host-version differences. Each child still passes the ordinary runner's exact-plan validation. `model-sweep-*` artifacts retain all scheduled cases, partial evidence, per-profile reports, and per-task summaries. Failed, inconclusive, and missing cases stay in the denominator; only strict passes with independently verified task success contribute to latency. Cross-host results measure the complete integration, not isolated inference speed. See [the acceptance criteria](../../docs/acceptance-model-sweep.md) and [the Sol workspace comparison](../../docs/verification-sol-workspace-2026-10-05.md).
 
-Repeat `--profile` to select a smaller explicit cohort. The optional `opus-5.5-fast-low` and `opus-5.5-fast-medium` profiles use Cursor SDK with `claude-opus-5-5`, 300k context, matching effort, and `fast=true`. For example, `python3 e2e/model_sweep.py --profile opus-5.5-fast-low --profile opus-5.5-fast-medium --rounds 3 --timeout 90 --list` previews six native trials. Omitting `--profile` preserves the original five Grok/Sol configurations; adding models to the registry does not increase default usage.
+Repeat `--profile` to select a smaller explicit cohort. The optional `opus-5.5-fast-low` and `opus-5.5-fast-medium` profiles use Cursor SDK with `claude-opus-5-5`, 300k context, matching effort, and `fast=true`. `python3 e2e/model_sweep.py --profile opus-5.5-fast-low --profile opus-5.5-fast-medium --rounds 3 --list` previews 18 workspace trials. Omitting `--profile` preserves the original five Grok/Sol configurations; this change adds no model profiles.
 
-Normalized tool events carry `origin` (`model` or `host-prefetch`), `call_id`, and `arguments`. Terminal evidence reports `model_tool_calls`, `prefetch_tool_calls`, and `driver_tool_calls`; these are attempted calls, including rejected attempts, not a count of successful low-level input events. Host milestones measure local observations of startup and model activity, not provider inference time. Verified-completion timing is available only when the final tool response proves the exact expected note, the Calculator result was observed, and the later independent judge and coexistence checks pass. Its clock begins at adapter entry; full harness-measured process time remains a separate metric.
+Normalized tool events carry `origin` (`model` or `host-prefetch`), `call_id`, and `arguments`. Terminal evidence reports `model_tool_calls`, `prefetch_tool_calls`, and `driver_tool_calls`, including dispatched calls that fail or are refused; a batch counts as one model call rather than its individual input actions. Some Codex requests rejected before dispatch terminate the trial before a normalized event is emitted, so the raw host trace and failed-trial status remain necessary alongside these counts. Host milestones measure local observations of startup and model activity, not provider inference time. Verified-completion timing is available only when the final tool response proves the exact expected note, the Calculator result was observed, and the later independent judge and coexistence checks pass. Its clock begins at adapter entry; full harness-measured process time remains a separate metric. Workspace trials use adapter wall time because this native-only completion derivation does not apply to them.
 
 With explicit `--off-space`, `native_placement` is `textedit-off-space`: TextEdit stays on its ordinary inactive Space, while Calculator retains the agent-display setup. The harness verifies TextEdit remains off screen and outside the agent display before and after execution. Default placement and task-result checks are unchanged, and comparison requires matching native placements.
 

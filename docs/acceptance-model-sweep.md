@@ -12,11 +12,15 @@ denominator. Ordinary cross-driver comparison must continue rejecting different
 model configurations. The separate sweep explicitly permits only its declared
 host, model, effort, parameters, and host-version differences.
 
-Initial screen: three rounds of the native editing task, then one round each of
-work-order navigation/submission and cancel/accept dialog handling. These are
-tool-use reliability tests, not a general intelligence or unexpected-error
-recovery benchmark. Native trials use upfront observations; browser trials use
-on-demand observations, consistently across models within each task cohort.
+The primary screen uses `workspace_reconcile`, `workspace_handoff`, and
+`workspace_recovery`, with 100 tool calls and 300 seconds per trial. Case seeds
+generate matched business records and display order. The default five model
+profiles are unchanged; repeat `--profile` to select a smaller cohort. Workspace
+trials use on-demand observations consistently across models.
+
+The earlier Calculator editing, work-order form, and dialog tests remain explicit
+`--task` regressions. Native-only selections retain upfront observations, and the
+separate `model_efficiency.py` experiment keeps its existing native task and budgets.
 
 Independent exact outcome judging is required. Record incomplete, refused,
 failed, interrupted, and setup-blocked trials without silently retrying or
@@ -30,6 +34,7 @@ Browser launch can change foreground during setup; retain that evidence and do
 not claim unattended background coexistence from task success.
 
 Model costs and inference time remain unknown unless directly measured. Usage
-keeps its provider semantics. Small fixed-task samples support a provisional
-operating choice only; a harder invoice or inbox fixture is a later accuracy
-test, not an implied result of this screen.
+keeps its provider semantics. Earlier easy-task timings remain regression evidence
+and do not establish the primary model recommendation. The workspace cases test
+context gathering, record preservation, and recovery; small synthetic samples still
+cannot establish general intelligence or a best-in-class ranking.

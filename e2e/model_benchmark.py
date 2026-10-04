@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Run matched model-driven trials, serially and interleaved across drivers.
+"""Run seeded workspace model trials, serially and interleaved across drivers.
 
 --list reads versions and prints the schedule without launching any desktop or model.
 Every real trial retains the existing independent judges and disposable fixtures.
+Legacy regression tasks remain available through explicit --task selections.
 """
 import argparse
 import copy
@@ -77,17 +78,18 @@ def parser():
     cli.add_argument("--reasoning-effort", choices=report.REASONING_EFFORTS)
     cli.add_argument("--configured-model", action="store_true", help="Pin this user's configured Codex model and effort")
     cli.add_argument("--rounds", type=int, default=3)
-    cli.add_argument("--task", action="append", choices=report.TASKS)
+    cli.add_argument("--task", action="append", choices=report.TASKS,
+                     help="Defaults to workspace reconciliation, handoff and recovery; repeat to select explicit tasks")
     cli.add_argument("--seed", type=int, default=1, help="First workspace case seed or legacy trial ID; does not seed provider sampling")
     placement = cli.add_mutually_exclusive_group()
     placement.add_argument("--native-placement", choices=("desktop", "agent-display", "textedit-off-space"),
                            default="desktop", help="Native fixture placement for both drivers (default: desktop)")
     placement.add_argument("--off-space", action="store_const", dest="native_placement", const="textedit-off-space",
                            help="Alias for --native-placement textedit-off-space")
-    cli.add_argument("--max-steps", type=int, default=40)
+    cli.add_argument("--max-steps", type=int, default=100)
     cli.add_argument("--observation-mode", choices=("on-demand", "upfront"), default="on-demand")
     cli.add_argument("--catalog-mode", choices=("full", "compact"), default="full")
-    cli.add_argument("--timeout", type=float, default=240, help="Per-trial solver budget in seconds")
+    cli.add_argument("--timeout", type=float, default=300, help="Per-trial solver budget in seconds (default: 300)")
     cli.add_argument("--codex-binary", default=shutil.which("codex") or "codex")
     cli.add_argument("--cua-binary", default=shutil.which("cua-driver") or "cua-driver")
     cli.add_argument("--list", action="store_true")
@@ -124,7 +126,7 @@ def build_plan(args):
     identities = {"second-cursor": "sha256:" + report.digest(binary)}
     if "cua-driver" in engines:
         identities["cua-driver"] = version(args.cua_binary)
-    tasks = args.task or list(report.DEFAULT_TASKS)
+    tasks = args.task or list(report.WORKSPACE_TASKS)
     if len(set(tasks)) != len(tasks):
         raise ValueError("Duplicate task selection")
     pinned_browser = browser_identity() if any(task != "native_notes" for task in tasks) else None
