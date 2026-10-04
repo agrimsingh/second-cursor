@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from benchmarks.engines import (EngineError, HTTPMCP, ScopeError, ScopedEngine, StdioMCP,
-                                UnsupportedEngine, create_engine, process_identity)
+                                UnsupportedEngine, _ok, create_engine, process_identity)
 
 FAKE_PROCESSES = {}
 
@@ -69,7 +69,7 @@ def sc_tools():
     tools = [definition("get_window_state", ["window_id", "app", "include_menu_bar", "include_screenshot", "scope", "session_id"]),
              definition("click", ["window_id", "element_index", "x", "y", "session_id"]),
              definition("press_key", ["window_id", "keys"], ["keys"]),
-             definition("batch", ["window_id", "tab_id", "steps"], ["steps"]),
+             definition("batch", ["window_id", "tab_id", "steps", "expect"], ["steps"]),
              definition("browser_open", ["url"], ["url"]),
              definition("browser_close", ["tab_id"], ["tab_id"]),
              definition("browser_snapshot", ["tab_id", "include_screenshot"]),
@@ -79,6 +79,7 @@ def sc_tools():
              definition("browser_command", ["tab_id", "operation", "arguments"], ["operation"]),
              definition("browser_repl", ["code"]), definition("list_windows")]
     tools[-3]["inputSchema"]["properties"]["arguments"] = {"type": "object", "description": "Operation-specific fields."}
+    tools[3]["inputSchema"]["properties"]["steps"] = {"type": "array", "items": {"type": "object", "properties": {"keys": {"type": "string"}}}}
     return tools
 
 
@@ -319,6 +320,66 @@ class ScopeTests(unittest.TestCase):
             with ScopedEngine("second-cursor", request, FakeMCP(sc_tools())) as engine:
                 with self.assertRaises(ScopeError):
                     engine.call("batch", args)
+
+    def test_browser_batch_projection_omits_native_expect_and_rejects_before_dispatch(self):
+        client = FakeMCP(sc_tools(), {"browser_open": content({"tab": {"id": 4, "url": URL}})})
+        with ScopedEngine("second-cursor", BROWSER, client) as engine:
+            schema = next(tool["inputSchema"] for tool in engine.tools() if tool["name"] == "batch")
+            self.assertNotIn("expect", schema["properties"])
+            self.assertNotIn("expect", schema["required"])
+            engine.call("browser_open", {"url": URL})
+            with self.assertRaisesRegex(ScopeError, "Browser tab batches do not support expect"):
+                engine.call("batch", {"tab_id": 4, "steps": [{"tool": "browser_click", "ref": "e1"}],
+                                      "expect": {"text": "Saved"}})
+            self.assertEqual([name for name, _ in client.calls], ["browser_open"])
+        with ScopedEngine("second-cursor", NATIVE, FakeMCP(sc_tools())) as engine:
+            schema = next(tool["inputSchema"] for tool in engine.tools() if tool["name"] == "batch")
+            self.assertIn("expect", schema["properties"])
+
+    def test_key_aliases_work_in_direct_browser_commands_and_batches_without_scope_escape(self):
+        client = FakeMCP(sc_tools(), {"browser_open": content({"tab": {"id": 4, "url": URL}})})
+        with ScopedEngine("second-cursor", BROWSER, client) as engine:
+            engine.call("browser_open", {"url": URL})
+            engine.call("browser_press_key", {"tab_id": 4, "keys": "ArrowDown"})
+            engine.call("browser_command", {"tab_id": 4, "operation": "press_key", "arguments": {"keys": "ArrowUp"}})
+            engine.call("batch", {"tab_id": 4, "steps": [{"tool": "browser_press_key", "keys": "Shift+Command+ArrowLeft"}]})
+            self.assertEqual(client.calls[-1][1]["steps"][0]["keys"], "Shift+Command+ArrowLeft")
+            prior_calls = len(client.calls)
+            for key in ("Command+L", "Super+C", "Control+V", "Command+Command+A", "Alt+ArrowLeft"):
+                with self.subTest(key=key), self.assertRaises(ScopeError):
+                    engine.call("browser_press_key", {"tab_id": 4, "keys": key})
+            self.assertEqual(len(client.calls), prior_calls)
+            tools = {tool["name"]: tool for tool in engine.tools()}
+            self.assertIn("ArrowDown", tools["browser_press_key"]["inputSchema"]["properties"]["keys"]["description"])
+            self.assertIn("ArrowDown", tools["browser_command"]["inputSchema"]["properties"]["arguments"]["description"])
+            self.assertIn("ArrowDown", tools["batch"]["inputSchema"]["properties"]["steps"]["items"]["properties"]["keys"]["description"])
+        with ScopedEngine("second-cursor", NATIVE, FakeMCP(sc_tools())) as engine:
+            engine.call("press_key", {"window_id": 11, "keys": "ArrowDown"})
+            engine.call("press_key", {"window_id": 11, "keys": "Shift+Command+ArrowRight"})
+
+    def test_partial_batch_telemetry_retains_failure_and_allows_recovery(self):
+        failed = content({"outcome": {"state": "failed", "verified": False},
+                          "steps": [{"ok": True}, {"ok": False}, {"ok": False, "skipped": True}]})
+        recovered = content({"outcome": {"state": "verified", "verified": True}, "steps": [{"ok": True}]})
+        responses, events = iter([failed, recovered]), []
+        client = FakeMCP(sc_tools(), {"batch": lambda args: next(responses)})
+        with ScopedEngine("second-cursor", NATIVE, client, events.append) as engine:
+            args = {"window_id": 11, "steps": [{"tool": "click", "element_index": 1}]}
+            self.assertEqual(engine.call("batch", args), failed)
+            self.assertEqual(engine.call("batch", args), recovered)
+        self.assertEqual([event["ok"] for event in events], [False, True])
+        self.assertEqual([event["transport_status"] for event in events], ["completed", "completed"])
+
+    def test_public_outcome_failures_include_text_only_legacy_steps_but_not_ui_contents(self):
+        for data in ({"steps": [{"ok": True}, {"ok": False}]}, {"results": [{"skipped": True}]},
+                     {"expect": {"status": "failed"}}, {"outcome": {"state": "uncertain"}},
+                     {"results": [{"outcome": {"state": "failed"}}]}, {"status": "refused"}):
+            with self.subTest(data=data):
+                self.assertFalse(_ok(content(data)))
+                self.assertFalse(_ok({"content": [{"type": "text", "text": json.dumps(data)}]}))
+        self.assertTrue(_ok(content({"observation": {"outcome": {"state": "failed"}, "ok": False,
+                                                   "steps": [{"ok": False}]}})))
+        self.assertTrue(_ok(content({"outcome": {"state": "observed", "verified": False}})))
 
     def test_browser_only_owns_successfully_created_exact_fixture_tab(self):
         client = FakeMCP(sc_tools(), {"browser_open": content({"tab": {"id": 4, "url": URL}})})

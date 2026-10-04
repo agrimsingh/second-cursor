@@ -45,9 +45,12 @@ enum Keyboard {
         "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\", ":": ";", "\"": "'", "<": ",", ">": ".", "?": "/", "~": "`",
     ]
 
-    /// X11 keysym spellings (xdotool, OpenAI computer-use) that differ from the names above. xdotool's
+    /// X11 keysyms and browser KeyboardEvent.key names that differ from the names above. xdotool's
     /// "Delete" is forward delete, but "delete" keeps the macOS meaning (backspace) here.
-    private static let aliases: [String: String] = ["prior": "pageup", "next": "pagedown"]
+    private static let aliases: [String: String] = [
+        "prior": "pageup", "next": "pagedown",
+        "arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right",
+    ]
 
     /// Names are case-insensitive, and `_`/`-` inside a multi-character name are ignored ("Page_Down", "KP_Enter").
     private static func normalized(_ name: String) -> String {

@@ -14,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from benchmarks import cursor_model_host as host
 from benchmarks.model_host import HostConfig
+from benchmarks.engines import ScopeError
 
 VERSION = "cursor-sdk 1.0.35 node v22.23.1"
 PARAMS = {"reasoning_effort": "medium", "fast": "true", "context": "256k"}
@@ -202,6 +203,18 @@ class CursorHostTests(unittest.TestCase):
         self.assertTrue(response["isError"])
         self.assertEqual(next(event["status"] for event in events if event["type"] == "tool"), "error")
         self.assertNotIn("super-secret-token", json.dumps(bridge.sent) + json.dumps(events) + json.dumps(result.as_dict()))
+
+    def test_scope_refusal_is_actionable_and_model_can_recover(self):
+        def callback(name, args):
+            if args.get("value") == 1:
+                raise ScopeError("Required tool arguments are missing: element_index")
+            return {"content": [{"type": "text", "text": "Recovered."}]}
+        result, bridge, events = self.run_host([ready(), call(), call("call-2", arguments={"value": 2}), finished()], callback)
+        self.assertEqual(result.status, "completed")
+        replies = [item["result"] for item in bridge.sent if item["type"] == "tool_result"]
+        self.assertTrue(replies[0]["isError"])
+        self.assertIn("Required tool arguments are missing: element_index", replies[0]["content"][0]["text"])
+        self.assertEqual([event["status"] for event in events if event["type"] == "tool"], ["error", "completed"])
 
     def test_invalid_fixture_content_is_explicit_error(self):
         responses = [{"content": [{"type": "audio", "data": "xx"}]},

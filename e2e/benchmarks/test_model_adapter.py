@@ -193,9 +193,48 @@ class AdapterTests(unittest.TestCase):
                       "status": status})
         _, final, events, _, _, _ = self.invoke(host_run=run)
         self.assertEqual([item["ok"] for item in events[:-1]], [True, False, False])
+        self.assertEqual([item["host_status"] for item in events[:-1]], ["completed", "error", "timeout"])
         self.assertTrue(all(item["end_ms"] >= item["start_ms"] for item in events[:-1]))
         self.assertEqual((final["model_tool_calls"], final["driver_tool_calls"]), (3, 3))
         self.assertIsNone(final["cost_usd"])
+
+    def test_partial_batch_then_recovery_keeps_failed_attempt_without_failing_turn(self):
+        failed = {"content": [], "structuredContent": {
+            "tab_id": 1, "completed": 1, "stopped_early": True,
+            "steps": [{"index": 0, "ok": True},
+                      {"index": 1, "ok": False, "error": "Target is not editable"},
+                      {"index": 2, "ok": False, "skipped": True}],
+            "outcome": {"state": "failed", "verified": False}}}
+        recovered = {"content": [], "structuredContent": {
+            "tab_id": 1, "outcome": {"state": "verified", "verified": True}}}
+
+        def run(emit):
+            for number, response in enumerate((failed, recovered)):
+                emit({"type": "tool", "call_id": f"call-{number}", "arguments": {"tab_id": 1},
+                      "name": "batch" if number == 0 else "browser_type",
+                      "start_ms": number * 2, "end_ms": number * 2 + 1,
+                      "status": "completed", "result": response})
+
+        code, final, events, trace, _, _ = self.invoke(host_run=run)
+        self.assertEqual([item["ok"] for item in events[:-1]], [False, True])
+        self.assertEqual([item["host_status"] for item in events[:-1]], ["completed", "completed"])
+        self.assertEqual((code, final["status"], final["host_status"]), (0, "completed", "completed"))
+        self.assertEqual((final["model_tool_calls"], final["driver_tool_calls"]), (2, 2))
+        raw = [item for item in trace if item["source"] == "model_host"]
+        self.assertEqual([item["result"] for item in raw], [failed, recovered])
+
+    def test_native_failed_postcondition_is_not_a_successful_tool_call(self):
+        def run(emit):
+            emit({"type": "tool", "call_id": "native-append", "arguments": {"window_id": 202},
+                  "name": "type_text", "start_ms": 1, "end_ms": 2, "status": "completed",
+                  "result": {"structuredContent": {
+                      "window_id": 202, "expect": {"status": "failed"},
+                      "outcome": {"state": "failed", "verified": False}}}})
+
+        _, final, events, _, _, _ = self.invoke(host_run=run)
+        self.assertFalse(events[0]["ok"])
+        self.assertEqual(events[0]["host_status"], "completed")
+        self.assertEqual(final["driver_tool_calls"], 1)
 
     def test_setup_deadline_interrupts_and_cleans(self):
         engine = FakeEngine()

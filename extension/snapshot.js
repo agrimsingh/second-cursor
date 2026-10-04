@@ -301,20 +301,20 @@ function mergeText(lines) {
   return out;
 }
 
-// Per tab, the frames Chrome runs in their own process that refs point into: ordinal → { frameId, parent, owner },
-// where owner is the <iframe>'s backend node id in the parent frame (ordinal 0 is the tab's own process).
+// Per tab, refs bind to the renderer session that issued their backend IDs: ordinal → { frameId, session, parent,
+// owner }. Replacement sessions get new ordinals so previously returned refs can never retarget a new renderer.
+// owner is the <iframe>'s backend node id in the parent frame (ordinal 0 is the tab's own process).
 const isolatedFrames = new Map();
 chrome.tabs.onRemoved.addListener((tabId) => isolatedFrames.delete(tabId));
 
-function frameOrdinal(tabId, frameId, parent, owner) {
+function frameOrdinal(tabId, frameId, session, parent, owner) {
   const frames = isolatedFrames.get(tabId) ?? new Map();
   isolatedFrames.set(tabId, frames);
   for (const [n, f] of frames) {
-    if (f.frameId !== frameId) continue;
-    Object.assign(f, { parent, owner });
+    if (f.frameId !== frameId || f.session !== session || f.parent !== parent || f.owner !== owner) continue;
     return n;
   }
-  frames.set(frames.size + 1, { frameId, parent, owner });
+  frames.set(frames.size + 1, { frameId, session, parent, owner });
   return frames.size;
 }
 
@@ -359,9 +359,10 @@ async function collect(tabId) {
           const frameId = node?.frameId;
           if (!frameId) return;
           // A frame that detaches mid-read leaves its iframe line empty rather than failing the snapshot.
-          if (!frameSession(tabId, frameId)) return read(renderer, frameId, iframe).catch(() => {});
-          const send = (method, params) => frameCDP(tabId, frameId, method, params);
-          const ordinal = frameOrdinal(tabId, frameId, renderer.ordinal, iframe.backendDOMNodeId);
+          const session = frameSession(tabId, frameId);
+          if (!session) return read(renderer, frameId, iframe).catch(() => {});
+          const send = (method, params) => frameCDP(tabId, frameId, method, params, { expectedSession: session });
+          const ordinal = frameOrdinal(tabId, frameId, session, renderer.ordinal, iframe.backendDOMNodeId);
           const facts = domFacts(send).catch(() => new Map());
           return read({ send, ordinal, frameId, facts }, frameId, iframe).catch(() => {});
         }),

@@ -21,18 +21,24 @@ const gone = (ref) => new BridgeError("invalid_argument", `Ref ${ref} is no long
 function resolve(tabId, ref) {
   const match = /^(?:f(\d+))?e?(\d+)$/.exec(String(ref ?? "").trim());
   if (!match) throw new BridgeError("invalid_argument", `Invalid ref ${JSON.stringify(ref)}; use an [e123] ref from browser_snapshot`);
-  const sender = (frameId) => (frameId ? (method, params) => frameCDP(tabId, frameId, method, params) : (method, params) => cdp(tabId, method, params));
+  const sender = (frameId) => {
+    if (!frameId) return (method, params) => cdp(tabId, method, params);
+    const expectedSession = frameSession(tabId, frameId);
+    if (!expectedSession) throw gone(ref);
+    return (method, params) => frameCDP(tabId, frameId, method, params, { expectedSession });
+  };
   const owners = [];
   let frameId = null;
   for (let ordinal = Number(match[1] ?? 0); ordinal; ) {
     const frame = isolatedFrame(tabId, ordinal);
     // Without its session, a frame's backend ids would be looked up in the tab's own process, where they name other nodes.
-    if (!frame || !frameSession(tabId, frame.frameId)) throw gone(ref);
+    if (!frame?.session || frame.session !== frameSession(tabId, frame.frameId)) throw gone(ref);
     frameId ??= frame.frameId;
-    owners.unshift({ id: frame.owner, send: sender(isolatedFrame(tabId, frame.parent)?.frameId) });
+    const parentFrameId = isolatedFrame(tabId, frame.parent)?.frameId;
+    owners.unshift({ id: frame.owner, send: sender(parentFrameId), frameId: parentFrameId });
     ordinal = frame.parent;
   }
-  return { id: Number(match[2]), send: sender(frameId), owners };
+  return { id: Number(match[2]), send: sender(frameId), owners, frameId };
 }
 
 /** Where each frame of the ref's chain starts in the tab's viewport, from the tab's frame down to the ref's own. */
@@ -211,21 +217,153 @@ async function suggests(send, id) {
     || attributes.autocomplete === "off" || ["aria-autocomplete", "aria-controls", "aria-owns", "list"].some((a) => a in attributes);
 }
 
+// These programs only inspect DOM state. Text always goes through Input.insertText, never a page value setter.
+// A successful DOM.focus is not evidence of focus: Chrome can leave the previous field active for a <select>,
+// a disabled field, or a page focus handler that immediately redirects it.
+const TYPING_STATE = `function (checkFocus, frameBoundaryKnown, ownerOnly) {
+  const parent = (node) => node.parentElement || node.getRootNode()?.host;
+  if (!this.isConnected) return "the target is no longer on the page";
+  const blocked = (element) => {
+    for (let node = element; node; node = parent(node)) {
+      if (node.inert || node.getAttribute("aria-disabled") === "true") return "the target is disabled or inert";
+      if (node.getAttribute("aria-readonly") === "true") return "the target is read-only";
+    }
+    if (element.disabled || element.matches(":disabled")) return "the target is disabled";
+    if (element.readOnly) return "the target is read-only";
+    return null;
+  };
+  const initialBlock = blocked(this);
+  if (initialBlock) return initialBlock;
+  if (!ownerOnly) {
+    const tag = this.localName;
+    if (tag === "select") return "the target is a dropdown; use browser_command operation=select_option";
+    const textInput = tag === "input" && ["text", "search", "email", "url", "tel", "password", "number"].includes(this.type);
+    if (!textInput && tag !== "textarea" && !this.isContentEditable)
+      return "the target is not an editable text field; use a ref for its editable input";
+  }
+  if (!checkFocus) return null;
+  let node = this;
+  for (;;) {
+    const ownerBlock = node !== this && blocked(node);
+    if (ownerBlock) return ownerBlock;
+    let root = node.getRootNode();
+    const active = root.activeElement;
+    // Even an editable descendant may be a separate editor; focus redirection is not ownership of this ref.
+    if (active !== node) return "focus moved to a different element";
+    if (node.shadowRoot?.activeElement) return "focus moved inside a different shadow editor; use its editable ref";
+    while (root.host) {
+      node = root.host;
+      root = node.getRootNode();
+      if (root.activeElement !== node) return "focus moved outside the target's shadow root";
+    }
+    const view = root.defaultView;
+    if (!view) return "the target's document is unavailable";
+    if (view === view.top) return null;
+    let frame;
+    try { frame = view.frameElement; } catch (_) {}
+    // Cross-origin/process boundaries are checked separately against the iframe owner refs in their sessions.
+    if (!frame) return frameBoundaryKnown ? { boundary: true } : "the parent frame's focus cannot be verified; use a fresh browser_snapshot ref";
+    node = frame;
+  }
+}`;
+
+const FOCUSED_TYPING_TARGET = `(() => {
+  let node = document.activeElement;
+  for (;;) {
+    if (node?.shadowRoot?.activeElement) { node = node.shadowRoot.activeElement; continue; }
+    if (["iframe", "frame"].includes(node?.localName)) {
+      try {
+        if (!node.contentDocument) return null;
+        node = node.contentDocument.activeElement;
+        continue;
+      } catch (_) { return null; }
+    }
+    return node;
+  }
+})()`;
+
+async function checkTypingTarget(send, objectId, { focus = false, frameId, owner = false, objectGroup } = {}) {
+  if (focus && !owner) {
+    const { node } = await send("DOM.describeNode", { objectId });
+    // Closed author roots hide their activeElement from page inspection. Native inputs' user-agent roots are
+    // different: the input itself owns the editing contract. A ref inside a closed root remains inspectable.
+    if (node?.shadowRoots?.some(root => root.shadowRootType === "closed"))
+      throw new BridgeError("failed", "Typing was not sent: a closed shadow host cannot prove editable focus; use the editable ref inside it");
+  }
+  const response = await send("Runtime.callFunctionOn", {
+    objectId, functionDeclaration: TYPING_STATE,
+    arguments: [focus, !!frameId, owner].map(value => ({ value })), returnByValue: true,
+  });
+  if (!response.exceptionDetails && response.result?.value?.boundary) {
+    // A ref can also be in a same-process child of an isolated frame. Only accept the opaque boundary whose
+    // owner was verified; an additional cross-origin ancestor must never inherit that proof accidentally.
+    const { result, exceptionDetails } = await send("Runtime.callFunctionOn", {
+      objectId, objectGroup, functionDeclaration: `function () {
+        let doc = this.ownerDocument;
+        while (doc.defaultView !== doc.defaultView.top) {
+          let frame;
+          try { frame = doc.defaultView.frameElement; } catch (_) {}
+          if (!frame) break;
+          doc = frame.ownerDocument;
+        }
+        return doc.documentElement;
+      }`,
+    });
+    const description = !exceptionDetails && result?.objectId
+      ? await send("DOM.describeNode", { objectId: result.objectId }) : null;
+    if (description?.node?.frameId === frameId) return;
+    throw new BridgeError("failed", "Typing was not sent: an unverified parent frame owns focus; take a new browser_snapshot");
+  }
+  if (response.exceptionDetails || response.result?.value !== null)
+    throw new BridgeError("failed", `Typing was not sent: ${response.result?.value || "the target's editable focus could not be verified"}`);
+}
+
+let typingOperation = 0;
+
 export async function type(tabId, { ref, text, submit }) {
-  if (ref != null && ref !== "") {
-    const { id, send, owners } = resolve(tabId, ref);
-    await requireLive(send, id, ref);
-    await send("DOM.focus", { backendNodeId: id }).catch((error) => {
-      throw refError(ref, error);
-    });
-    if (text && !submit && !(await suggests(send, id).catch(() => true))) expectQuickReaction(tabId, QUICK_REACT_MS);
-    pointTo(tabId, async () => {
-      const { model } = await send("DOM.getBoxModel", { backendNodeId: id });
-      return shift(fieldPoint(model.border), await frameOffset(owners));
-    });
-  } else show(tabId);
-  if (text) await cdp(tabId, "Input.insertText", { text: String(text) });
-  if (submit) await pressKey(tabId, "Enter");
+  const objectGroup = `second-cursor-typing-${++typingOperation}`;
+  const releases = new Set();
+  try {
+    const hasRef = ref != null && ref !== "";
+    const target = hasRef ? resolve(tabId, ref) : { send: (method, params) => cdp(tabId, method, params), owners: [] };
+    const { id, send, owners, frameId } = target;
+    releases.add(send);
+    const response = hasRef
+      ? await send("DOM.resolveNode", { backendNodeId: id, objectGroup }).catch(error => { throw refError(ref, error); })
+      : await send("Runtime.evaluate", { expression: FOCUSED_TYPING_TARGET, objectGroup });
+    const objectId = (response.object ?? response.result)?.objectId;
+    if (!objectId || response.exceptionDetails)
+      throw new BridgeError("failed", "Typing was not sent: no editable focus could be identified; use a fresh browser_snapshot ref");
+    await checkTypingTarget(send, objectId);
+    if (hasRef) {
+      await send("DOM.focus", { backendNodeId: id }).catch(error => { throw refError(ref, error); });
+      if (text && !submit && !(await suggests(send, id).catch(() => true))) expectQuickReaction(tabId, QUICK_REACT_MS);
+      pointTo(tabId, async () => {
+        const { model } = await send("DOM.getBoxModel", { backendNodeId: id });
+        return shift(fieldPoint(model.border), await frameOffset(owners));
+      });
+    } else show(tabId);
+    const verifyFocus = async () => {
+      for (let index = 0; index < owners.length; index++) {
+        const owner = owners[index];
+        releases.add(owner.send);
+        const { object } = await owner.send("DOM.resolveNode", { backendNodeId: owner.id, objectGroup });
+        await checkTypingTarget(owner.send, object.objectId, { focus: true, frameId: owner.frameId, owner: true, objectGroup });
+      }
+      await checkTypingTarget(send, objectId, { focus: true, frameId, objectGroup });
+    };
+    // Do all cursor/metadata work first, then recheck the live target immediately before each input dispatch.
+    await verifyFocus();
+    if (text) await cdp(tabId, "Input.insertText", { text: String(text) });
+    if (submit) {
+      if (text) await verifyFocus().catch(error => {
+        throw new BridgeError("failed", `Text was inserted, but Enter was not sent: ${String(error.message ?? error).replace(/^Typing was not sent: /, "")}`);
+      });
+      await pressKey(tabId, "Enter");
+    }
+  } finally {
+    await Promise.all([...releases].map(send => send("Runtime.releaseObjectGroup", { objectGroup }).catch(() => {})));
+  }
 }
 
 export async function pressKey(tabId, keys) {

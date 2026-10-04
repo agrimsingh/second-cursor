@@ -20,6 +20,7 @@ from collections.abc import Callable
 from typing import Any
 
 from best_in_class import ReservedGroupProcess, stop_group
+from benchmarks.engines import ScopeError
 from benchmarks.model_host import HostConfig, HostError, HostResult, IsolationError, TrialDeadline, _tool_specs, tool_response
 
 DEFAULT_SDK_ROOT = pathlib.Path(__file__).resolve().parents[1] / "cursor_host"
@@ -360,6 +361,11 @@ class CursorModelHost:
                 emit({"type": "tool", "call_id": call_id, "name": name, "arguments": arguments,
                       "start_ms": call_start, "end_ms": now_ms(), "status": "timeout"})
                 raise
+            except ScopeError as exc:
+                # Only the local validator's authored public contract refusals
+                # are safe to forward. They let Cursor recover from a rejected
+                # call just as Codex can; arbitrary runtime errors stay masked.
+                response = {"content": [{"type": "text", "text": f"ScopeError: {exc}"}], "isError": True}
             except Exception:
                 # Exceptions can contain headers, endpoints or configuration.
                 # Give the solver an honest error without forwarding their text.

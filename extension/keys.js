@@ -70,7 +70,9 @@ function mainKey(token, modifiers) {
   if (SHIFTED[char]) {
     modifiers.add("shift");
     char = SHIFTED[char];
-  } else if (/[A-Z]/.test(char)) {
+  } else if (/[A-Z]/.test(char) && !["meta", "ctrl", "alt"].some((name) => modifiers.has(name))) {
+    // Shortcut labels such as Cmd+A name the key, not a shifted character. Literal A still types
+    // uppercase, and an explicit Shift modifier continues to distinguish Cmd+Shift+Z from Cmd+Z.
     modifiers.add("shift");
   }
   const shifted = modifiers.has("shift");

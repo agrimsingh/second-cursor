@@ -35,7 +35,11 @@ class UnsupportedEngine(EngineError):
 
 
 class ScopeError(EngineError):
-    pass
+    """A solver-facing refusal authored by the local fixture scope validator.
+
+    Messages must describe the public tool contract, never interpolate driver
+    diagnostics, configuration, credentials or arbitrary model argument values.
+    """
 
 
 def _objects(value):
@@ -74,11 +78,35 @@ def _unique(result, key, kind):
     return values.pop()
 
 
+def _outcome_ok(data):
+    """Inspect outcome fields, not arbitrary values inside an observed page/tree."""
+    if not isinstance(data, dict):
+        return True
+    if (data.get("status") == "refused" or data.get("ok") is False
+            or data.get("skipped") is True or data.get("uncertain") is True
+            or data.get("stopped_early") is True):
+        return False
+    outcome, expectation = data.get("outcome"), data.get("expect")
+    if isinstance(outcome, dict) and outcome.get("state") in ("failed", "uncertain"):
+        return False
+    if isinstance(expectation, dict) and expectation.get("status") in ("failed", "timeout"):
+        return False
+    # A batch can complete its transport successfully while only its first few
+    # actions succeed. Preserve that distinction even with older driver replies
+    # that lack the aggregate outcome annotation.
+    return all(_outcome_ok(step) for key in ("steps", "results")
+               if isinstance(data.get(key), list) for step in data[key])
+
+
 def _ok(result):
+    """Whether public tool outcome evidence is free of failure/uncertainty.
+
+    This is not proof that the user's task succeeded. It does not rewrite the
+    MCP response or prevent the model from observing and recovering from it.
+    """
     if not isinstance(result, dict) or result.get("isError", False):
         return False
-    data = result.get("structuredContent")
-    return not (isinstance(data, dict) and data.get("status") == "refused")
+    return all(_outcome_ok(data) for data in payloads(result))
 
 
 def _refusal_diagnostic(result):
@@ -398,6 +426,14 @@ SAFE_KEYS = {"return", "enter", "tab", "escape", "esc", "up", "down", "left", "r
              "backspace", "home", "end", "pageup", "pagedown", "cmd+a", "command+a", "ctrl+a",
              "cmd+left", "cmd+right", "cmd+up", "cmd+down", "shift+left", "shift+right", "shift+up", "shift+down",
              "cmd+shift+left", "cmd+shift+right", "cmd+shift+up", "cmd+shift+down"}
+KEY_ALIASES = {"arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right"}
+MODIFIER_ALIASES = {"command": "cmd", "super": "cmd", "control": "ctrl"}
+KEY_SCOPE_DESCRIPTION = (
+    " Fixture keyboard scope: letters/digits, Return/Enter, Tab, Escape/Esc, Space, Delete/Backspace, "
+    "Home/End, PageUp/PageDown, Up/Down/Left/Right (also ArrowUp/ArrowDown/ArrowLeft/ArrowRight); "
+    "Cmd+A or Ctrl+A; arrows with Cmd, Shift, or Cmd+Shift. Names are case-insensitive; "
+    "Command/Super mean Cmd and Control means Ctrl. Clipboard, browser chrome, file and app shortcuts are unavailable."
+)
 
 
 class ScopedEngine:
@@ -431,14 +467,16 @@ class ScopedEngine:
         self.started = self.closed = False
 
     def _invoke(self, name, args, phase="model"):
-        start, ok = (time.monotonic() - self.clock_start) * 1000, False
+        start, ok, transport_status = (time.monotonic() - self.clock_start) * 1000, False, "error"
         try:
             result = self.client.call(name, args)
+            transport_status = "completed"
             ok = _ok(result)
             return result
         finally:
             self.emit({"type": "tool", "name": name, "phase": phase, "start_ms": start,
-                       "end_ms": (time.monotonic() - self.clock_start) * 1000, "ok": ok, "retry": False})
+                       "end_ms": (time.monotonic() - self.clock_start) * 1000, "ok": ok,
+                       "transport_status": transport_status, "retry": False})
 
     def _host(self, name, args, phase="setup"):
         if name not in self.catalog:
@@ -604,6 +642,8 @@ class ScopedEngine:
         else:
             props.pop("window_id", None)
             props.pop("pid", None)
+            if name in {"batch", "act"}:
+                props.pop("expect", None)  # Native AX postconditions do not apply to a browser tab.
             if "tab_id" in props and name != "browser_command":
                 schema["required"] = list(dict.fromkeys(schema["required"] + ["tab_id"]))
         if "url" in props:
@@ -614,7 +654,15 @@ class ScopedEngine:
             props["input_route"]["enum"] = ["trusted"]
         if name == "browser_command":
             props["operation"]["enum"] = sorted(BROWSER_OPERATIONS)
-            props["arguments"]["description"] += " Fixture-only benchmark: use visible-page locators, text/value, check/select_option, real drag coordinates, wait, or dialog accept. No script, CDP, files, navigation, or evaluator access."
+            props["arguments"]["description"] += " Fixture-only benchmark: use visible-page locators, text/value, check/select_option, real drag coordinates, wait, or dialog accept. No script, CDP, files, navigation, or evaluator access." + KEY_SCOPE_DESCRIPTION
+        for field in ("keys", "key"):
+            if field in props:
+                props[field]["description"] = props[field].get("description", "") + KEY_SCOPE_DESCRIPTION
+        if name in {"batch", "act"}:
+            step_props = props.get("steps", {}).get("items", {}).get("properties", {})
+            if "keys" in step_props:
+                step_props["keys"]["description"] = step_props["keys"].get("description", "") + KEY_SCOPE_DESCRIPTION
+        schema["required"] = [key for key in schema["required"] if key in props]
         tool["description"] = tool.get("description", "") + " Benchmark scope: only the provided fixture targets; background delivery only."
         return tool
 
@@ -630,10 +678,16 @@ class ScopedEngine:
         chord = "+".join(value) if isinstance(value, list) and all(isinstance(x, str) for x in value) else value
         modifiers = args.get("modifiers", [])
         if modifiers:
-            if not isinstance(modifiers, list) or not all(isinstance(x, str) for x in modifiers):
+            if not isinstance(chord, str) or not isinstance(modifiers, list) or not all(isinstance(x, str) for x in modifiers):
                 raise ScopeError("Invalid key modifiers")
             chord = "+".join(modifiers + [chord])
-        if not isinstance(chord, str) or chord.lower() not in SAFE_KEYS and not (len(chord) == 1 and chord.isalnum()):
+        if isinstance(chord, str):
+            parts = [part.strip().lower() for part in chord.split("+")]
+            # Chord modifier ordering is immaterial to both public drivers. Keep
+            # duplicates/unknown modifiers rejected by the canonical allowlist.
+            parts = sorted(MODIFIER_ALIASES.get(part, part) for part in parts[:-1]) + [KEY_ALIASES.get(parts[-1], parts[-1])]
+            chord = "+".join(parts)
+        if not isinstance(chord, str) or chord not in SAFE_KEYS and not (len(chord) == 1 and chord.isalnum()):
             raise ScopeError("This keyboard shortcut can escape the fixture or touch the clipboard")
 
     @staticmethod
@@ -659,10 +713,15 @@ class ScopedEngine:
             raise ScopeError("Tool arguments must be an object")
         args = copy.deepcopy(args)
         schema = self.allowed[name]["inputSchema"]
+        if self.name == "second-cursor" and not self.native and name in {"batch", "act"} and "expect" in args:
+            raise ScopeError("Browser tab batches do not support expect; inspect the returned observation instead")
         if set(args) - set(schema.get("properties", {})):
             raise ScopeError("Tool includes an unadvertised or host-only argument")
-        if any(key not in args for key in schema.get("required", [])):
-            raise ScopeError("Required tool arguments are missing")
+        missing = [key for key in schema.get("required", []) if key not in args]
+        if missing:
+            # Names come from the public schema; never echo arbitrary values.
+            names = [key for key in missing if isinstance(key, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key)]
+            raise ScopeError("Required tool arguments are missing" + (": " + ", ".join(names) if names else ""))
         if args.get("delivery_mode", "background") != "background":
             raise ScopeError("Foreground delivery is outside the benchmark track")
         if "url" in args and args["url"] != self.url:

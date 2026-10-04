@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Browser target contracts</title>
+<style>body{font:16px system-ui;margin:24px}label{display:block;margin:10px 0}input,select,textarea,[contenteditable]{min-width:200px}iframe{width:360px;height:130px}</style>
+<h1>Browser target contracts</h1>
+<label>Name <input id="name" value="Ada Lovelace"></label>
+<label>Route <select id="route"><option value="">Choose a route</option><option value="priority">Priority</option><option value="closed" disabled>Closed</option></select></label>
+<label>Read only <input id="readonly" readonly value="unchanged"></label>
+<label>Disabled <input id="disabled" disabled value="unchanged"></label>
+<label>Redirected <input id="redirected"></label>
+<label>Replaced <input id="replaced"></label>
+<label>Submit redirect <input id="submit-redirect"></label>
+<label>Search route <input id="search" role="combobox" aria-expanded="false"></label>
+<label>Notes <textarea id="notes"></textarea></label>
+<div id="editable" contenteditable="true" role="textbox" aria-label="Editable note"><span>Initial</span></div>
+<button id="button" type="button">Noneditable button</button>
+<div id="open-shadow"></div><div id="closed-shadow"></div>
+<label>Ambiguous <select id="ambiguous"><option value="keep">Keep</option><option value="a">Same</option><option value="b">Same</option></select></label>
+<label>Value precedence <select id="precedence"><option value="keep">Keep</option><option value="Express">By code</option><option value="other">Express</option></select></label>
+<label>Multiple routes <select id="multiple" multiple><option value="a">Alpha</option><option value="b">Beta</option><option value="c">Gamma</option></select></label>
+<label>Grouped <select id="grouped"><option value="keep">Keep</option><optgroup label="Unavailable" disabled><option value="closed">Closed group</option></optgroup></select></label>
+<iframe title="Local input frame" src="browser-targets-frame.html"></iframe>
+<iframe id="remote" title="Remote input frame"></iframe>
+<p id="events" aria-live="polite">No input events</p>
+<p id="keys">No Enter key</p>
+<script>
+const nameField=document.getElementById('name');
+document.getElementById('redirected').addEventListener('focus',()=>nameField.focus());
+document.getElementById('replaced').addEventListener('focus',e=>{const replacement=e.target.cloneNode();e.target.replaceWith(replacement);nameField.focus();},{once:true});
+document.getElementById('submit-redirect').addEventListener('input',()=>nameField.focus());
+document.addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('keys').textContent='Enter received';});
+for(const mode of ['open','closed']){
+ const root=document.getElementById(mode+'-shadow').attachShadow({mode});
+ const input=document.createElement('input');input.setAttribute('aria-label',mode==='open'?'Open shadow input':'Closed shadow input');root.append(input);
+}
+document.getElementById('remote').src=location.origin.replace('127.0.0.1','localhost')+'/browser-targets-frame.html';
+let count=0;document.addEventListener('input',()=>document.getElementById('events').textContent='Input events: '+(++count));
+</script></html>

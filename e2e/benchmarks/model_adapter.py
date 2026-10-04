@@ -236,13 +236,17 @@ def run_adapter(request, args):
                             or event["start_ms"] < 0 or event["end_ms"] < event["start_ms"]
                             or event.get("status") not in {"completed", "error", "timeout"}):
                         raise ValueError("Malformed model tool timing or status")
-                    # Host intervals include rejected calls; setup/cleanup stays
-                    # separate so these intervals are not counted twice.
+                    # A completed transport can contain a failed action or
+                    # partial batch. Preserve both facts without making a
+                    # recoverable tool failure fail the entire model turn.
+                    # Legacy result-less events retain their host status.
+                    ok = event["status"] == "completed" and (
+                        "result" not in event or _ok(event["result"]))
                     item = {"type": "tool", "name": event["name"], "origin": "model",
                             "call_id": event.get("call_id"), "arguments": event.get("arguments"),
                             "start_ms": event["start_ms"] + host_offset,
                             "end_ms": event["end_ms"] + host_offset,
-                            "ok": event["status"] == "completed", "retry": False}
+                            "host_status": event["status"], "ok": ok, "retry": False}
                     final["model_tool_calls"] += 1
                     final["driver_tool_calls"] += 1
                     print(json.dumps(item, allow_nan=False), flush=True)

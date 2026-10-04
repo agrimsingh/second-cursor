@@ -8,15 +8,20 @@ const MUTATING_COMMANDS = new Set([
   "Emulation.setDeviceMetricsOverride", "Emulation.clearDeviceMetricsOverride",
 ]);
 const frameSessions = new Map();
+// A missing session for a frame known to be isolated must not turn its backend node IDs into main-renderer IDs.
+// Keep these tombstones across debugger detachment; tab closure is the point at which old refs cannot return.
+const isolatedFrameIds = new Set();
 // Page lifecycle events ("load", "networkIdle", …) of each tab's top-level frames, for the document each loader
 // committed. They come from the Page domain, so knowing whether a page is still fetching needs no Network.enable.
 const lifecycles = new Map();
 chrome.debugger.onEvent.addListener((source,method,p)=>{
   if(method === "Target.attachedToTarget") {
-    frameSessions.set(`${source.tabId}:${p.targetInfo.targetId}`,p.sessionId);
+    const key = `${source.tabId}:${p.targetInfo.targetId}`;
+    isolatedFrameIds.add(key);
+    frameSessions.set(key,p.sessionId);
     chrome.debugger.sendCommand({tabId:source.tabId,sessionId:p.sessionId},"Target.setAutoAttach",{autoAttach:true,waitForDebuggerOnStart:false,flatten:true}).catch(()=>{});
   }
-  if(method === "Target.detachedFromTarget")for(const [k,v] of frameSessions)if(v===p.sessionId)frameSessions.delete(k);
+  if(method === "Target.detachedFromTarget")for(const [k,v] of frameSessions)if(k.startsWith(`${source.tabId}:`)&&v===p.sessionId)frameSessions.delete(k);
   if (method === "Page.lifecycleEvent" && !source.sessionId) {
     const frames = lifecycles.get(source.tabId) ?? new Map();
     lifecycles.set(source.tabId, frames);
@@ -25,10 +30,17 @@ chrome.debugger.onEvent.addListener((source,method,p)=>{
   }
 });
 
-chrome.debugger.onDetach.addListener(({ tabId }) => {
+function detachedTab(tabId) {
   attached.delete(tabId);
   lifecycles.delete(tabId);
   for (const key of enabled) if (key.startsWith(`${tabId}:`)) enabled.delete(key);
+  for (const key of frameSessions.keys()) if (key.startsWith(`${tabId}:`)) frameSessions.delete(key);
+}
+
+chrome.debugger.onDetach.addListener(({ tabId }) => detachedTab(tabId));
+chrome.tabs.onRemoved.addListener(tabId => {
+  detachedTab(tabId);
+  for (const key of isolatedFrameIds) if (key.startsWith(`${tabId}:`)) isolatedFrameIds.delete(key);
 });
 
 /** True once the tab's current document has gone 500 ms without a network request in flight. */
@@ -100,12 +112,31 @@ export function protocolMessage(error) {
 /** The session of a frame Chrome isolated in its own process; undefined for frames in the tab's process. */
 export const frameSession = (tabId, frameId) => frameSessions.get(`${tabId}:${frameId}`);
 
-export async function frameCDP(tabId,frameId,method,params={}) {
+/** Root/same-process frame IDs deliberately use the tab session. Callers retaining isolated-frame backend IDs
+ * can pin expectedSession so a replacement renderer cannot reinterpret those IDs between awaited commands. */
+export async function frameCDP(tabId,frameId,method,params={}, { expectedSession } = {}) {
+  const key = `${tabId}:${frameId}`;
+  const initialSession = frameSessions.get(key);
+  // A new frame context may establish that a former isolated frame now lives in the tab renderer. This command
+  // names the frame explicitly and cannot send stale backend-node IDs or input to the main document.
+  const proveLocalFrame = !expectedSession && !initialSession && isolatedFrameIds.has(key)
+    && method === "Page.createIsolatedWorld" && params.frameId === frameId;
+  const unavailable = () => new BridgeError("failed", "The isolated browser frame changed or detached; take a new browser_snapshot before acting again");
+  if ((isolatedFrameIds.has(key) && !initialSession && !proveLocalFrame) || (expectedSession && initialSession !== expectedSession))
+    throw unavailable();
   const releasing = params.type === "mouseReleased" || params.type === "keyUp";
   if (method.startsWith("Input.")) await (releasing ? requireAgentTab(tabId) : requireAgentInput(tabId));
   else if (MUTATING_COMMANDS.has(method)) await requireAgentInput(tabId);
   await attach(tabId);
-  const sessionId=frameSessions.get(`${tabId}:${frameId}`);
-  try{return await chrome.debugger.sendCommand({tabId,...(sessionId?{sessionId}:{})},method,params);}
+  const sessionId=frameSessions.get(key);
+  if (sessionId !== initialSession || (isolatedFrameIds.has(key) && !sessionId && !proveLocalFrame)) throw unavailable();
+  try {
+    const result = await chrome.debugger.sendCommand({tabId,...(sessionId?{sessionId}:{})},method,params);
+    if (proveLocalFrame) {
+      if (!attached.has(tabId) || frameSessions.get(key) || !Number.isInteger(result?.executionContextId)) throw unavailable();
+      isolatedFrameIds.delete(key);
+    }
+    return result;
+  }
   catch(e){throw new BridgeError("failed",`${method}: ${protocolMessage(e)}`);}
 }

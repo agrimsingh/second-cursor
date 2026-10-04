@@ -138,6 +138,8 @@ The optional [Cursor model host](e2e/cursor_host/README.md) runs Grok 4.5/4.7 Fa
 
 For Opus, add `--profile opus-5.5-fast-low --profile opus-5.5-fast-medium` to select only those configurations, both pinned to 300k context and Fast enabled. The default five-profile selection stays unchanged. See [the Opus results](docs/verification-opus-model-sweep-2026-10-04.md).
 
+The [browser contract verification](docs/verification-browser-contracts-2026-10-04.md) records the resulting typing-target fixes, dropdown selection improvements, semantic failure reporting, and a matched old/new form comparison. It separates reduced tool recovery from noisy model latency and documents the remaining native Return/autosave limitation.
+
 Add `--experiment tool-surface` to `model_efficiency.py` to compare full and compact catalogs with upfront observations enabled in both. The compact catalog represents actions through the complete batch schema and retains all observation tools; the engine still checks each nested action against its original allowlist. Results from the two experiments stay separate.
 
 ```bash
@@ -159,6 +161,8 @@ python3 e2e/text_batch.py      # native selection, insertion, Unicode and interr
 python3 e2e/invoice_workflow.py # kill/restart the SDK after a real invoice submission
 node --test sdk/agent-recovery.test.mjs # checkpoint durability and refusal/recovery cases, no GUI
 python3 e2e/browser_reliability.py # freshness, hover, verified form state, settling
+python3 e2e/browser_target_contracts.py # editable focus, iframe/shadow targets, dropdown contracts
+node --test e2e/extension_tests/*.test.mjs # isolated browser logic regressions, no GUI
 python3 e2e/release_setup.py   # portable bundle, setup diagnostics and disposable browser check
 python3 e2e/task_ui.py --ui   # deliberately opens the disposable Tasks and Setup panels
 python3 e2e/focus.py --takeover   # focus safety; takes focus and covers the screen, so run it while you are away

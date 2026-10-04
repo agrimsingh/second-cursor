@@ -96,6 +96,11 @@ export function recordEvent(source, method, p) {
 // This function executes in an isolated page world and only operates on DOM elements. `anchor` is the element an
 // aria-ref locator resolved to.
 function domOperation(p, isSecretField, anchor) {
+  // Keep this guard in the isolated world as well as before cursor/locator work in operate().
+  if (["select_option", "check"].includes(p.operation) &&
+      (p.ref !== undefined || !p.locator || typeof p.locator !== "object" ||
+       Array.isArray(p.locator) || Object.keys(p.locator).length === 0))
+    throw Error('select_option and check require locator, for example {"label":"Route"}; top-level ref is unsupported');
   let doc = document;
   for (const selector of Array.isArray(p.locator?.frame)
     ? p.locator.frame
@@ -156,22 +161,45 @@ function domOperation(p, isSecretField, anchor) {
   const visible = (e) =>
     !!e.getClientRects().length && getComputedStyle(e).visibility !== "hidden";
   // Password and payment card values stay out of reads, as in browser_snapshot.
-  const secret = (e) =>
-    e.matches("input,textarea") &&
+  const secret = (e, value = e.value) =>
+    e.matches("input,textarea,select") &&
     isSecretField({
       type: e.type,
       autocomplete: e.getAttribute("autocomplete"),
       name: name(e) || e.getAttribute("placeholder"),
-      value: e.value,
+      value,
     });
+  const optionSecret = (e, o) => secret(e, o.value) || secret(e, o.label);
   const valueOf = (e) =>
-    e.value && secret(e) ? "[redacted]" : String(e.value);
+    e.value && (secret(e) || (e.tagName === "SELECT" && [...e.selectedOptions].some((o) => optionSecret(e, o))))
+      ? "[redacted]" : String(e.value);
   const matches = (a, b) =>
     p.locator?.exact === false ? a.includes(b) : a.trim() === b;
   // Chained locators (browser_repl) follow Playwright: text is case-insensitive substring unless exact, exact is
   // case-sensitive and whole, whitespace is normalized, and each step searches below or narrows the previous set.
   const chained = !!p.locator?.chain;
   const normalized = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+  const optionDisabled = (o) => o.disabled || !!o.closest("optgroup[disabled]");
+  const selectMetadata = (e) => {
+    if (e.tagName !== "SELECT") return {};
+    const options = [...e.options];
+    return {
+      multiple: e.multiple,
+      option_count: options.length,
+      options_truncated: options.length > 100,
+      options: options.slice(0, 100).map((o) => {
+        const redacted = optionSecret(e, o);
+        return {
+          label: redacted ? "[redacted]" : o.label.slice(0, 300),
+          value: redacted ? "[redacted]" : o.value.slice(0, 300),
+          selected: o.selected,
+          disabled: optionDisabled(o),
+          ...(!redacted && o.label.length > 300 ? { label_truncated: true } : {}),
+          ...(!redacted && o.value.length > 300 ? { value_truncated: true } : {}),
+        };
+      }),
+    };
+  };
   const textMatches = (value, want, exact) => {
     const text = normalized(value);
     if (want && typeof want === "object")
@@ -517,6 +545,7 @@ function domOperation(p, isSecretField, anchor) {
             selected: e.getAttribute("aria-selected"),
             expanded: e.getAttribute("aria-expanded"),
             editable: e.isContentEditable || e.matches("input,textarea"),
+            ...selectMetadata(e),
             visible: visible(e),
             bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
             actions: e.disabled
@@ -538,6 +567,7 @@ function domOperation(p, isSecretField, anchor) {
                   ...(e.matches("input,textarea,[contenteditable]")
                     ? ["fill", "type", "select_text"]
                     : []),
+                  ...(e.tagName === "SELECT" ? ["select_option"] : []),
                 ],
           },
         ];
@@ -608,6 +638,7 @@ function domOperation(p, isSecretField, anchor) {
       enabled: chained ? enabled(e) : !e.disabled,
       visible: chained ? shown(e) : visible(e),
       checked: "checked" in e ? e.checked : null,
+      ...selectMetadata(e),
       attributes: Object.fromEntries(
         [...e.attributes].map((x) => [
           x.name,
@@ -689,25 +720,40 @@ function domOperation(p, isSecretField, anchor) {
         expected: redacted ? "[redacted]" : p.text, actual: redacted ? "[redacted]" : actual } };
   }
   if (p.operation === "select_option") {
+    if (e.tagName !== "SELECT") throw Error("select_option requires a native <select> control");
+    if (!enabled(e)) throw Error("Element is disabled");
     const opts = [...e.options];
-    // Chained locators also match an option by its label, as Playwright's selectOption does.
-    const values = (Array.isArray(p.value) ? p.value : [p.value]).map((v) =>
-      chained && !opts.some((o) => o.value === v)
-        ? (opts.find((o) => normalized(o.label) === normalized(v))?.value ?? v)
-        : v,
-    );
-    if (!values.every((v) => opts.some((o) => o.value === v)))
-      throw Error("Option not found");
-    for (const o of opts) o.selected = values.includes(o.value);
+    const requested = Array.isArray(p.value) ? p.value : [p.value];
+    if (!requested.every((v) => typeof v === "string"))
+      throw Error("select_option value must be a string or an array of strings");
+    // Both locator forms prefer exact values, then an exact case-sensitive label with normalized whitespace.
+    // Resolve the entire request before mutating; a duplicate or disabled match must not select a different option.
+    const selected = [...new Set(requested.map((v) => {
+      let matches = opts.filter((o) => o.value === v);
+      if (!matches.length) matches = opts.filter((o) => normalized(o.label) === normalized(v));
+      if (!matches.length) throw Error("Option not found; inspect the control for available option labels and values");
+      if (matches.length !== 1) throw Error("Option is ambiguous; use a unique option value or label from inspect");
+      if (optionDisabled(matches[0])) throw Error("Requested option is disabled");
+      return matches[0];
+    }))];
+    if (!e.multiple && selected.length > 1)
+      throw Error("Multiple options require a <select multiple> control");
+    const values = selected.map((o) => o.value);
+    const expectedRedacted = selected.some((o) => optionSecret(e, o));
+    for (const o of opts) o.selected = selected.includes(o);
     e.dispatchEvent(new Event("input", { bubbles: true }));
     e.dispatchEvent(new Event("change", { bubbles: true }));
-    const actual = [...e.selectedOptions].map(o => o.value);
-    const verified = e.isConnected && actual.length === values.length && actual.every(v => values.includes(v));
-    return { value: e.value,
+    const actualOptions = [...e.selectedOptions];
+    const actual = actualOptions.map((o) => o.value);
+    const verified = e.isConnected && actualOptions.length === selected.length &&
+      actualOptions.every((o) => selected.includes(o)) && selected.every((o, i) => o.value === values[i]);
+    const redacted = expectedRedacted || actualOptions.some((o) => optionSecret(e, o));
+    return { value: redacted ? "[redacted]" : valueOf(e),
       outcome: { state: verified ? "verified" : "uncertain", verified,
         reason: verified ? "The connected control has the requested selection after its input handlers returned."
           : "The control was replaced or did not retain the requested selection; inspect it before continuing.",
-        verification: "selected_values", expected: values, actual } };
+        verification: "selected_values", expected: redacted ? values.map(() => "[redacted]") : values,
+        actual: redacted ? actual.map(() => "[redacted]") : actual } };
   }
   if (p.operation === "check") {
     if (!["checkbox", "radio"].includes(e.type))
@@ -1042,7 +1088,7 @@ const OPERATION_ARGUMENTS = {
     "locator, text; optional prefix, suffix, selection_type (text/cursor_before/cursor_after)",
   perform_action: "locator, action from the observed actions",
   check: "locator, checked boolean",
-  select_option: "locator, value",
+  select_option: "locator, value (exact option value or exact label; values take precedence). An array selects multiple options on <select multiple>. inspect/dom_snapshot expose bounded options with labels, values, selected and disabled states.",
   press_key: "keys; optional locator",
   scroll: "direction, amount; optional locator",
   drag: "from_x, from_y, to_x, to_y in viewport CSS pixels. Left-button pointer drag; no HTML5 DataTransfer synthesis.",
@@ -1171,6 +1217,10 @@ async function operate(p, guardObservation) {
       op,
     )
   ) {
+    if (["select_option", "check"].includes(op) &&
+        (p.ref !== undefined || !p.locator || typeof p.locator !== "object" ||
+         Array.isArray(p.locator) || Object.keys(p.locator).length === 0))
+      throw new BridgeError("invalid_argument", 'select_option and check require locator, for example {"label":"Route"}; top-level ref is unsupported');
     await pointAtLocator(tabId, p);
     return dom(tabId, p);
   }

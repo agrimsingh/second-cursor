@@ -80,7 +80,7 @@ enum ToolCatalog {
         "Act on one window: run a list of steps strictly in order, then get one observation after the UI settles. This is the way to act, with one step or many: put every step you already know in one call (pressing a known series of buttons, filling known fields, typing followed by a shortcut), and end the list before any step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet); then look at the observation and send the next list. Each step is a tool name (click, type_text, press_key, set_value, scroll, drag, perform_action, wait) plus that action's arguments. Element indexes come from get_window_state or find_elements and are not refreshed between steps. Pixel steps (x/y) take coordinate_space and stop the list if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the list stops at the first failure. The observation is a diff like get_window_state unless full=true. \(tabBatch)"
 
     private static let tabBatch =
-        "With tab_id instead of window_id, the steps act in that agent tab: browser_click (ref, or x and y), browser_type (text, optional ref and submit), browser_press_key, browser_scroll and wait, with refs from the tab's latest outline (not refreshed between steps, so end the list where a step re-renders what later steps target); the observation is the tab's diff."
+        "With tab_id instead of window_id, the steps act in that agent tab: browser_click (ref, or x and y), browser_type (text, optional ref and submit), browser_press_key, browser_scroll and wait, with refs from the tab's latest outline (not refreshed between steps, so end the list where a step re-renders what later steps target); the observation is the tab's diff. expect is only supported for native windows: omit it with tab_id and inspect the returned tab observation to check the result."
 
     private static let catalog: [Tool] =
         ([
@@ -235,7 +235,7 @@ enum ToolCatalog {
             Tool(
                 name: "type_text",
                 description:
-                    "Type text into the window's focused element, or into element_index when given. Does not press Return; follow with press_key if needed. If the text shows in get_window_state but not on screen (common in custom-drawn apps such as DAWs and games), retry with keystrokes_only=true.",
+                    "Type text into the window's focused element, or into element_index when given. Does not append Return automatically. For document line breaks, include newline characters in text so the default accessibility route can insert them without a keyboard focus handoff. Use press_key when a control requires an actual Return key, such as submitting a form. If the text shows in get_window_state but not on screen (common in custom-drawn apps such as DAWs and games), retry with keystrokes_only=true.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
@@ -259,7 +259,7 @@ enum ToolCatalog {
             Tool(
                 name: "press_key",
                 description:
-                    "Send a key or chord to the window without focusing it, e.g. \"return\", \"escape\", \"tab\", \"down\", \"cmd+a\", \"cmd+shift+t\". A cmd chord that matches a menu item presses that item (route ax_menu_shortcut). A successful menu press confirms dispatch only; it does not verify the command's effect. Check the resulting observation or supply an expectation to verify the outcome.",
+                    "Send a key or chord to the window without bringing it to the foreground, e.g. \"return\", \"escape\", \"tab\", \"down\" (also ArrowDown), \"cmd+a\", \"cmd+shift+t\". Background keys may temporarily change the target app's internal active/key state, which can trigger app behavior such as autosave. For a document line break, prefer a newline in type_text. A cmd chord that matches a menu item presses that item (route ax_menu_shortcut). A successful menu press confirms dispatch only; it does not verify the command's effect. Check the resulting observation or supply an expectation to verify the outcome.",
                 inputSchema: schema(
                     [
                         "window_id": windowID,
@@ -372,13 +372,13 @@ enum ToolCatalog {
             Tool(
                 name: "browser_type",
                 description:
-                    "Type text into the element with ref, or into the focused element. submit=true presses Enter afterwards. Returns what changed on the page once it settles (observation, a diff like browser_snapshot's).",
+                    "Type text into the editable element with ref, or the currently focused editable element. Verifies editability and focus before typing. For a native dropdown, use browser_command with operation=select_option. submit=true sends Enter afterwards only if the target retains focus. Returns what changed on the page once it settles (observation, a diff like browser_snapshot's).",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
                         "text": string("Text to type."),
                         "ref": string("Element ref from browser_snapshot."),
-                        "submit": boolean("Press Enter after typing.", default: false),
+                        "submit": boolean("Press Enter after typing only while the target retains editable focus.", default: false),
                     ], required: ["tab_id", "text"])
             ),
             Tool(
@@ -453,7 +453,7 @@ enum ToolCatalog {
                         enumValues: ["tree", "both", "screenshot", "none"], default: "tree")
                 }
                 if observingTools.contains(tool.name) || tool.name == "batch" {
-                    props["expect"] = ["click", "batch"].contains(tool.name) ? expect : expectPointer
+                    props["expect"] = tool.name == "batch" ? batchExpect : tool.name == "click" ? expect : expectPointer
                 }
                 if tool.name == "browser_snapshot" {
                     props["full"] = boolean(
@@ -608,6 +608,13 @@ enum ToolCatalog {
             "Optional check that the action worked, as in click: {text} or {element_index, value}, with optional gone and timeout_ms.",
     ]
 
+    private static let batchExpect: Value = [
+        "type": "object",
+        "description":
+            "Native windows only (window_id or app); not accepted with tab_id. Checks text or an element_index/value condition before the batch and after its last step, as in click. For a browser tab, omit expect and inspect the returned observation.",
+        "properties": .object(conditionFields),
+    ]
+
     /// Flat on each step rather than nested under args: Gemini through Cursor stringifies a free-form nested
     /// object and garbles the keys of a declared one. The router still accepts {tool, args}.
     static let batchStepArguments: [String: Value] = [
@@ -635,7 +642,7 @@ enum ToolCatalog {
         "ms": integer("wait: milliseconds."),
         "caption": string("Shown beside the agent's cursor from this step on, replacing the batch's caption."),
         "ref": string("browser_click, browser_type: element ref from the tab's outline, such as e12."),
-        "submit": ["type": "boolean", "description": "browser_type: press Enter after typing."],
+        "submit": ["type": "boolean", "description": "browser_type: press Enter after typing only while the target retains editable focus."],
     ]
 
     private static let windowID = integer("Window id from list_windows or launch_app. Omit to target app instead.")
