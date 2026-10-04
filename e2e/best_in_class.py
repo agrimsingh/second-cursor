@@ -19,14 +19,26 @@ import subprocess
 import sys
 import time
 
+from benchmarks.workspace_fixtures import WORKSPACE_TASKS
+
 ROOT = pathlib.Path(__file__).resolve().parent
 REPO = ROOT.parent
 CONTRACT = "second-cursor-benchmark/1"
-TASKS = ("native_notes", "browser_work_order", "canvas_route", "transient_dialog")
+DEFAULT_TASKS = ("native_notes", "browser_work_order", "canvas_route", "transient_dialog")
+TASKS = DEFAULT_TASKS + WORKSPACE_TASKS
+FIXTURE_FILES = ("fixture.html", "fixtures.py", "workspace.html", "workspace_fixtures.py")
+TASK_FILES = (*FIXTURE_FILES, "tasks.py", "workspace_driver.py")
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 INTERFACE_TRACKS = ("native-tools", "screenshot-actions")
 MODEL_CONFIG_FIELDS = ("model", "reasoning_effort", "max_steps", "timeout_seconds", "model_host_version")
 MODEL_HOSTS = ("codex", "cursor-sdk")
+
+
+def case_seed_semantics(tasks):
+    if any(task in WORKSPACE_TASKS for task in tasks):
+        return ("Workspace seeds generate reproducible case data; legacy task fixtures remain fixed. "
+                "No case seed controls provider sampling.")
+    return "Trial identity only; this pilot uses fixed fixtures and does not seed provider sampling."
 
 
 def finite_number(value, *, positive=False):
@@ -134,19 +146,57 @@ def digest(path):
     return hashed.hexdigest()
 
 
+def extension_identity():
+    """Pin the extension start-browser loads, independently of the app bundle.
+
+    Only relative runtime-resource names and bytes enter the digest. A saved
+    identical copy has the same identity even when its directory changes.
+    """
+    root = pathlib.Path(os.environ.get("SC_E2E_EXTENSION") or REPO / "extension").expanduser().resolve()
+    manifest_path = root / "manifest.json"
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    if (not isinstance(manifest, dict) or not isinstance(manifest.get("version"), str)
+            or not manifest["version"].strip()):
+        raise ValueError("Effective extension manifest must declare a version")
+    suffixes = {".js", ".mjs", ".cjs", ".html", ".css", ".wasm", ".png", ".svg", ".ico",
+                ".jpg", ".jpeg", ".gif", ".webp", ".woff", ".woff2", ".ttf", ".otf"}
+    paths = {manifest_path, *(path for path in root.rglob("*")
+                              if path.is_file() and path.suffix.lower() in suffixes)}
+    hashed, files = hashlib.sha256(), {}
+    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        data = manifest_bytes if path == manifest_path else path.read_bytes()
+        encoded = relative.encode("utf-8")
+        hashed.update(len(encoded).to_bytes(8, "big"))
+        hashed.update(encoded)
+        hashed.update(len(data).to_bytes(8, "big"))
+        hashed.update(data)
+        files[relative] = hashlib.sha256(data).hexdigest()
+    return {"path": str(root), "version": manifest["version"], "manifest_version": manifest.get("manifest_version"),
+            "sha256": hashed.hexdigest(), "files": files,
+            "coverage": "manifest.json, all JavaScript modules, and browser UI resources"}
+
+
 def metadata():
     def git(*args):
         return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True, timeout=10).stdout.strip()
     bundle = pathlib.Path(os.environ.get("SC_E2E_APP", str(pathlib.Path.home() / "Applications/SecondCursor.app"))).expanduser().resolve()
     task_hash = hashlib.sha256()
-    for name in ("fixture.html", "fixtures.py", "tasks.py"):
+    for name in TASK_FILES:
         task_hash.update(name.encode())
         task_hash.update((ROOT / "benchmarks" / name).read_bytes())
+    fixture_hash = hashlib.sha256()
+    for name in FIXTURE_FILES:
+        fixture_hash.update(name.encode())
+        fixture_hash.update((ROOT / "benchmarks" / name).read_bytes())
     return {"recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "commit": git("rev-parse", "HEAD"), "dirty_paths": git("status", "--short").splitlines(),
             "platform": platform.platform(), "macos": platform.mac_ver()[0], "machine": platform.machine(),
             "bundle": str(bundle), "binary_sha256": digest(bundle / "Contents/MacOS/SecondCursor"),
-            "fixture_sha256": digest(ROOT / "benchmarks/fixture.html"), "task_sha256": task_hash.hexdigest(),
+            "fixture_sha256": fixture_hash.hexdigest(), "task_sha256": task_hash.hexdigest(),
+            "fixture_files": {name: digest(ROOT / "benchmarks" / name) for name in FIXTURE_FILES},
+            "extension_identity": extension_identity(),
             "python": sys.version.split()[0]}
 
 
@@ -491,6 +541,20 @@ def validate_comparison(payloads):
     task_sets = [{t["task_id"] for t in p["trials"]} for p in payloads]
     if any(t != task_sets[0] for t in task_sets[1:]):
         raise ValueError("Cannot compare different task selections")
+    if profiles[0] != "model" and any(task in WORKSPACE_TASKS for task in task_sets[0]):
+        schedules = []
+        for payload in payloads:
+            schedule = []
+            for trial in payload["trials"]:
+                if (type(trial.get("trial")) is not int or trial["trial"] < 1
+                        or type(trial.get("case_seed")) is not int or trial["case_seed"] < 0):
+                    raise ValueError("Workspace comparisons require positive trial numbers and nonnegative case seeds")
+                schedule.append((trial["task_id"], trial["trial"], trial["case_seed"]))
+            if len(schedule) != len(set(schedule)):
+                raise ValueError("Workspace comparison cannot contain duplicate task/trial/seed identities")
+            schedules.append(sorted(schedule))
+        if any(schedule != schedules[0] for schedule in schedules[1:]):
+            raise ValueError("Cannot compare different workspace task/trial/case_seed schedules")
     if profiles[0] == "model":
         modes = [p.get("observation_mode", "on-demand") for p in payloads]
         if any(mode not in {"on-demand", "upfront"} for mode in modes) or len(set(modes)) != 1:
@@ -613,7 +677,7 @@ def parser():
     task_cli.add_argument("--observation-mode", choices=("on-demand", "upfront"), default="on-demand")
     task_cli.add_argument("--catalog-mode", choices=("full", "compact"), default="full")
     task_cli.add_argument("--seed", type=int, action="append",
-                          help="Case ID for a trial round; repeat once per round (not a model sampling seed)")
+                          help="Workspace case seed or legacy trial ID; repeat once per round (not a model sampling seed)")
     task_cli.add_argument("--model-host-version", help="Pinned model host/version fingerprint, required for model runs")
     task_cli.add_argument("--interface-track", choices=INTERFACE_TRACKS, default="native-tools",
                           help="Action and observation interface; engines may explicitly reject unsupported tracks")

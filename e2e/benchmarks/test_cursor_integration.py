@@ -150,7 +150,8 @@ class CursorComparisonTests(unittest.TestCase):
     def test_cursor_source_and_lock_changes_change_runner_fingerprint(self):
         for changed in ("benchmarks/cursor_model_host.py", "cursor_host/bridge.mjs",
                         "cursor_host/package.json", "cursor_host/package-lock.json"):
-            with self.subTest(changed=changed):
+            with self.subTest(changed=changed), \
+                    mock.patch.object(report, "extension_identity", return_value={"sha256": "test-extension-sha"}):
                 with mock.patch.object(pathlib.Path, "read_bytes", return_value=b"baseline"):
                     baseline = pilot.runner_fingerprint()
                 def content(path):

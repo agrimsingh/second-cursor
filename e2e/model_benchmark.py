@@ -27,11 +27,16 @@ def runner_fingerprint():
     digest = hashlib.sha256()
     for path in [ROOT / "model_benchmark.py", ROOT / "model_efficiency.py", ROOT / "model_sweep.py", ROOT / "best_in_class.py", ROOT / "run.py", ROOT / "start-browser.py",
                  *(ROOT / "benchmarks" / name for name in
-                 ("model_adapter.py", "model_host.py", "cursor_model_host.py", "engines.py", "completion_timing.py", "tool_surface.py")),
+                 ("model_adapter.py", "model_host.py", "cursor_model_host.py", "engines.py", "completion_timing.py", "tool_surface.py",
+                  "workspace.html", "workspace_fixtures.py", "workspace_driver.py")),
                  *(ROOT / "cursor_host" / name for name in ("bridge.mjs", "package.json", "package-lock.json"))]:
         digest.update(path.relative_to(ROOT).as_posix().encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
+    # The disposable browser loads the repo/override extension, not the copy
+    # inside the pinned app bundle. Hash its content without its local path.
+    digest.update(b"\0effective-browser-extension\0")
+    digest.update(report.extension_identity()["sha256"].encode("ascii"))
     return digest.hexdigest()
 
 
@@ -73,7 +78,7 @@ def parser():
     cli.add_argument("--configured-model", action="store_true", help="Pin this user's configured Codex model and effort")
     cli.add_argument("--rounds", type=int, default=3)
     cli.add_argument("--task", action="append", choices=report.TASKS)
-    cli.add_argument("--seed", type=int, default=1, help="First case ID; existing fixtures remain fixed")
+    cli.add_argument("--seed", type=int, default=1, help="First workspace case seed or legacy trial ID; does not seed provider sampling")
     placement = cli.add_mutually_exclusive_group()
     placement.add_argument("--native-placement", choices=("desktop", "agent-display", "textedit-off-space"),
                            default="desktop", help="Native fixture placement for both drivers (default: desktop)")
@@ -119,7 +124,7 @@ def build_plan(args):
     identities = {"second-cursor": "sha256:" + report.digest(binary)}
     if "cua-driver" in engines:
         identities["cua-driver"] = version(args.cua_binary)
-    tasks = args.task or list(report.TASKS)
+    tasks = args.task or list(report.DEFAULT_TASKS)
     if len(set(tasks)) != len(tasks):
         raise ValueError("Duplicate task selection")
     pinned_browser = browser_identity() if any(task != "native_notes" for task in tasks) else None
@@ -160,13 +165,16 @@ def build_plan(args):
             "contract": report.CONTRACT, "track": "host-background", "native_placement": args.native_placement,
             "browser_visibility": "headed",
             "browser_identity": pinned_browser,
+            "extension_identity": metadata.get("extension_identity"),
             "fixture_sha256": metadata["fixture_sha256"], "task_sha256": metadata["task_sha256"],
-            "note": "Fixed-task integration pilot. Seeds identify trials, not randomized fixtures or provider sampling."}
+            "case_seed_semantics": report.case_seed_semantics(tasks),
+            "note": "Integration pilot. " + report.case_seed_semantics(tasks)}
 
 
 def planned_artifact(plan, engine):
     """Use the preflight manifest, never the first child's claims, as the baseline."""
     return {"kind": "tasks", "execution_profile": "model", "engine": engine + "-model",
+            "case_seed_semantics": plan.get("case_seed_semantics", report.case_seed_semantics(plan["tasks"])),
             "observation_mode": plan.get("observation_mode", "on-demand"),
             "catalog_mode": plan.get("catalog_mode", "full"),
             "engine_version": plan["engines"][engine], "model": plan["model_config"]["model"],
@@ -287,7 +295,7 @@ def run_plan(plan):
             complete = False
     if not complete:
         lines.extend(["", "Evidence is incomplete or mismatched; no comparative conclusion is valid."])
-    lines.extend(["", "A small fixed-task pilot does not establish superiority. Inspect independent judges, failures,"
+    lines.extend(["", "A small task pilot does not establish superiority. Inspect independent judges, failures,"
                   " safety refusals and coexistence uncertainty in the linked artifacts."])
     (output / "report.md").write_text("\n".join(lines) + "\n")
     print(f"Pilot: {output / 'report.md'}")

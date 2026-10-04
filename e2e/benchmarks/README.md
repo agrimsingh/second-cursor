@@ -4,6 +4,21 @@ Raw verification evidence under `build/` and `e2e/artifacts/` is local and Git-i
 
 ## Shared model runner
 
+The opt-in workspace suite adds generated cases that require information from several
+views and preserve unrelated records. Run
+`SC_E2E_APP=build/SecondCursor.app python3 e2e/workspace_workflows.py --rounds 3`
+for a scripted UI regression, or add an explicit model and host configuration for
+context-gathering trials. For example, append
+`--model-host cursor-sdk --model claude-opus-5-5 --reasoning-effort low --model-param effort=low --model-param fast=true --model-param context=300k`.
+`--seed` changes the workspace data; it does not control model sampling. These are
+synthetic workflows, not public benchmark submissions. The legacy four tasks remain
+the default for `model_benchmark.py`. See [workspace acceptance](../../docs/acceptance-workspace-workflows.md).
+
+Artifacts also pin the effective browser extension loaded by `start-browser.py`,
+including `SC_E2E_EXTENSION` overrides. Its content hash participates in the runner
+fingerprint: matching native app binaries alone cannot conceal different extension
+scripts. Identical extension copies retain the same hash regardless of directory.
+
 By default, `e2e/model_benchmark.py` runs Second Cursor and Cua Driver through the same Codex app-server host implementation, installed host binary, account, model, and reasoning setting. Each trial gets a fresh app-server process, ephemeral conversation, and disposable fixtures. The selected pilot configuration is `gpt-6.1-sol` with `high` reasoning. Cua Driver was updated to 0.33.0 for this comparison; every run records and checks the actual driver version. The optional [Cursor SDK host](../cursor_host/README.md) supports explicit Grok Fast variants with a separate pinned host/model identity; cross-driver comparisons still require identical configurations.
 
 From the repository root, inspect the exact schedule without starting a model or touching the desktop:

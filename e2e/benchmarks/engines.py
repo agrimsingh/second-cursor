@@ -22,8 +22,10 @@ import time
 import urllib.parse
 import uuid
 
+from benchmarks.workspace_fixtures import WORKSPACE_TASKS
+
 PROTOCOL = "2025-03-26"
-TASKS = {"native_notes", "browser_work_order", "canvas_route", "transient_dialog"}
+TASKS = {"native_notes", "browser_work_order", "canvas_route", "transient_dialog", *WORKSPACE_TASKS}
 
 
 class EngineError(RuntimeError):

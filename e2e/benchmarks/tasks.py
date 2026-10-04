@@ -8,6 +8,7 @@ import time
 
 import best_in_class as report
 from benchmarks.fixtures import FixtureServer, judge
+from benchmarks.workspace_fixtures import WORKSPACE_TASKS, WorkspaceFixture
 
 NOTE = "Dispatch notes\nKeep this existing line."
 PROMPTS = {
@@ -20,6 +21,10 @@ RULES = (" Use only your engine's normal computer-control tools. Do not use the 
          "JavaScript evaluation, or direct HTTP requests to complete the task. Do not change the human's focus, cursor, or Space. "
          "Do not touch any target outside this task. Close only browser tabs that you created when finished.")
 MODES = {"browser_work_order": "form", "canvas_route": "canvas", "transient_dialog": "dialog"}
+
+
+def browser_task(task):
+    return task in MODES or task in WORKSPACE_TASKS
 
 
 def native_placement(args):
@@ -109,6 +114,9 @@ class Meter:
 
 
 def execute_builtin(ctx, task, targets, meter):
+    if task in WORKSPACE_TASKS:
+        from benchmarks.workspace_driver import execute
+        return execute(ctx, task, targets, meter)
     from run import element_index
     call = meter.call
     if task == "native_notes":
@@ -275,6 +283,54 @@ def start_fixture_browser(ctx, row, trial_dir):
     return owned["browser"]
 
 
+def judge_workspace(ctx, server, row):
+    """Read the durable ledger independently and retain every predicate, even on failure."""
+    checks, evidence = {}, {}
+    row["independent_task_success"] = False
+    try:
+        deadline = time.monotonic() + 2
+        while True:
+            durable = server.read()
+            if not isinstance(durable, dict):
+                raise ValueError("Workspace durable evidence is missing or malformed")
+            evidence["ledger"] = durable
+            judged = server.judge(durable)
+            if (not isinstance(judged, dict) or not judged or any(not isinstance(key, str) or not key
+                    or type(value) is not bool for key, value in judged.items())):
+                raise ValueError("Workspace judge must return nonempty named boolean checks")
+            checks = dict(judged)
+            if (not isinstance(durable.get("case_metadata"), dict) or not isinstance(durable.get("baseline"), dict)
+                    or not isinstance(durable.get("state"), dict) or not isinstance(durable.get("events"), list)):
+                raise ValueError("Workspace durable evidence is missing or malformed")
+            checks["durable_workspace_evidence_readable"] = True
+            checks["durable_workspace_case_matches_manifest"] = durable["case_metadata"] == row["case_metadata"]
+            if all(checks.values()) or time.monotonic() >= deadline:
+                break
+            time.sleep(.05)
+    except Exception as error:
+        checks["durable_workspace_evidence_readable"] = False
+        evidence["error"] = f"{type(error).__name__}: {error}"
+    evidence["checks"] = checks
+    row["independent_checks"] = checks
+    row["independent_task_success"] = bool(checks) and all(checks.values())
+    diagnostics = getattr(server, "diagnostics", None)
+    if callable(diagnostics) and "ledger" in evidence:
+        try:
+            detail = diagnostics(evidence["ledger"])
+            if not isinstance(detail, dict):
+                raise ValueError("Workspace diagnostics must be an object")
+            json.dumps(detail, allow_nan=False)
+            evidence["diagnostics"] = detail
+            row["independent_diagnostics"] = detail
+        except Exception as error:
+            # Auxiliary counts cannot replace or invalidate the exact predicates.
+            evidence["diagnostics_error"] = f"{type(error).__name__}: {error}"
+            row["independent_diagnostics_error"] = evidence["diagnostics_error"]
+    for name, passed in checks.items():
+        ctx.check("independent workspace: " + name, passed, evidence.get("error"))
+    return evidence
+
+
 def task_trial(ctx, task, round_number, args, row, output):
     import run as harness
     trial_dir = output / "trials" / f"{task}-{round_number}"
@@ -313,9 +369,16 @@ def task_trial(ctx, task, round_number, args, row, output):
         targets = {"calculator_window_id": calc, "calculator_pid": launched["app"]["pid"],
                    "notes_window_id": notes, "notes_pid": note_window["pid"], "original_note": NOTE}
     else:
-        server = FixtureServer().__enter__()
-        ctx.cleanups.append(lambda: server.__exit__(None, None, None))
-        targets["url"] = server.url + "?task=" + MODES[task]
+        if task in WORKSPACE_TASKS:
+            server = WorkspaceFixture(task, row["case_seed"], trial_dir).__enter__()
+            ctx.cleanups.append(lambda: server.__exit__(None, None, None))
+            row["case_metadata"] = server.case_metadata()
+            report.write_json(trial_dir / "case-manifest.json", row["case_metadata"])
+            targets["url"] = server.url
+        else:
+            server = FixtureServer().__enter__()
+            ctx.cleanups.append(lambda: server.__exit__(None, None, None))
+            targets["url"] = server.url + "?task=" + MODES[task]
         if args.model and getattr(args, "headed_browser", False):
             # Each solver gets the same fresh, active blank tab. Reusing a
             # profile would leave the previous task visible and break binding.
@@ -328,12 +391,17 @@ def task_trial(ctx, task, round_number, args, row, output):
             require_desktop_window(ctx, window, "Browser")
             targets.update(browser_pid=browser.pid, browser_window_id=window["id"])
         if not args.adapter_command:
-            tid = ctx.call("browser_open", url=targets["url"])["tab"]["id"]
+            # Workspace smoke tests exercise the same initial navigation as the
+            # model's claimed blank tab, including the server's document boundary.
+            tid = ctx.call("browser_open", url="about:blank" if task in WORKSPACE_TASKS else targets["url"])["tab"]["id"]
             targets["tab_id"] = tid
             ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
+            if task in WORKSPACE_TASKS:
+                ctx.call("browser_navigate", tab_id=tid, url=targets["url"])
     request = {"protocol": report.CONTRACT, "task_id": task, "trial": round_number, "track": args.track,
                "native_placement": native_placement(args),
-               "model": args.model, "prompt": PROMPTS[task] + RULES, "targets": targets, "timeout_seconds": args.timeout}
+               "model": args.model, "prompt": (server.prompt if task in WORKSPACE_TASKS else PROMPTS[task]) + RULES,
+               "targets": targets, "timeout_seconds": args.timeout}
     if args.model:
         request.update(model_config=report.model_config_for(args), case_seed=row["case_seed"],
                        observation_mode=getattr(args, "observation_mode", "on-demand"),
@@ -360,18 +428,25 @@ def task_trial(ctx, task, round_number, args, row, output):
             row["metrics"] = execute_external(ctx, request, trial_dir, args, row)
         else:
             meter = Meter(ctx)
-            execute_builtin(ctx, task, targets, meter)
+            builtin_targets = {**targets, "goal": request["prompt"]} if task in WORKSPACE_TASKS else targets
+            execute_builtin(ctx, task, builtin_targets, meter)
     except Exception as error:
         adapter_error = error
     finally:
         if meter is not None:
             row["metrics"] = meter.finish()
             report.write_json(trial_dir / "tool-events.json", meter.events)
-        after = harness.observe()
-        row["execution_environment"].update(final_frontmost=after["frontmost"], final_active_space=after["active_space"])
-        report.write_json(trial_dir / "execution-environment.json", row["execution_environment"])
-        row["adapter_invariants"] = ctx.run.invariants(before, after, time.time() - started)
-        report.write_json(trial_dir / "adapter-invariants.json", row["adapter_invariants"])
+        try:
+            after = harness.observe()
+            row["execution_environment"].update(final_frontmost=after["frontmost"], final_active_space=after["active_space"])
+            report.write_json(trial_dir / "execution-environment.json", row["execution_environment"])
+            row["adapter_invariants"] = ctx.run.invariants(before, after, time.time() - started)
+            report.write_json(trial_dir / "adapter-invariants.json", row["adapter_invariants"])
+        except Exception as error:
+            if task not in WORKSPACE_TASKS:
+                raise
+            row["post_adapter_error"] = f"{type(error).__name__}: {error}"
+            adapter_error = adapter_error or error
     if task == "native_notes":
         actual = full_text(ctx, notes)
         tree = ctx.tree(calc, include_screenshot=True)
@@ -390,6 +465,8 @@ def task_trial(ctx, task, round_number, args, row, output):
             active_space = harness.observe()["active_space"]
             row["fixture_environment"].update(textedit_final=final_window, final_active_space=active_space)
             require_off_space(ctx, final_window, active_space, "After task")
+    elif task in WORKSPACE_TASKS:
+        evidence = judge_workspace(ctx, server, row)
     else:
         # Judge persistence after the adapter stops, not merely its own final observation.
         deadline = time.monotonic() + 2
@@ -427,6 +504,7 @@ def run_tasks(args):
         raise ValueError("The built-in adapter does not invoke a model; supply --adapter-command for model runs")
     elif args.engine != "second-cursor-scripted":
         raise ValueError("The built-in adapter must retain the engine name second-cursor-scripted")
+    tasks = args.task or report.DEFAULT_TASKS
     output = report.artifact_dir("best-in-class-tasks")
     meta = report.metadata()
     result = {"kind": "tasks", "contract": report.CONTRACT, "engine": args.engine,
@@ -441,11 +519,10 @@ def run_tasks(args):
                   runner_sha256=runner_sha256,
                   browser_visibility="headed" if getattr(args, "headed_browser", False) else "headless",
                   browser_identity=browser_identity(args),
-                  case_seed_semantics="Trial identity only; this pilot uses fixed fixtures and does not seed provider sampling.")
+                  case_seed_semantics=report.case_seed_semantics(tasks))
     result["coexistence_scope"] = {"endpoint_invariants": True, "transient_interference_verified": False,
                                    "background_execution_verified": False,
                                    "note": "The host-background track requests background actions; it does not prove the fixture started or remained in the background. Each trial records its initial foreground app and target PIDs. Task trials compare before/after focus, cursor and Space and cannot detect a transient change restored between reads. Use attended focus and same-app suites for event-counter evidence."}
-    tasks = args.task or report.TASKS
     harness.SCENARIOS.clear()
     for round_number in range(1, args.rounds + 1):
         for task in tasks:
@@ -460,7 +537,7 @@ def run_tasks(args):
     try:
         run = harness.Run(browser=(not (args.model and getattr(args, "headed_browser", False)))
                           and (not args.adapter_command or getattr(args, "adapter_browser", False))
-                          and any(t in MODES for t in tasks), installed=False,
+                          and any(browser_task(t) for t in tasks), installed=False,
                           headed_browser=getattr(args, "headed_browser", False))
         run.dir.rename(output / "e2e")
         run.dir = output / "e2e"
@@ -499,7 +576,7 @@ def run_tasks(args):
         lines = [f"# Complete task benchmark — {result['status']}", "",
                  f"Engine: `{args.engine}`. Model: `{args.model}`. Track: `{args.track}`. Native placement: `{native_placement(args)}`.", "",
                  f"Execution profile: `{result['execution_profile']}`. Unknown model usage and cost remain unavailable. Every trial stays in the denominator.", "",
-                 f"Model configuration: `{json.dumps(model_config, sort_keys=True)}`. Case seeds identify repeated fixed fixtures, not randomized tasks.", "",
+                 f"Model configuration: `{json.dumps(model_config, sort_keys=True)}`. {result['case_seed_semantics']}", "",
                  "Coexistence is checked at task endpoints only. The host-background track requests background actions, but a passing task does not verify background execution or absence of transient focus, cursor or Space changes. Each trial records whether its fixture initially had foreground focus; attended focus suites provide separate evidence.", "",
                  "| Task | Independent outcome correct | All checks passed | Median / p95 wall ms | Tool median ms |", "| --- | ---: | ---: | ---: | ---: |"]
         for task, summary in result["summary"].items():

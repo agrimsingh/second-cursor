@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Juniper · Operations workspace</title>
+  <style>
+    :root { color-scheme: light; --ink: #24372f; --muted: #68746c; --line: #dce2dc; --paper: #fff; --ground: #f5f6f2; --green: #24604c; --tint: #eaf2eb; --warn: #7c4a18; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--ground); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:disabled { cursor: wait; opacity: .55; }
+    :focus-visible { outline: 3px solid #b57820; outline-offset: 3px; }
+    [hidden] { display: none !important; }
+    #workspace { display: grid; grid-template-columns: 202px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar { background: #eef1ea; border-right: 1px solid var(--line); padding: 26px 15px; }
+    .brand { margin: 0 12px 30px; font-size: 23px; letter-spacing: -.7px; font-weight: 750; }
+    .brand small { display: block; color: var(--muted); font-size: 10px; letter-spacing: 1.8px; font-weight: 650; text-transform: uppercase; margin-top: 2px; }
+    nav { display: grid; gap: 5px; }
+    nav button { text-align: left; background: transparent; border: 0; border-radius: 6px; padding: 10px 12px; min-height: 42px; color: #536258; font-weight: 560; }
+    nav button:hover { background: #e1e8df; }
+    nav button[aria-current="page"] { background: #dce9dc; color: #234e3e; font-weight: 700; }
+    .nav-group { margin: 23px 12px 6px; color: var(--muted); font-size: 10px; letter-spacing: 1.3px; text-transform: uppercase; }
+    .sidebar-footer { border-top: 1px solid #d4ddd3; margin: 30px 12px 0; padding-top: 16px; font-size: 12px; color: var(--muted); }
+    .main-wrap { min-width: 0; }
+    .topbar { background: var(--paper); border-bottom: 1px solid var(--line); min-height: 64px; padding: 18px 32px; display: flex; justify-content: space-between; align-items: center; gap: 20px; font-size: 13px; color: var(--muted); }
+    .topbar strong { color: var(--ink); font-weight: 600; }
+    .environment { display: flex; align-items: center; gap: 7px; font-size: 11px; }
+    .environment::before { content: ""; width: 6px; height: 6px; background: #63936b; border-radius: 100%; }
+    main { max-width: 1320px; margin: 0 auto; padding: 28px 32px 50px; }
+    h1 { font-size: 28px; letter-spacing: -.7px; line-height: 1.2; margin: 0 0 7px; font-weight: 650; }
+    h2 { font-size: 20px; letter-spacing: -.35px; line-height: 1.3; margin: 0 0 6px; font-weight: 650; }
+    h3 { font-size: 13px; font-weight: 650; margin: 25px 0 10px; }
+    p { margin: 0 0 13px; }
+    .muted, .subtitle { color: var(--muted); }
+    .subtitle { max-width: 720px; margin-bottom: 24px; }
+    .toolbar { display: flex; align-items: center; gap: 12px; justify-content: space-between; margin-bottom: 17px; }
+    .toolbar .count { font-size: 12px; color: var(--muted); }
+    .split { display: grid; grid-template-columns: minmax(245px, .8fr) minmax(340px, 1.4fr); border: 1px solid var(--line); background: var(--paper); border-radius: 8px; overflow: hidden; min-height: 410px; }
+    .record-list { border-right: 1px solid var(--line); }
+    .record-list ul { list-style: none; margin: 0; padding: 0; }
+    .record-list li + li { border-top: 1px solid #e9ece7; }
+    .record-item { padding: 15px 18px 11px; }
+    .record-item.selected { background: #edf4ed; box-shadow: inset 3px 0 0 var(--green); }
+    .record-button { display: block; max-width: 100%; text-align: left; border: 0; background: transparent; padding: 6px 0; color: var(--green); min-height: 32px; font-size: 12px; font-weight: 650; }
+    .record-button:hover { text-decoration: underline; }
+    .record-title { font-weight: 650; display: block; margin-bottom: 4px; }
+    .record-meta { display: block; color: var(--muted); font-size: 12px; }
+    .record-status { display: inline-block; color: #4c6858; font-size: 11px; margin-top: 5px; }
+    .detail { min-width: 0; padding: 25px 28px 30px; }
+    .detail:focus { outline: none; }
+    .empty { padding: 60px 20px; text-align: center; color: var(--muted); }
+    .eyebrow { font-size: 11px; color: var(--muted); letter-spacing: .7px; margin-bottom: 7px; }
+    .facts { margin: 20px 0 0; display: grid; grid-template-columns: minmax(125px, .9fr) minmax(0, 1.2fr); gap: 8px 17px; font-size: 13px; }
+    .facts dt { color: var(--muted); }
+    .facts dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .prose { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; margin: 21px 0; }
+    .divider { border: 0; border-top: 1px solid var(--line); margin: 24px 0; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .field { min-width: 0; }
+    .field.full { grid-column: 1 / -1; }
+    label { display: block; font-weight: 600; font-size: 12px; margin-bottom: 6px; }
+    input, select, textarea { background: #fff; color: var(--ink); width: 100%; border: 1px solid #b8c4b9; border-radius: 5px; padding: 9px 10px; min-height: 40px; }
+    textarea { min-height: 94px; resize: vertical; line-height: 1.5; }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin-top: 21px; }
+    .button { border: 1px solid #bcc8bd; background: #fff; border-radius: 5px; color: var(--ink); padding: 9px 13px; min-height: 40px; font-weight: 600; font-size: 12px; }
+    .button:hover { background: #f2f6ef; }
+    .button.primary { background: var(--green); border-color: var(--green); color: #fff; }
+    .button.primary:hover { background: #1d4c3d; }
+    .notice { border: 1px solid #ccdccc; background: #eff6ef; border-radius: 6px; padding: 13px 16px; margin: 0 0 19px; font-size: 13px; white-space: pre-wrap; }
+    .notice.error { background: #fff5e9; border-color: #e2cba8; color: var(--warn); }
+    .notice .actions { margin-top: 10px; }
+    .overview { margin-top: 28px; border-top: 1px solid var(--line); }
+    .overview-row { display: grid; grid-template-columns: 150px 1fr auto; gap: 20px; align-items: center; padding: 23px 0; border-bottom: 1px solid var(--line); }
+    .overview-row h2 { font-size: 15px; margin: 0; }
+    .overview-row p { font-size: 13px; color: var(--muted); margin: 0; max-width: 520px; }
+    dialog { padding: 0; border: 1px solid #b9c7bb; border-radius: 10px; color: var(--ink); width: min(540px, calc(100vw - 40px)); max-height: calc(100vh - 50px); box-shadow: 0 20px 75px #16261b35; }
+    dialog::backdrop { background: #1d2e256b; }
+    .dialog-content { padding: 27px; }
+    dialog .actions { justify-content: flex-end; border-top: 1px solid var(--line); padding-top: 20px; }
+    @media (min-width: 1450px) { main { padding-top: 39px; } }
+    @media (max-width: 850px) { #workspace { grid-template-columns: 160px minmax(0, 1fr); } .sidebar { padding: 22px 9px; } main { padding: 24px 20px; } .topbar { padding: 17px 20px; } .split { grid-template-columns: minmax(180px,.75fr) minmax(290px,1.25fr); } .detail { padding: 23px 18px; } }
+    @media (max-width: 650px) { #workspace { display: block; } .sidebar { padding: 14px; border-right: 0; border-bottom: 1px solid var(--line); } .brand { margin: 0 5px 14px; } .brand small, .nav-group, .sidebar-footer { display: none; } nav { display: flex; flex-wrap: wrap; gap: 3px; } nav button { padding: 7px 9px; min-height: 35px; font-size: 12px; } .topbar { min-height: 48px; padding: 12px 18px; } main { padding: 23px 17px; } .split { display: block; } .record-list { border-right: 0; border-bottom: 1px solid var(--line); max-height: 280px; overflow: auto; } .record-item { padding: 12px 16px 8px; } .record-button { min-height: 32px; padding: 6px 0; } .overview-row { grid-template-columns: 1fr auto; gap: 8px; } .overview-row p { grid-column: 1; grid-row: 2; } .overview-row button { grid-column: 2; grid-row: 1 / 3; } }
+  </style>
+</head>
+<body>
+  <div id="workspace">
+    <aside class="sidebar" aria-label="Workspace navigation">
+      <div class="brand">Juniper<small>Operations workspace</small></div>
+      <nav aria-label="Main navigation">
+        <button type="button" data-section="home">Overview</button>
+        <button type="button" data-section="messages">Inbox</button>
+        <div class="nav-group">Finance</div>
+        <button type="button" data-section="orders">Orders</button>
+        <button type="button" data-section="policy">Policy</button>
+        <button type="button" data-section="invoices">Invoices</button>
+        <div class="nav-group">Customer operations</div>
+        <button type="button" data-section="tickets">Support</button>
+        <button type="button" data-section="releases">Release notes</button>
+        <div class="nav-group">Records</div>
+        <button type="button" data-section="activity">Activity</button>
+      </nav>
+      <div class="sidebar-footer">Shared records.<br>Changes are reviewed before saving.</div>
+    </aside>
+    <div class="main-wrap">
+      <header class="topbar"><strong>Operations / <span id="current-section">Overview</span></strong><span class="environment">Workspace</span></header>
+      <main id="app" aria-busy="true">
+        <h1 id="page-title">Overview</h1>
+        <p id="page-description" class="subtitle">Loading workspace…</p>
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+        <div id="content"></div>
+      </main>
+    </div>
+    <dialog id="review-dialog" aria-labelledby="review-title" aria-describedby="review-description">
+      <div class="dialog-content">
+        <h2 id="review-title">Review update</h2>
+        <p id="review-description" class="muted">Confirm the values before saving this record.</p>
+        <div id="review-details"></div>
+        <div id="review-error" class="notice error" role="alert" hidden></div>
+        <div class="actions"><button class="button" type="button" id="back-to-editing">Back to editing</button><button class="button primary" type="button" id="confirm-save">Save update</button></div>
+      </div>
+    </dialog>
+  </div>
+  <script>
+    "use strict";
+    // Only the current section is fetched. Business decisions and receipts remain server-owned.
+    const sectionInfo = {
+      home: ["Overview", "A shared place for invoices, customer handoffs, and the context behind them."],
+      messages: ["Inbox", "Updates from finance, account owners, and customer operations."],
+      orders: ["Orders", "Purchase details, agreed quantities, and delivery allowances."],
+      policy: ["Policy", "Current operating guidance for finance and customer operations."],
+      invoices: ["Invoices", "Review submitted invoices against their orders and the latest account context."],
+      tickets: ["Support", "Customer requests and the people responsible for the next step."],
+      releases: ["Release notes", "Availability, rollout details, and changes for customer handoffs."],
+      activity: ["Activity", "Recorded changes and save receipts. Open an entry to inspect its outcome."]
+    };
+    const app = document.getElementById("app");
+    const content = document.getElementById("content");
+    const notice = document.getElementById("notice");
+    const dialog = document.getElementById("review-dialog");
+    const confirmSave = document.getElementById("confirm-save");
+    const backToEditing = document.getElementById("back-to-editing");
+    let currentSection = "home";
+    let currentView = null;
+    let selectedID = null;
+    let loading = false;
+    let saving = false;
+    let pendingReview = null;
+    let loadSequence = 0;
+    const rememberedSelection = new Map();
+    const currency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+
+    function element(tag, text, className) {
+      const node = document.createElement(tag);
+      if (text !== undefined && text !== null) node.textContent = String(text);
+      if (className) node.className = className;
+      return node;
+    }
+    function money(cents) { return cents === null || cents === undefined ? "Not set" : currency.format(Number(cents) / 100); }
+    function display(value) { return value === null || value === undefined || value === "" ? "Not set" : String(value); }
+    function button(label, callback, primary = false) {
+      const node = element("button", label, primary ? "button primary" : "button");
+      node.type = "button";
+      node.addEventListener("click", event => { if (!loading && !saving) callback(event); });
+      return node;
+    }
+    function facts(entries) {
+      const list = element("dl", null, "facts");
+      for (const [key, value] of entries) {
+        list.append(element("dt", `${key}:`), element("dd", display(value)));
+      }
+      return list;
+    }
+    function announce(message, error = false, actions = []) {
+      notice.replaceChildren(element("div", message));
+      notice.className = error ? "notice error" : "notice";
+      notice.hidden = !message;
+      if (actions.length) {
+        const row = element("div", null, "actions");
+        for (const action of actions) row.append(button(action.label, action.run));
+        notice.append(row);
+      }
+    }
+    function setBusy(value) {
+      loading = value;
+      app.setAttribute("aria-busy", String(value));
+      for (const node of document.querySelectorAll("nav button, #content button, #notice button")) node.disabled = value || saving;
+    }
+    async function request(path, data) {
+      const response = await fetch(path, data === undefined ? { cache: "no-store" } : {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data)
+      });
+      let body;
+      try {
+        body = await response.json();
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Invalid response shape");
+      } catch (_) {
+        body = { ok: false, uncertain: data !== undefined && data.action !== "review_invoice", message: `The server returned an unreadable response (${response.status}).` };
+      }
+      if (!response.ok || body.ok === false) {
+        const error = new Error(body.message || body.error || `Request failed (${response.status}).`);
+        error.status = response.status;
+        error.code = body.error;
+        error.uncertain = body.uncertain === true;
+        throw error;
+      }
+      return body;
+    }
+    async function loadSection(section, options = {}) {
+      if (saving) return;
+      if (!Object.hasOwn(sectionInfo, section)) section = "home";
+      const sequence = ++loadSequence;
+      const [title, description] = sectionInfo[section];
+      setBusy(true);
+      announce("");
+      document.getElementById("current-section").textContent = title;
+      document.getElementById("page-title").textContent = title;
+      document.getElementById("page-description").textContent = description;
+      for (const node of document.querySelectorAll("nav button")) {
+        if (node.dataset.section === section) node.setAttribute("aria-current", "page");
+        else node.removeAttribute("aria-current");
+      }
+      content.replaceChildren(element("p", "Loading records…", "muted"));
+      try {
+        const view = await request(`/api/view?section=${encodeURIComponent(section)}`);
+        if (sequence !== loadSequence) return;
+        currentSection = section;
+        currentView = { ...view, items: Array.isArray(view.items) ? view.items : [], options: view.options || {} };
+        selectedID = options.selectedID || rememberedSelection.get(section) || null;
+        if (!currentView.items.some(row => String(row.id) === String(selectedID))) selectedID = null;
+        document.title = `${title} · Juniper`;
+        renderSection();
+        if (options.message) announce(options.message);
+      } catch (error) {
+        if (sequence !== loadSequence) return;
+        content.replaceChildren();
+        announce(`Could not load ${title.toLowerCase()}. ${error.message}`, true, [{ label: "Try loading again", run: () => loadSection(section, options) }]);
+      } finally {
+        if (sequence === loadSequence) setBusy(false);
+      }
+    }
+    function renderSection() {
+      content.replaceChildren();
+      if (currentSection === "home") {
+        const intro = element("div", null, "overview");
+        const rows = [
+          ["Inbox", "Read updates and requests before changing a shared record.", "messages"],
+          ["Finance", "Find an invoice, compare its order, and consult the current policy.", "invoices"],
+          ["Support", "Review customer context and release availability before a handoff.", "tickets"],
+          ["Activity", "Look up recorded changes when you need to confirm a save.", "activity"]
+        ];
+        for (const [title, description, section] of rows) {
+          const row = element("section", null, "overview-row");
+          row.append(element("h2", title), element("p", description), button(`Open ${title.toLowerCase()}`, () => loadSection(section)));
+          intro.append(row);
+        }
+        content.append(intro);
+        return;
+      }
+      const toolbar = element("div", null, "toolbar");
+      toolbar.append(element("span", `${currentView.items.length} ${currentSection === "activity" ? "entries" : "records"}`, "count"), button("Refresh records", () => loadSection(currentSection, { selectedID })));
+      content.append(toolbar);
+      if (!currentView.items.length) {
+        content.append(element("p", currentSection === "activity" ? "No activity has been recorded yet." : "No records in this view.", "empty"));
+        return;
+      }
+      const split = element("div", null, "split");
+      const listRegion = element("section", null, "record-list");
+      listRegion.setAttribute("aria-label", `${sectionInfo[currentSection][0]} records`);
+      const list = element("ul");
+      for (const record of currentView.items) {
+        const isSelected = String(selectedID) === String(record.id);
+        const row = element("li", null, isSelected ? "record-item selected" : "record-item");
+        const item = element("button", null, "record-button");
+        item.type = "button";
+        const summary = recordSummary(record);
+        item.setAttribute("aria-label", summary.action);
+        item.setAttribute("aria-pressed", String(isSelected));
+        // Keep context outside the short action name so accessibility snapshots
+        // retain timestamps, customer names, and other list comparison details.
+        row.append(element("span", summary.title, "record-title"), element("span", summary.meta, "record-meta"));
+        if (summary.status) row.append(element("span", summary.status, "record-status"));
+        item.textContent = currentSection === "messages" ? "Open message" : currentSection === "policy" ? "Open policy" : summary.action;
+        item.addEventListener("click", () => {
+          if (loading || saving) return;
+          selectedID = record.id;
+          rememberedSelection.set(currentSection, selectedID);
+          announce("");
+          renderSection();
+          document.getElementById("record-detail").focus({ preventScroll: true });
+        });
+        row.append(item);
+        list.append(row);
+      }
+      listRegion.append(list);
+      const detail = element("section", null, "detail");
+      detail.id = "record-detail";
+      detail.tabIndex = -1;
+      detail.setAttribute("aria-label", "Record details");
+      const selected = currentView.items.find(row => String(row.id) === String(selectedID));
+      if (selected) renderDetail(detail, selected);
+      else detail.append(element("p", "Select a record to see its details.", "empty"));
+      split.append(listRegion, detail);
+      content.append(split);
+    }
+    function recordSummary(record) {
+      switch (currentSection) {
+        case "invoices": return { action: `Open invoice ${record.invoice_number}`, title: record.vendor, meta: `${record.invoice_number} · ${money(record.invoice_amount_cents)}`, status: record.status };
+        case "orders": return { action: `Open order ${record.id}`, title: record.vendor, meta: `${record.id} · ${record.product}` };
+        case "policy": return { action: `Open policy ${record.title}`, title: record.title, meta: record.id };
+        case "messages": return { action: `Open message ${record.subject}`, title: record.subject, meta: `${record.author} · ${record.record_id}`, status: record.sent_at };
+        case "tickets": return { action: `Open ticket ${record.id}`, title: record.customer, meta: `${record.id} · ${record.subject}`, status: `${record.status} · ${record.owner}` };
+        case "releases": return { action: `Open release ${record.version}`, title: record.version, meta: record.stage, status: record.rollout };
+        case "activity": return { action: `Open activity ${record.id}`, title: `${record.record_id} · ${record.action}`, meta: record.id, status: record.outcome };
+        default: return { action: `Open record ${record.id}`, title: record.id, meta: "" };
+      }
+    }
+    function renderDetail(target, record) {
+      const summary = recordSummary(record);
+      target.append(element("div", sectionInfo[currentSection][0], "eyebrow"), element("h2", summary.title));
+      switch (currentSection) {
+        case "invoices":
+          target.append(facts([
+            ["Invoice ID", record.id], ["Invoice number", record.invoice_number], ["Order ID", record.order_id],
+            ["Vendor", record.vendor], ["Quantity", record.quantity], ["Unit price", money(record.unit_price_cents)],
+            ["Shipping", money(record.shipping_cents)], ["Invoice total", money(record.invoice_amount_cents)],
+            ["Status", record.status], ["Saved approved amount", money(record.approved_amount_cents)],
+            ["Saved decision", routeLabel(record.route)], ["Saved note", record.note], ["Revision", record.revision]
+          ]));
+          target.append(element("hr", null, "divider"));
+          renderInvoiceForm(target, record);
+          break;
+        case "tickets":
+          target.append(facts([["Ticket ID", record.id], ["Customer", record.customer], ["Subject", record.subject], ["Saved status", record.status], ["Saved owner", record.owner], ["Saved release", record.release], ["Saved note", record.note], ["Revision", record.revision]]));
+          target.append(element("hr", null, "divider"));
+          renderTicketForm(target, record);
+          break;
+        case "orders":
+          target.append(facts([["Order ID", record.id], ["Vendor", record.vendor], ["Product", record.product], ["Quantity", record.quantity], ["Unit price", money(record.unit_price_cents)], ["Delivery cap", money(record.delivery_cap_cents)]]), element("h3", "Order notes"), element("p", display(record.notes), "prose"));
+          break;
+        case "policy":
+          target.append(facts([["Policy ID", record.id]]), element("p", display(record.body), "prose"));
+          break;
+        case "messages":
+          target.append(facts([["Message ID", record.id], ["From", record.author], ["Sent", record.sent_at], ["Topic", record.topic], ["Related record", record.record_id]]), element("p", display(record.body), "prose"));
+          break;
+        case "releases":
+          target.append(facts([["Release ID", record.id], ["Version", record.version], ["Stage", record.stage], ["Rollout", record.rollout]]), element("h3", "Release notes"), element("p", display(record.notes), "prose"));
+          break;
+        case "activity":
+          target.append(facts([["Activity ID", record.id], ["Record ID", record.record_id], ["Action", record.action], ["Outcome", record.outcome]]), element("h3", "Recorded message"), element("p", display(record.message), "prose"));
+          break;
+      }
+    }
+    function routeLabel(value) {
+      const match = (currentView.options.routes || []).find(option => option.value === value);
+      return match ? match.label : display(value);
+    }
+    function field(label, id, control, full = false) {
+      const container = element("div", null, full ? "field full" : "field");
+      const name = element("label", label);
+      name.htmlFor = id;
+      control.id = id;
+      control.name = id;
+      container.append(name, control);
+      return container;
+    }
+    function selectControl(options, value, placeholder) {
+      const control = element("select");
+      control.required = true;
+      const first = element("option", placeholder);
+      first.value = "";
+      first.disabled = true;
+      control.append(first);
+      for (const entry of options) {
+        const item = typeof entry === "string" ? { value: entry, label: entry } : entry;
+        const option = element("option", item.label);
+        option.value = item.value;
+        control.append(option);
+      }
+      control.value = value || "";
+      if (control.selectedIndex < 0) control.value = "";
+      return control;
+    }
+    function noteControl(value) {
+      const control = element("textarea");
+      control.value = value || "";
+      control.required = true;
+      control.maxLength = 500;
+      return control;
+    }
+    function renderInvoiceForm(target, record) {
+      target.append(element("h3", "Invoice decision"));
+      const form = element("form");
+      form.setAttribute("aria-label", "Invoice decision");
+      const grid = element("div", null, "form-grid");
+      const amount = element("input");
+      amount.type = "text";
+      amount.inputMode = "decimal";
+      amount.autocomplete = "off";
+      amount.required = true;
+      amount.pattern = "[0-9]+([.][0-9]{1,2})?";
+      amount.value = record.approved_amount_cents === null || record.approved_amount_cents === undefined ? "" : (record.approved_amount_cents / 100).toFixed(2);
+      const route = selectControl(currentView.options.routes || [], record.route, "Choose a decision");
+      const note = noteControl(record.note);
+      grid.append(field("Approved amount ($)", "approved-amount", amount), field("Decision", "invoice-decision", route), field("Review note", "review-note", note, true));
+      const actions = element("div", null, "actions");
+      const review = element("button", "Review invoice", "button primary");
+      review.type = "submit";
+      actions.append(review, button("Reload invoice", () => loadSection("invoices", { selectedID: record.id, message: "Invoice reloaded from saved records. Unsaved edits were replaced." })));
+      form.append(grid, element("p", "Enter dollars and cents. Review the order, policy, and relevant inbox updates before saving.", "hint"), actions);
+      form.addEventListener("submit", async event => {
+        event.preventDefault();
+        if (loading || saving || !form.reportValidity()) return;
+        const cents = parseCents(amount.value);
+        if (cents === null || !note.value.trim()) { announce("Enter a valid amount with at most two decimal places and a review note.", true); return; }
+        const draft = { action: "save_invoice", id: record.id, revision: record.revision, amount_cents: cents, route: route.value, note: note.value.trim() };
+        review.disabled = true;
+        setBusy(true);
+        try {
+          const reviewed = await request("/api/action", { action: "review_invoice", id: record.id, revision: record.revision });
+          if (reviewed.review_revision !== undefined && Number(reviewed.review_revision) !== Number(record.revision)) {
+            announce("The invoice changed during review. Reload the invoice and review the latest details before saving.", true, recoveryActions(record.id));
+            return;
+          }
+          openReview(draft, record);
+        } catch (error) { showActionError(error, record.id, "invoices"); }
+        finally { review.disabled = false; setBusy(false); }
+      });
+      target.append(form);
+    }
+    function parseCents(value) {
+      const text = value.trim();
+      if (!/^\d+(?:\.\d{1,2})?$/.test(text)) return null;
+      const [whole, fraction = ""] = text.split(".");
+      const cents = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+      return Number.isSafeInteger(cents) && cents >= 0 ? cents : null;
+    }
+    function renderTicketForm(target, record) {
+      target.append(element("h3", "Support handoff"));
+      const form = element("form");
+      form.setAttribute("aria-label", "Support handoff");
+      const grid = element("div", null, "form-grid");
+      const status = selectControl(currentView.options.statuses || [], record.status, "Choose a status");
+      const owner = selectControl(currentView.options.owners || [], record.owner, "Choose an owner");
+      const release = selectControl(currentView.options.releases || [], record.release, "Choose a release");
+      const note = noteControl(record.note);
+      grid.append(field("Status", "ticket-status", status), field("Owner", "ticket-owner", owner), field("Release", "ticket-release", release, true), field("Handoff note", "handoff-note", note, true));
+      const actions = element("div", null, "actions");
+      const review = element("button", "Review support update", "button primary");
+      review.type = "submit";
+      actions.append(review, button("Reload ticket", () => loadSection("tickets", { selectedID: record.id, message: "Ticket reloaded from saved records. Unsaved edits were replaced." })));
+      form.append(grid, actions);
+      form.addEventListener("submit", event => {
+        event.preventDefault();
+        if (loading || saving || !form.reportValidity()) return;
+        if (!note.value.trim()) { announce("Add a handoff note before reviewing this update.", true); return; }
+        openReview({ action: "update_ticket", id: record.id, revision: record.revision, status: status.value, owner: owner.value, release: release.value, note: note.value.trim() }, record);
+      });
+      target.append(form);
+    }
+    function openReview(draft, record) {
+      pendingReview = { draft: Object.freeze({ ...draft }), section: currentSection, recordLabel: record.invoice_number || record.id };
+      const invoice = draft.action === "save_invoice";
+      document.getElementById("review-title").textContent = invoice ? "Review invoice update" : "Review support update";
+      document.getElementById("review-description").textContent = "These values will be saved to the shared record. Check the decision and note before confirming.";
+      document.getElementById("review-details").replaceChildren(facts(invoice ? [
+        ["Invoice ID", draft.id], ["Invoice number", record.invoice_number], ["Vendor", record.vendor], ["Approved amount", money(draft.amount_cents)], ["Decision", routeLabel(draft.route)], ["Review note", draft.note], ["Reviewed revision", draft.revision]
+      ] : [["Ticket ID", draft.id], ["Customer", record.customer], ["Status", draft.status], ["Owner", draft.owner], ["Release", draft.release], ["Handoff note", draft.note], ["Reviewed revision", draft.revision]]));
+      document.getElementById("review-error").hidden = true;
+      confirmSave.textContent = invoice ? "Save invoice" : "Save support update";
+      confirmSave.disabled = false;
+      dialog.showModal();
+      backToEditing.focus();
+    }
+    function recoveryActions(id, section = "invoices") {
+      return [
+        { label: section === "invoices" ? "Reload saved invoice" : "Reload saved ticket", run: () => loadSection(section, { selectedID: id }) },
+        { label: "Check activity", run: () => loadSection("activity") },
+        { label: "Read latest inbox", run: () => loadSection("messages") }
+      ];
+    }
+    function showActionError(error, id, section) {
+      if (error.uncertain || error.code === "response_lost" || !error.status || error.status >= 500) {
+        announce(`Save confirmation is unavailable. ${error.message}\nCheck the saved record and Activity before attempting another save.`, true, recoveryActions(id, section));
+      } else if (error.status === 409 || error.code === "stale_revision") {
+        announce(`This record changed. ${error.message}\nReload the record and read the latest inbox updates before reviewing again.`, true, recoveryActions(id, section));
+      } else {
+        announce(`The update was not saved. ${error.message}`, true);
+      }
+    }
+    backToEditing.addEventListener("click", () => { if (!saving) dialog.close(); });
+    dialog.addEventListener("cancel", event => { if (saving) event.preventDefault(); });
+    dialog.addEventListener("close", () => { if (!saving) pendingReview = null; });
+    confirmSave.addEventListener("click", async () => {
+      if (saving || !pendingReview) return;
+      const review = pendingReview;
+      saving = true;
+      confirmSave.disabled = true;
+      backToEditing.disabled = true;
+      setBusy(true);
+      confirmSave.textContent = "Saving…";
+      let result;
+      let failure;
+      try { result = await request("/api/action", review.draft); }
+      catch (error) { failure = error; }
+      finally {
+        saving = false;
+        backToEditing.disabled = false;
+        dialog.close();
+        pendingReview = null;
+        setBusy(false);
+      }
+      if (failure) { showActionError(failure, review.draft.id, review.section); return; }
+      await loadSection(review.section, { selectedID: review.draft.id, message: result.message || `Saved ${review.recordLabel}. The record below was reloaded from the server.` });
+    });
+    for (const node of document.querySelectorAll("nav button")) node.addEventListener("click", () => {
+      if (!loading && !saving) loadSection(node.dataset.section);
+    });
+    loadSection("home");
+  </script>
+</body>
+</html>

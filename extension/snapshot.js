@@ -206,7 +206,7 @@ const joinTexts = (texts) =>
     return OPENS.test(texts[i - 1]) || CLOSES.test(text) ? line + text : `${line} · ${text}`;
   }, "");
 
-/** A control with no controls inside is one line: its visible text, or its name when it shows none. */
+/** A control with no controls inside keeps its accessible name and useful visible text on one line. */
 function controlLabel(node, byId) {
   const texts = visibleText(node, byId);
   const name = clean(node.name?.value, Infinity);
@@ -214,6 +214,18 @@ function controlLabel(node, byId) {
   // The name is the visible text as the page phrases it ("[19]", "v2.1 Latest"): keep it.
   if (name.replace(/\s/g, "") === texts.join("").replace(/\s/g, "")) return clean(name, MAX_CONTROL_TEXT);
   const shown = joinTexts(texts);
+  // Only a name computed from contents may lose extra image-alt fragments. An
+  // explicit label can distinguish several controls with the same visible text
+  // ("Open message"), so that text covering part of the name is not redundancy.
+  // Ignore superseded/invalid candidates; when Chrome omits source metadata,
+  // conservatively retain the more informative accessible name.
+  const source = node.name?.sources?.find((candidate) =>
+    !candidate.superseded && !candidate.invalid && clean(candidate.value?.value, Infinity) === name,
+  );
+  if (name && source?.type !== "contents") {
+    if (texts.every((text) => name.includes(text))) return clean(name, MAX_CONTROL_TEXT);
+    if (!shown.includes(name)) return clean(`${name} · ${shown}`, MAX_CONTROL_TEXT);
+  }
   // A name built from the control's content (plus image alt text) says nothing the texts do not.
   const covered = texts.filter((t) => name.includes(t)).length >= Math.ceil(texts.length / 2);
   const label = !name || covered || shown.includes(name) ? shown : `${name} · ${shown}`;
@@ -225,8 +237,8 @@ const refOf = (node) => node.ref ?? `e${node.backendDOMNodeId}`;
 /**
  * Renders the accessibility tree as an indented outline. Interactive nodes carry `[e<backendDOMNodeId>]`
  * refs (`[f<frame>e<id>]` inside a frame Chrome runs in another process), which stay valid for as long as the DOM
- * node exists. A control with no controls inside (a card link, a labelled button) is a single line with its visible
- * text; unnamed images and empty containers are left out, and a wrapper whose whole name is already printed inside
+ * node exists. A control with no controls inside (a card link, a labelled button) is a single line retaining explicit
+ * accessible labels and useful visible text; unnamed images and empty containers are left out, and a wrapper whose whole name is already printed inside
  * it gives up its own line. Elements only a listener or pointer cursor makes clickable, and scroll panels, carry a
  * `clickable` or `scrollable` hint; password and payment card values are redacted.
  */
