@@ -20,9 +20,9 @@ Ways the feature could fail, written down before the code:
 12. The compact surface advertises the wrong tools, hides act or find_elements, makes hidden tools uncallable, or gives
     act a schema that drifts from batch's; /api and /mcp list different tools.
 13. The full surface advertises act, or omits find_elements.
-14. tools/list grows back past its budget, or still lists what only hosts use: session_id, operation_id,
-    observation_id or timeout_ms on a tool (wait_for's and browser_repl's timeout_ms are the model's), or the session
-    and operation tools.
+14. tools/list grows back past its budget, or still lists what only hosts use: session_id, mutation operation_id,
+    observation_id or timeout_ms on a tool (wait_for's and browser_repl's timeout_ms are the model's), or session,
+    ownership and cancellation tools. Read-only operation_status must expose its required operation_id.
 15. A host parameter left out of tools/list stops working: an unlisted session cannot be created or own a tab, an
     operation_id retry clicks again, a superseded observation_id or an expired timeout_ms lets the click through.
 
@@ -44,7 +44,7 @@ SCENARIOS.clear()
 LINE = re.compile(r'^\[(\d+)\] (AX\w+) "((?:[^"\\]|\\.)*)"')
 FRAME = re.compile(r"\((-?\d+),(-?\d+) (\d+)x(\d+)\)")
 HIDDEN_IN_COMPACT = {"click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "batch"}
-HOST_TOOLS = {"session", "bind_target", "operation_status", "cancel_operation"}
+HOST_TOOLS = {"session", "bind_target", "cancel_operation"}
 HOST_PARAMETERS = {"session_id", "operation_id", "observation_id", "timeout_ms"}
 # The default surface measured 63.8k characters before host parameters were hidden and expect, observe and caption
 # were described in full only on click and batch (browser_click for the browser).
@@ -353,10 +353,21 @@ def host_parameters(ctx):
     size = len(json.dumps(tools))
     ctx.check(f"tools/list is at most {LISTING_BUDGET} characters", size <= LISTING_BUDGET, size)
     names = {t["name"] for t in tools}
-    ctx.check("the session and operation tools are not listed", not (HOST_TOOLS & names), sorted(HOST_TOOLS & names))
+    ctx.check("session, ownership and cancellation tools are not listed", not (HOST_TOOLS & names), sorted(HOST_TOOLS & names))
     leaked = sorted(f'{t["name"]}.{p}' for t in tools for p in t["inputSchema"].get("properties", {})
-                    if p in HOST_PARAMETERS and not (p == "timeout_ms" and t["name"] in ("wait_for", "browser_repl")))
-    ctx.check("no listed tool takes session_id, operation_id, observation_id or timeout_ms", not leaked, leaked)
+                    if p in HOST_PARAMETERS
+                    and not (p == "timeout_ms" and t["name"] in ("wait_for", "browser_repl"))
+                    and not (p == "operation_id" and t["name"] == "operation_status"))
+    ctx.check("host parameters stay hidden except model waits and operation_status.operation_id", not leaked, leaked)
+    operation_status = next((t for t in tools if t["name"] == "operation_status"), {})
+    recovery_schema = operation_status.get("inputSchema", {})
+    ctx.check("operation_status exposes its required string operation_id",
+              "operation_id" in recovery_schema.get("required", [])
+              and recovery_schema.get("properties", {}).get("operation_id", {}).get("type") == "string",
+              recovery_schema)
+    ctx.check("operation_status advertises read-only recovery",
+              operation_status.get("annotations", {}).get("readOnlyHint") is True,
+              operation_status.get("annotations"))
     wait_for = next(t for t in tools if t["name"] == "wait_for")["inputSchema"]["properties"]
     ctx.check("wait_for keeps its timeout_ms", "timeout_ms" in wait_for, sorted(wait_for))
 

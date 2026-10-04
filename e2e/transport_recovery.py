@@ -177,6 +177,16 @@ def durable_operation_recovery(ctx):
     client = Client(ctx.run.instance, transcript=ctx.run.transcript)
     client.initialize()
     ctx.cleanups.append(client.close)
+    status, discovery = client.raw("tools/list")
+    recovery = next((tool for tool in discovery.get("result", {}).get("tools", [])
+                     if tool.get("name") == "operation_status"), None)
+    ctx.require("ordinary MCP discovery exposes read-only outcome reconciliation",
+                status == 200 and recovery and recovery.get("annotations", {}).get("readOnlyHint") is True,
+                recovery)
+    ctx.require("discovered recovery schema retains its required operation ID",
+                recovery["inputSchema"].get("required") == ["operation_id"]
+                and recovery["inputSchema"]["properties"].get("operation_id", {}).get("type") == "string",
+                recovery["inputSchema"])
     window = launch_textedit(ctx, "recovery.txt", "before")["id"]
     snapshot = client.call("get_window_state", window_id=window)
     index = element_index(snapshot["tree"], "AXTextArea")

@@ -49,8 +49,9 @@ enum ToolCatalog {
     /// as well, or ("repl") browser_repl alone. Models offered both browser_repl and the discrete browser tools mixed
     /// them and ran slower than with either, so browser_repl is listed only when asked for.
     /// `expand` is listed only when reads are condensed (`condenseOutlines`), since nothing is hidden otherwise.
-    /// Sessions, retries and deadlines (docs/api.md) are for hosts, which pass them in code; a model never needs them,
-    /// so they are left out of every surface and stay accepted.
+    /// Session ownership, retry IDs and deadlines are normally managed by hosts.
+    /// Outcome reconciliation stays discoverable because an uncertain result can
+    /// require the model to inspect a journaled operation before choosing its next action.
     static func advertised(surface: String?, condensing: Bool = false) -> [Tool] {
         let hidden: Set<String> = surface == "compact" ? compactHiddenTools.union(["browser_repl"])
             : surface == "full" ? ["act"] : ["act", "browser_repl"]
@@ -60,6 +61,7 @@ enum ToolCatalog {
             guard case .object(var schema) = tool.inputSchema, case .object(var properties)? = schema["properties"]
             else { return tool }
             var dropped = hostParameters
+            if tool.name == "operation_status" { dropped.remove("operation_id") }
             // wait_for's timeout_ms bounds its wait, and browser_repl's a script the model wrote.
             if ["wait_for", "browser_repl"].contains(tool.name) { dropped.remove("timeout_ms") }
             if !condensing { dropped.insert("expand") }
@@ -70,7 +72,7 @@ enum ToolCatalog {
     }
 
     private static let hostParameters: Set<String> = ["session_id", "operation_id", "observation_id", "timeout_ms"]
-    private static let hostTools: Set<String> = ["session", "bind_target", "operation_status", "cancel_operation"]
+    private static let hostTools: Set<String> = ["session", "bind_target", "cancel_operation"]
 
     private static let expand = stringArray(
         "Ids of hidden parts of a condensed read (its '… N lines hidden (expand \"r3\")' lines) to return whole, as they "
@@ -509,8 +511,9 @@ enum ToolCatalog {
             inputSchema: schema(
                 ["target": string("Target"), "action": string("claim or release")], required: ["target"])),
         Tool(
-            name: "operation_status", description: "Reconcile a request after timeout without repeating input.",
-            inputSchema: schema(["operation_id": string("Operation ID")], required: ["operation_id"])),
+            name: "operation_status", description: "Check the operation_id reported by an uncertain or timed-out action without repeating input. Inspect its state and outcome_known, then observe the target before deciding whether another action is needed. An expired result body does not mean the action failed.",
+            inputSchema: schema(["operation_id": string("Operation ID from the action result or error")], required: ["operation_id"]),
+            annotations: .init(readOnlyHint: true)),
         Tool(
             name: "cancel_operation", description: "Cancel queued work; already delivered input cannot be undone.",
             inputSchema: schema(["operation_id": string("Operation ID")], required: ["operation_id"])),

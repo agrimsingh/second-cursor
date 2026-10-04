@@ -82,6 +82,8 @@ For Cursor, the menu bar item's **Copy Cursor MCP config** produces the same ent
 
 Custom hosts can use POST `/api` or `sdk/index.mjs`; all interfaces share the same dispatcher and policies.
 
+The connected AI app owns the model conversation: it discovers Second Cursor's tools, chooses actions, and reads their results before continuing. Second Cursor supplies computer observations, input, task controls and recovery, so changing the host or its model does not require a provider integration in the runtime. A host must support MCP tool calls; MCP sampling is optional and is not required by this design. The configuration helpers above do not establish compatibility with every host or model.
+
 The port and token live in `~/Library/Application Support/SecondCursor/config.json`. The server only listens on localhost and rejects requests without the token or with a non-local origin.
 
 ### Cursor turn-end hook
@@ -102,9 +104,9 @@ Second Cursor runs no model of its own; choose one in your connected client. The
 
 | Area | Tools |
 | --- | --- |
-| Status and task control | `status`, `capabilities`, `task` |
+| Status and task control | `status`, `capabilities`, `task`, `operation_status` |
 | Apps and windows | `list_apps`, `list_windows`, `launch_app`, `get_window_state`, `find_elements`, `screenshot` |
-| Sessions (for hosts; callable but not in `tools/list`, like the `session_id`, `operation_id`, `observation_id` and `timeout_ms` arguments) | `session`, `bind_target`, `operation_status`, `cancel_operation` |
+| Sessions (for hosts; callable but not in `tools/list`, like the `session_id`, action `operation_id`, `observation_id` and host `timeout_ms` arguments) | `session`, `bind_target`, `cancel_operation` |
 | Editing | `inspect_element`, `select_text`, `paste` |
 | Extended browser | `browser_instances`, `browser_command` (DOM, dialogs, files, exports, screenshots, history, assets) |
 | Browser REPL (opt-in, `toolSurface: "full"`) | `browser_repl`: persistent JavaScript with a Playwright-compatible `page` ([details](docs/api.md#browser-repl)) |
@@ -162,6 +164,7 @@ python3 e2e/native_safety.py   # native capabilities and stale-layout/input refu
 python3 e2e/text_batch.py      # native selection, insertion, Unicode and interruption guards
 python3 e2e/invoice_workflow.py # kill/restart the SDK after a real invoice submission
 python3 e2e/cross_app_workflows.py --takeover --seed 73 --rounds 3 # browser -> existing native document amid synthetic foreground activity
+python3 e2e/cross_app_model.py --takeover --seed 101 --rounds 5 # real Sol 6.1 high decisions, same independent cross-app judges
 node --test sdk/agent-recovery.test.mjs # checkpoint durability and refusal/recovery cases, no GUI
 python3 e2e/browser_reliability.py # freshness, hover, verified form state, settling
 python3 e2e/browser_target_contracts.py # editable focus, iframe/shadow targets, dropdown contracts
@@ -177,6 +180,8 @@ python3 e2e/focus.py --takeover   # focus safety; takes focus and covers the scr
 Background suites put fixture windows on the agent display. `focus.py --takeover`, `native_safety.py --takeover`, `task_ui.py --ui`, `setup.py --ui`, and `run.py --on-screen` explicitly permit foreground fixture activity. Run those attended checks separately from unattended timing measurements.
 
 The cross-app suite uses a visible isolated browser, a disposable TextEdit document with existing content, and two foreground canary editors. Its seeded schedule switches canary windows and inserts synthetic text while the public-tool driver reconciles a stale invoice, handles unavailable save confirmation, pauses/resumes, preserves an external document edit, and saves the derived summary. `--mode recovery`, `--mode pause-resume`, and `--mode stale-plan` isolate the stages; the default `--mode interleaved` combines them and discards a native append acknowledgement to exercise journal reconciliation. Event-based focus/text checks detect transient corruption, and an independent judge reads the browser ledger and saved native file. Run it only while away from the Mac; synthetic in-process activity does not establish physical human-input detection or model reasoning quality. See [the acceptance scope](docs/acceptance-cross-app-workflows.md) and [the 12-case verification](docs/verification-cross-app-workflows-2026-10-05.md). It is also available as `best_in_class.py gate --profile release --suite cross-app-interruptions --takeover`.
+
+The [model cross-app track](docs/acceptance-cross-app-model.md) gives a fresh isolated model conversation the business goal and permitted targets, then forwards its choices through the real MCP catalog and transport. It uses the same independent browser, saved-document and foreground checks, with no scripted solver. Defaults are Sol 6.1 high, seeds 101–105, 100 tool calls and 420 seconds per trial; `--list` previews the pinned profile without launching apps or spending model usage. Batch tools are excluded from this first track so each native mutation has an independent before/after receipt. The [first frozen cohort](docs/verification-cross-app-model-2026-10-05.md) passed five of five trials at a median 176.1 seconds, with a failed development pilot retained separately. This tests the runtime behind a reference host; each AI app's native MCP configuration still needs a separate compatibility check.
 
 `SC_E2E_APP=build/SecondCursor.app` tests another bundle, and `--installed` targets your running app instead (opt-in). `python3 e2e/setup.py` runs `install-mcp` against a temporary `HOME` and checks that your real client configs are unchanged.
 

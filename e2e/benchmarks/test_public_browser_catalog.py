@@ -71,6 +71,24 @@ class PublicBrowserCatalogTests(unittest.TestCase):
             self.assertIn(fragment, locator["properties"]["role"]["description"])
         self.assertIn("values take precedence", arguments["properties"]["value"]["description"])
 
+    def test_uncertain_action_recovery_is_discoverable_with_a_complete_schema(self):
+        for name, surface in self.catalogs.items():
+            with self.subTest(surface=name):
+                tools = {tool["name"]: tool for tool in surface}
+                recovery = tools["operation_status"]
+                self.assertTrue(recovery["annotations"]["readOnlyHint"])
+                self.assertEqual(recovery["inputSchema"]["required"], ["operation_id"])
+                self.assertEqual(set(recovery["inputSchema"]["properties"]), {"operation_id"})
+                self.assertEqual(recovery["inputSchema"]["properties"]["operation_id"]["type"], "string")
+                for text in ("without repeating input", "outcome_known", "observe the target"):
+                    self.assertIn(text, recovery["description"])
+                for hidden in ("session", "bind_target", "cancel_operation"):
+                    self.assertNotIn(hidden, tools)
+                self.assertNotIn("session_id", tools["get_window_state"]["inputSchema"]["properties"])
+                for tool in tools.values():
+                    self.assertLessEqual(set(tool["inputSchema"].get("required", [])),
+                                         set(tool["inputSchema"].get("properties", {})), tool["name"])
+
     def test_other_operations_fields_and_native_batch_remain_available(self):
         schema = self.command["inputSchema"]
         self.assertEqual(set(schema["properties"]["operation"]["enum"]), OPERATIONS)
