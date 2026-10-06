@@ -3,6 +3,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { WorkflowCheckpointError } from './checkpoint.mjs';
+import { normalizeContract, initialControl, validateControl, prepareSpace, contractLimit, resolveChoice, recordOutcome, failedResult, verify } from './contract.mjs';
 export { fileCheckpointStore, WorkflowCheckpointError } from './checkpoint.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -83,8 +84,11 @@ function validateState(state, expected) {
       !state.history.every(item => object(item) && ['assistant', 'tool'].includes(item.role) && (item.role !== 'tool' || (typeof item.id === 'string' && typeof item.name === 'string'))) ||
       (state.pending !== null && (!object(state.pending) || !validCall(state.pending.call) || typeof state.pending.operationId !== 'string' || !state.pending.operationId)) ||
       (state.pending && (state.queue[0]?.id !== state.pending.call.id || JSON.stringify(state.queue[0]) !== JSON.stringify(state.pending.call))) ||
+      (state.contract && state.pending && !['act', 'observe'].includes(state.pending.kind)) ||
       (state.status === 'completed' && (state.pending || state.queue.length || !object(state.result)))) invalid('Checkpoint structure or version is invalid');
   targetsOf(state.targets);
+  if (state.contract) validateControl(state.control);
+  if (state.verificationRequired && state.status === 'completed' && state.result?.verification?.complete !== true) invalid('Verified workflow lacks completion evidence');
   let unresolved = [];
   for (const item of state.history) {
     if (item.role === 'assistant') {
@@ -102,7 +106,7 @@ function validateState(state, expected) {
   }
   if (JSON.stringify(unresolved) !== JSON.stringify(state.queue)) invalid('Checkpoint queue does not match unresolved call history');
   if (state.result?.text !== undefined && typeof state.result.text !== 'string') invalid('Checkpoint result is invalid');
-  for (const key of ['id', 'task', 'endpoint', 'transport', 'initialTargets'])
+  for (const key of ['id', 'task', 'endpoint', 'transport', 'initialTargets', 'contract', 'verificationRequired'])
     if (JSON.stringify(state[key]) !== JSON.stringify(expected[key])) invalid(`Checkpoint ${key} does not match this workflow`, 'CHECKPOINT_MISMATCH');
 }
 function endpointOf(client) {
@@ -125,20 +129,23 @@ async function definitions(client) {
   return response.json();
 }
 
-export async function runAgent({ adapter, client, task, maxSteps = 50, onApproval, onTurn, workflow }) {
+export async function runAgent({ adapter, client, task, maxSteps = 50, onApproval, onTurn, workflow, contract: rawContract, getDecisionSpace, verifyCompletion }) {
   if (!adapter?.next) throw new Error('adapter.next is required');
   if (!Number.isSafeInteger(maxSteps) || maxSteps < 1) throw new Error('maxSteps must be a positive integer');
-  if (!workflow) return transientAgent({ adapter, client, task, maxSteps, onApproval, onTurn });
+  if (verifyCompletion !== undefined && typeof verifyCompletion !== 'function') throw new Error('verifyCompletion must be a function');
+  const contract = normalizeContract(rawContract, getDecisionSpace, verifyCompletion);
+  if (!workflow) return transientAgent({ adapter, client, task, maxSteps, onApproval, onTurn, contract, getDecisionSpace, verifyCompletion });
   if (typeof task !== 'string' || !task || typeof workflow.id !== 'string' || !workflow.id || !workflow.store?.acquire)
     invalid('Durable workflows require a task, workflow.id, and checkpoint store');
   const initialTargets = targetsOf(workflow.targets);
-  const expected = { id: workflow.id, task, endpoint: endpointOf(client), transport: client.transport ?? 'http', initialTargets };
+  const expected = { id: workflow.id, task, endpoint: endpointOf(client), transport: client.transport ?? 'http', initialTargets, ...(contract ? { contract } : {}), ...(verifyCompletion ? { verificationRequired: true } : {}) };
   const lease = await workflow.store.acquire();
   try {
     let state = await lease.load();
     const resumed = state !== null;
     const persist = async () => { state.updatedAt = new Date().toISOString(); validateState(state, expected); rejectCredential(state, client.token); await lease.save(clone(state)); };
-    const stopped = (reason, details = {}) => ({ stopped: reason, history: state.history, progress: state.progress, ...details });
+    const stopped = (reason, details = {}) => ({ stopped: reason, history: state.history, progress: state.progress, ...(contract ? { control: clone(state.control) } : {}), ...details });
+    const context = () => ({ task, history: clone(state.history), progress: clone(state.progress), ...(contract ? { contract: clone(contract) } : {}) });
     if (resumed) {
       validateState(state, expected);
       if (workflow.taskId && workflow.taskId !== state.taskId) invalid('Checkpoint task identity does not match', 'CHECKPOINT_MISMATCH');
@@ -159,7 +166,7 @@ export async function runAgent({ adapter, client, task, maxSteps = 50, onApprova
     };
     const initialTask = await readTask();
     if (!state) {
-      state = { version: 1, ...expected, sessionId: client.sessionId, taskId: initialTask.id, targets: clone(initialTargets), status: 'active', step: 0, completedCalls: 0, history: [], queue: [], pending: null, progress: null, createdAt: new Date().toISOString() };
+      state = { version: 1, ...expected, sessionId: client.sessionId, taskId: initialTask.id, targets: clone(initialTargets), status: 'active', step: 0, completedCalls: 0, history: [], queue: [], pending: null, progress: null, ...(contract ? { control: initialControl() } : {}), createdAt: new Date().toISOString() };
       mergeTargets(state, runtimeTargets(initialTask));
       await persist();
     }
@@ -178,6 +185,7 @@ export async function runAgent({ adapter, client, task, maxSteps = 50, onApprova
             (recorded.state === 'completed' && !object(recorded.result)))
           return stopped('recovery_required', { operationId, reason: 'outcome_unresolved', operation: recorded });
         state.history.push({ role: 'tool', id: call.id, name: call.name, ...(recorded.state === 'completed' ? { result: recorded.result } : { error: recorded.error ?? `Operation ${recorded.state}` }), operation_id: operationId, recovered: true });
+        if (contract) recordOutcome(state.control, call, state.pending.kind, recorded.state !== 'completed' || failedResult(recorded.result));
         state.completedCalls++; state.pending = null; state.queue.shift(); await persist();
       }
       // The lost operation may have registered its resolved target after the first task read.
@@ -203,7 +211,26 @@ export async function runAgent({ adapter, client, task, maxSteps = 50, onApprova
     for (let step = 0; step < maxSteps; step++) {
       const lifecycle = await readTask();
       if (!allowedTask(lifecycle)) return stopped(`task_${lifecycle.status}`);
-      const turn = clone(await adapter.next({ task, tools, history: clone(state.history), progress: clone(state.progress) }));
+      let space, kind;
+      if (contract) {
+        space = prepareSpace(await getDecisionSpace(context()), contract, state.control);
+        await persist();
+        const limit = contractLimit(contract, state.control);
+        if (limit) {
+          const verification = await verify(verifyCompletion, { ...context(), reason: limit });
+          const afterVerification = await readTask();
+          if (!allowedTask(afterVerification)) return stopped(`task_${afterVerification.status}`);
+          if (!verification.complete) return stopped(limit, { verification });
+          state.status = 'completed'; state.result = { verification }; await persist();
+          return { ...state.result, history: state.history, progress: state.progress, control: clone(state.control) };
+        }
+      }
+      let turn = clone(await adapter.next({ ...context(), tools, ...(space ? { decisionSpace: clone(space) } : {}) }));
+      if (contract) {
+        const resolved = resolveChoice(turn, space, contract);
+        if (!resolved.turn) return stopped('invalid_choice', { reason: resolved.reason });
+        turn = resolved.turn; kind = resolved.kind;
+      }
       if (!object(turn) || (turn.text !== undefined && typeof turn.text !== 'string') || (turn.calls !== undefined && (!Array.isArray(turn.calls) || !turn.calls.every(validCall)))) invalid('Adapter returned an invalid turn');
       if (turn.calls && new Set(turn.calls.map(call => call.id)).size !== turn.calls.length) invalid('Call IDs must be unique within a turn');
       await onTurn?.(clone(turn));
@@ -211,8 +238,13 @@ export async function runAgent({ adapter, client, task, maxSteps = 50, onApprova
       if (Object.hasOwn(turn, 'progress')) state.progress = turn.progress;
       state.queue = clone(turn.calls ?? []); state.step++; await persist();
       if (!state.queue.length) {
-        state.status = 'completed'; state.result = { ...(turn.text === undefined ? {} : { text: turn.text }) }; await persist();
-        return { ...state.result, history: state.history, progress: state.progress };
+        if (contract && turn.handoff) return stopped(turn.handoff, { text: turn.text });
+        const verification = verifyCompletion ? await verify(verifyCompletion, { ...context(), reason: 'completion' }) : undefined;
+        const afterVerification = await readTask();
+        if (!allowedTask(afterVerification)) return stopped(`task_${afterVerification.status}`);
+        if (verification && !verification.complete) return stopped('completion_unverified', { verification });
+        state.status = 'completed'; state.result = { ...(turn.text === undefined ? {} : { text: turn.text }), ...(verification ? { verification } : {}) }; await persist();
+        return { ...state.result, history: state.history, progress: state.progress, ...(contract ? { control: clone(state.control) } : {}) };
       }
       while (state.queue.length) {
         const call = state.queue[0];
@@ -228,7 +260,8 @@ export async function runAgent({ adapter, client, task, maxSteps = 50, onApprova
         if (!allowedTask(approvedTask)) return stopped(`task_${approvedTask.status}`);
         const operationId = randomUUID();
         // Host-assigned identity overrides any model-supplied ID. Persist before crossing the network.
-        state.pending = { call, operationId };
+        state.pending = { call, operationId, ...(contract ? { kind } : {}) };
+        if (contract) state.control.actions++;
         const args = { ...(call.arguments ?? {}), operation_id: operationId };
         mergeTargets(state, callTargets(call.name, args));
         await persist();
@@ -241,6 +274,7 @@ export async function runAgent({ adapter, client, task, maxSteps = 50, onApprova
         }
         if (uncertain(result)) return stopped('recovery_required', { operationId, reason: 'outcome_uncertain', result });
         state.history.push({ role: 'tool', id: call.id, name: call.name, ...(failure ? { error: failure } : { result }), operation_id: operationId });
+        if (contract) recordOutcome(state.control, call, kind, Boolean(failure) || failedResult(result));
         state.completedCalls++; state.pending = null; state.queue.shift(); await persist();
       }
     }
@@ -248,19 +282,59 @@ export async function runAgent({ adapter, client, task, maxSteps = 50, onApprova
   } finally { await lease.release(); }
 }
 
-async function transientAgent({ adapter, client, task, maxSteps, onApproval, onTurn }) {
-  const tools = await definitions(client), history = [];
+async function transientAgent({ adapter, client, task, maxSteps, onApproval, onTurn, contract, getDecisionSpace, verifyCompletion }) {
+  const tools = await definitions(client), history = [], control = contract ? initialControl() : undefined;
+  let progress = null;
+  const context = () => ({ task, history: clone(history), progress: clone(progress), ...(contract ? { contract: clone(contract) } : {}) });
+  const stopped = (reason, details = {}) => ({ stopped: reason, history, ...(contract ? { control: clone(control) } : {}), ...details });
   for (let step = 0; step < maxSteps; step++) {
-    const turn = await adapter.next({ task, tools, history });
-    await onTurn?.(turn); history.push({ role: 'assistant', ...turn });
-    if (!turn.calls?.length) return { text: turn.text, history };
+    let space, kind;
+    if (contract) {
+      space = prepareSpace(await getDecisionSpace(context()), contract, control);
+      const limit = contractLimit(contract, control);
+      if (limit) {
+        const verification = await verify(verifyCompletion, { ...context(), reason: limit });
+        return verification.complete ? { history, progress, control: clone(control), verification } : stopped(limit, { verification });
+      }
+    }
+    let turn = await adapter.next({ ...context(), tools, ...(space ? { decisionSpace: clone(space) } : {}) });
+    if (contract) {
+      const resolved = resolveChoice(turn, space, contract);
+      if (!resolved.turn) return stopped('invalid_choice', { reason: resolved.reason });
+      turn = resolved.turn; kind = resolved.kind;
+    }
+    await onTurn?.(clone(turn)); history.push({ ...turn, role: 'assistant' });
+    if (Object.hasOwn(turn, 'progress')) progress = turn.progress;
+    if (!turn.calls?.length) {
+      if (contract && turn.handoff) return stopped(turn.handoff, { text: turn.text });
+      const verification = verifyCompletion ? await verify(verifyCompletion, { ...context(), reason: 'completion' }) : undefined;
+      if (verification && !verification.complete) return stopped('completion_unverified', { verification });
+      return { text: turn.text, history, ...(verification ? { verification } : {}), ...(contract ? { control: clone(control), progress } : {}) };
+    }
     for (const call of turn.calls) {
+      let dispatched = false;
+      const operationId = contract ? randomUUID() : undefined;
       try {
-        if (onApproval && !(await onApproval(call))) throw new Error('Host denied this action');
-        const result = await client.call(call.name, call.arguments ?? {});
-        history.push({ role: 'tool', id: call.id, name: call.name, result });
-      } catch (error) { history.push({ role: 'tool', id: call.id, name: call.name, error: error.message, operation_id: error.operationId }); }
+        if (onApproval && !(await onApproval(clone(call)))) throw Object.assign(new Error('Host denied this action'), { outcomeUncertain: false });
+        if (contract) control.actions++;
+        dispatched = true;
+        const result = await client.call(call.name, { ...(call.arguments ?? {}), ...(contract ? { operation_id: operationId } : {}) });
+        if (contract && uncertain(result)) return stopped('recovery_required', { operationId, reason: 'outcome_uncertain', result });
+        history.push({ role: 'tool', id: call.id, name: call.name, result, ...(contract ? { operation_id: operationId } : {}) });
+        if (contract) recordOutcome(control, call, kind, failedResult(result));
+      } catch (error) {
+        if (contract && dispatched && error.code === 'CALLBACK_ERROR' && object(error.result)) {
+          if (uncertain(error.result)) return stopped('recovery_required', { operationId: error.operationId ?? operationId, reason: 'outcome_uncertain', result: error.result });
+          history.push({ role: 'tool', id: call.id, name: call.name, result: error.result, operation_id: error.operationId ?? operationId });
+          recordOutcome(control, call, kind, failedResult(error.result));
+        } else {
+          if (contract && dispatched && error.outcomeUncertain !== false)
+            return stopped('recovery_required', { operationId: error.operationId ?? operationId, reason: 'dispatch_uncertain', error: error.message });
+          history.push({ role: 'tool', id: call.id, name: call.name, error: error.message, operation_id: error.operationId ?? operationId });
+          if (contract && dispatched) recordOutcome(control, call, kind, true);
+        }
+      }
     }
   }
-  return { stopped: 'step_limit', history };
+  return stopped('step_limit');
 }

@@ -134,7 +134,8 @@ extension ToolRouter {
                 full: try args.bool("full", default: false),
                 scope: scope.index,
                 scopeLabel: scope.label,
-                ocr: try args.bool("ocr", default: false)
+                ocr: try args.bool("ocr", default: false),
+                visualSettle: try args.bool("visual_settle", default: false)
             )
             let snapshot = try await desktop.windowState(windowID: try args.windowID(), options: options)
             var json = await snapshotJSON(snapshot, structured: structured)
@@ -457,6 +458,7 @@ extension ToolRouter {
         if let ms = snapshot.ocrMS { json["ocr_ms"] = ms }
         if let count = snapshot.ocrCount { json["ocr_count"] = count }
         if let error = snapshot.ocrError { json["ocr_error"] = error }
+        if let visualSettle = snapshot.visualSettle { json["visual_settle"] = Shape.codable(visualSettle) }
         if let capabilities = snapshot.capabilities { json["capabilities"] = Shape.codable(capabilities) }
         if let base = snapshot.diffBase { json["diff_base"] = base }
         if let scope = snapshot.scope { json["scope"] = scope }

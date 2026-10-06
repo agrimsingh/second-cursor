@@ -17,3 +17,16 @@ void error;
 // @ts-expect-error A native target requires a numeric window ID.
 const invalid: WorkflowTarget = { windowId: '42' };
 void invalid;
+
+void runAgent({
+  adapter: { next({ decisionSpace, contract }) {
+    if (decisionSpace?.choices.length) return { choice: decisionSpace.choices[0].id };
+    return { handoff: 'needs_input', text: String(contract?.criteria) };
+  } }, client, task: 'Save the supplied note',
+  contract: { id: 'save-note-v1', inputs: { note: 'Exact note' }, criteria: ['A persisted note exists'], maxActions: 8 },
+  getDecisionSpace: async () => ({ key: 'saved=false', choices: [{
+    id: 'type-note', label: 'Type the supplied note', kind: 'act',
+    call: { name: 'type_text', arguments: { window_id: 42 } }, inputBindings: { text: 'note' },
+  }] }),
+  verifyCompletion: async ({ reason }) => ({ complete: false, evidence: { reason } }),
+}).then(result => { if (result.stopped === 'no_progress') console.log(result.control?.actions); });

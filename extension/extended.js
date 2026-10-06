@@ -33,6 +33,7 @@ function state(id) {
       logs: [],
       downloads: [],
       assets: new Map(),
+      collectAssets: false,
       dialog: null,
       chooser: null,
       dialogWaiters: new Set(),
@@ -82,7 +83,9 @@ export function recordEvent(source, method, p) {
     const name = s.downloads.find((d) => d.guid === p.guid)?.suggestedFilename ?? p.guid;
     report(source.tabId, `download ${p.state === "completed" ? "finished" : "canceled"} in tab ${source.tabId}: ${name}`);
   }
-  if (method === "Network.responseReceived") {
+  // Settling also enables Network. Retain resource URLs only after the caller explicitly asks for assets;
+  // getResponseBody below addresses the root session, so isolated-frame request IDs cannot be collected here.
+  if (method === "Network.responseReceived" && s.collectAssets && !source.sessionId) {
     s.assets.set(p.requestId, {
       id: p.requestId,
       url: p.response.url,
@@ -1540,6 +1543,7 @@ async function operate(p, guardObservation) {
   if (op === "export") return exportContent(tabId, p);
   if (op === "assets") {
     // Responses before this call are found through the page below; later ones are also recorded with their bodies.
+    state(tabId).collectAssets = true;
     await ensureDomain(tabId, "Network");
     const { result } = await cdp(tabId, "Runtime.evaluate", {
       expression:

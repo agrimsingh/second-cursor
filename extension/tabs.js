@@ -1,4 +1,4 @@
-import { attach, cdp, networkIdle } from "./cdp.js";
+import { attach, cdp, networkIdle, ensureActionNetwork, actionNetworkState } from "./cdp.js";
 import { removeCursor, show } from "./cursor.js";
 import { BridgeError, sleep } from "./errors.js";
 import { add as addTiming, timed } from "./timing.js";
@@ -118,9 +118,12 @@ chrome.tabs.query({ active: true }).then((tabs) => {
 const inputAt = new Map();
 chrome.tabs.onRemoved.addListener((tabId) => inputAt.delete(tabId));
 /** The agent is about to send input to the tab. */
-export function noteInput(tabId) {
+export async function noteInput(tabId) {
+  await ensureActionNetwork(tabId);
   inputAt.set(tabId, Date.now());
   quickReactions.delete(tabId);
+  // A dispatch that later throws may still have started a request. The next read must observe that action too.
+  noteAction(tabId, inputAt.get(tabId));
 }
 
 const quickReactions = new Map();
@@ -400,7 +403,7 @@ const ACTION_LOAD_MS = 10000;
  * happened.
  */
 export function noteAction(tabId, at = Date.now(), load = false) {
-  lastAction.set(tabId, { at, load, reactMs: quickReactions.get(tabId) });
+  lastAction.set(tabId, { at: Math.max(at, inputAt.get(tabId) ?? 0), load, reactMs: quickReactions.get(tabId) });
   quickReactions.delete(tabId);
 }
 
@@ -410,10 +413,11 @@ export function noteAction(tabId, at = Date.now(), load = false) {
  * (search results, a filter, "load more"), so the read waits for the change to start first. While the last action is
  * a load, a page whose network has gone idle has no request left to wait for, so every read stops waiting for one.
  * A document the action started loading counts as such a load, and is waited for until it finishes (at most
- * ACTION_LOAD_MS), however long that takes.
+ * ACTION_LOAD_MS). Document/XHR/Fetch requests started after input also hold the observation, bounded by that
+ * same action deadline. Pre-existing requests do not. Quietness is a readiness hint, not a verified postcondition.
  * The first probe of a document starts its clock, so an idle page costs `quietMs` once, and nothing on later reads.
  */
-export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200 } = {}) {
+export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200, requestTimeoutMs = ACTION_LOAD_MS } = {}) {
   const began = Date.now();
   const { at: actedAt = 0, reactMs: quick } = lastAction.get(tabId) ?? {};
   let { load = false } = lastAction.get(tabId) ?? {};
@@ -422,8 +426,21 @@ export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs 
   // Split out the wait for a reaction that has not started from the wait for the page to go quiet.
   let reacting = 0;
   let loading = 0;
+  let fetching = 0;
+  let network = actionNetworkState(tabId, actedAt);
+  const result = (state, reason) => ({ state, ...(reason ? { reason } : {}),
+    network: network.available ? "observed" : "unavailable", pending_requests: network.pending,
+    ...(network.inferred ? { body_completion_inferred: network.inferred } : {}),
+    failed_requests: network.failed, waited_ms: Date.now() - began });
   try {
     while (Date.now() < deadline) {
+      network = actionNetworkState(tabId, actedAt);
+      if (actedAt && (network.pending || network.enabling)) {
+        deadline = Math.max(deadline, actedAt + requestTimeoutMs);
+        fetching += 50;
+        await sleep(50);
+        continue;
+      }
       const navigation = loads.get(tabId);
       if (navigation && navigation.at >= actedAt) {
         load = true;
@@ -436,20 +453,31 @@ export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs 
         navigation.done = true;
       }
       const state = await settleProbe(tabId);
-      if (!state) return;
+      if (!state) return result("unavailable", "The document could not be observed while settling.");
+      // CDP events can arrive while the DOM probe is in flight. Recheck before declaring it ready.
+      network = actionNetworkState(tabId, actedAt);
+      if (actedAt && (network.pending || network.enabling)) continue;
       const sinceAction = Date.now() - actedAt;
       let awaitingReaction = sinceAction < reactWithin && (!state.mutated || state.quiet >= sinceAction);
-      // The idle signal covers the page's first load only, so actions keep the fixed window.
+      // Retain a bounded reaction window for timers/debounces that have not started a request yet.
       if (awaitingReaction && load && (await networkIdle(tabId).catch(() => false))) awaitingReaction = false;
-      if (state.ready === "complete" && state.quiet >= quietMs && !awaitingReaction) return;
+      network = actionNetworkState(tabId, actedAt);
+      if (actedAt && (network.pending || network.enabling)) continue;
+      if (state.ready === "complete" && state.quiet >= quietMs && network.quiet >= quietMs && !awaitingReaction)
+        return network.incomplete
+          ? result("unavailable", "Request tracking exceeded its bounded capacity; pending work may remain. Observe the intended postcondition before retrying.")
+          : result("quiet");
       const pause = awaitingReaction ? 50 : Math.min(100, Math.max(20, quietMs - state.quiet));
       if (awaitingReaction) reacting += pause;
       await sleep(pause);
     }
+    network = actionNetworkState(tabId, actedAt);
+    return result("timed_out", "The readiness deadline expired; the action may still be running. Observe again before retrying a mutation.");
   } finally {
     addTiming(tabId, "settled", Date.now() - began);
     if (reacting) addTiming(tabId, "settled_awaiting_reaction", reacting);
     if (loading) addTiming(tabId, "settled_loading", loading);
+    if (fetching) addTiming(tabId, "settled_requests", fetching);
   }
 }
 
@@ -489,6 +517,8 @@ export async function openTab(rawUrl, session = "legacy") {
 export async function navigateTab(tabId, rawUrl) {
   await requireAgentTab(tabId);
   const url = normalizeUrl(rawUrl);
+  await noteInput(tabId);
+  const at = Date.now();
   await settleAround(tabId, async () => {
     await requireAgentInput(tabId);
     return chrome.tabs.update(tabId, { url });
@@ -496,7 +526,7 @@ export async function navigateTab(tabId, rawUrl) {
     quietMs: 1000,
     timeoutMs: 20000,
   });
-  noteAction(tabId, Date.now(), true);
+  noteAction(tabId, at, true);
   await settled(tabId, { quietMs: 500, timeoutMs: 6000, reactMs: 1500 });
   return describe(await chrome.tabs.get(tabId));
 }

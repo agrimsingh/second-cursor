@@ -19,7 +19,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node recovery-smoke.mjs && node --test agent-recovery.test.mjs",
+    "test": "node recovery-smoke.mjs && node --test agent-recovery.test.mjs agent-contract.test.mjs",
     "test:live": "node smoke.mjs && node stdio-smoke.mjs"
   },
   "bin": {

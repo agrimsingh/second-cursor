@@ -151,6 +151,9 @@ enum ToolCatalog {
                         "ocr": boolean(
                             "Also recognize the text drawn in the window (on device) and merge what the outline lacks. Use it when you can see text the outline does not have: custom-drawn apps (DAWs, games), canvases, images of text. Text already in the outline is left out; text on an element is added to its line as ocr=\"...\"; other text becomes a line such as text \"Export\" (412,88 40x14), which has no index: click it with x/y at the center of its frame. Returns ocr_ms and ocr_count, or ocr_error with the outline when recognition fails. Costs a few hundred ms, more on large windows.",
                             default: false),
+                        "visual_settle": boolean(
+                            "For delayed custom drawing after an action: probe target-window pixels before reading (1.6 s reaction allowance, 2.2 s probe budget plus capture overhead). Returns visual_settle status; quiet pixels do not prove success. Off by default.",
+                            default: false),
                         "expand": expand,
                     ]),
                 annotations: .init(readOnlyHint: true)

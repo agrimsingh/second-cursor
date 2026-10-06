@@ -130,7 +130,7 @@ const handlers = {
     // Like Codex, the cursor is on the tab from the moment the agent works in it, not only once it acts.
     await timing.timed(tabId, "attach", () => attach(tabId));
     if (await sessionIsActive(session_id)) show(tabId, session_id);
-    await settled(tabId);
+    const settling = await settled(tabId);
     const key = `${session_id}:${tabId}`;
     const previous = observations.get(key);
     const beforeRevision = await browserRevision(tabId);
@@ -162,6 +162,7 @@ const handlers = {
       outline,
       ...(structured && !is_diff ? { elements: snapshot.elements } : {}),
       snapshot_id: id,
+      settling,
       freshness: { revision, captured_at_ms: capturedAt, age_ms: Date.now() - capturedAt,
         status: current ? "current" : "changed_during_capture" },
       is_diff,
@@ -223,7 +224,7 @@ async function act(params, action, settleOptions) {
   noteAction(tabId, at);
   const reply = { outcome: { state: "dispatched", verified: false, reason: "Input was dispatched; no postcondition was requested.", verification: "none" } };
   try {
-    if (observe === "screenshot") await settled(tabId);
+    if (observe === "screenshot") reply.settling = await settled(tabId);
     else reply.observation = await handlers["tab.snapshot"]({ tabId, session_id, full: false });
     if (observe !== "tree") reply.screenshot = await timing.timed(tabId, "screenshot", () => screenshot(tabId));
   } catch (error) {
@@ -328,7 +329,7 @@ async function dispatch(activePort, { id, method, params, receivedAt, controlGen
     if (acts || ["tabs.open", "tabs.close", "tab.navigate"].includes(method) ||
         (method === "extended" && ["claim", "dialog", "clipboard"].includes(params.operation)))
       inputToken = await beginAgentInput(params.tabId, params.session_id, await controlGeneration);
-    if (acts) noteInput(params.tabId);
+    if (acts) await noteInput(params.tabId);
     reply = {
       id,
       result: await (params.tabId != null

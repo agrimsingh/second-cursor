@@ -12,6 +12,23 @@ enum Capture {
     /// positions off a shrunk image would click off by the shrink factor.
     static let maxEdge = 1024
 
+    /// Small RGB pixels for readiness checks; no PNG encoding or OCR, and never a whole-display capture.
+    /// Preserve aspect ratio and color so a small badge is not erased by a grayscale/area threshold.
+    static func probe(_ wid: CGWindowID) async throws -> [UInt8] {
+        let (image, _) = try await image(wid, maxEdge: 192)
+        let rowBytes = image.width * 4
+        var pixels = [UInt8](repeating: 0, count: rowBytes * image.height)
+        let rendered = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: rowBytes, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return true
+        }
+        guard rendered else { throw SCError.actionFailed("Could not create a visual readiness probe") }
+        return pixels
+    }
+
     /// Captures only the window's own pixels at one pixel per point, scaled down (never up) so the long edge is at
     /// most `maxEdge`. `scale` is image pixels per window point. Works for occluded windows and windows on other Spaces.
     static func window(_ wid: CGWindowID) async throws -> Screenshot {

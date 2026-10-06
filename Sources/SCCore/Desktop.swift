@@ -212,6 +212,11 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     /// A failed capture does not fail the read: the tree was taken and is now the diff baseline, so the caller
     /// must see it.
     public func windowState(windowID: UInt32, options: SnapshotOptions) async throws -> WindowSnapshot {
+        var visualSettle: VisualSettleResult?
+        if options.visualSettle {
+            if needsSettle(windowID) { await settle(windowID: windowID) }
+            visualSettle = try await waitForVisualQuiet(windowID)
+        }
         var recognized: [RecognizedText]?
         var ocrError: String?
         var ocrMS: Int?
@@ -235,6 +240,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         }
         snapshot.ocrMS = ocrMS
         snapshot.ocrError = ocrError
+        snapshot.visualSettle = visualSettle
         if options.includeScreenshot {
             do {
                 snapshot.screenshot = try await capture(windowID)
@@ -254,6 +260,69 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
     }
 
     private static let repaintTime: TimeInterval = 0.15
+
+    /// Opt-in because an unchanging first frame does not rule out a delayed reaction. Ordinary AX reads
+    /// keep their existing timing; custom surfaces get a declared reaction allowance and a bounded probe.
+    /// Capture failures preserve the AX read. Cancellation and dispatch revocation must still propagate.
+    private func waitForVisualQuiet(_ wid: CGWindowID) async throws -> VisualSettleResult {
+        let started = ProcessInfo.processInfo.systemUptime
+        guard let owner = WindowList.record(wid)?.pid else { throw SCError.windowNotFound(wid) }
+        func requireTarget() throws -> CGWindowRecord {
+            guard let record = WindowList.record(wid), record.pid == owner else {
+                // Do not fall through to the AX/OCR read for a replacement process reusing this id.
+                throw SCError.actionFailed("The target window disappeared or changed owner during visual settling; observe the app again.")
+            }
+            return record
+        }
+        let action = lock.withLock { activity[wid] }
+        var policy = VisualSettlingPolicy(
+            minimumUntil: started + max(0, 1.6 - (action.map { Date().timeIntervalSince($0.at) } ?? 0)),
+            deadline: started + max(0, min(2.2, (Execution.context.deadline?.timeIntervalSinceNow ?? 60) - 0.3)))
+        func result(_ status: String, _ reason: String) -> VisualSettleResult {
+            VisualSettleResult(status: status, elapsedMS: Int((ProcessInfo.processInfo.systemUptime - started) * 1000),
+                samples: policy.samples, changedDuringProbe: policy.changed, reason: reason)
+        }
+        guard let action, Date().timeIntervalSince(action.at) < 2 else {
+            return result("no_recent_action", "No action on this window was recorded in the last two seconds; the visual probe was skipped.")
+        }
+        return try await Timing.measureAsync("visual_settle") {
+            while true {
+                try Task.checkCancellation()
+                try Execution.context.beforeDispatch()
+                guard lock.withLock({ activity[wid]?.at == action.at }) else {
+                    return result("superseded", "A newer action arrived during the visual wait; observe that action's result.")
+                }
+                if policy.decision(at: ProcessInfo.processInfo.systemUptime) == .timedOut {
+                    return result("timed_out", "Visual quiet was not established within the probe budget. Inspect before acting; do not repeat an uncertain write.")
+                }
+                _ = try requireTarget()
+                let pixels: [UInt8]
+                do { pixels = try await Capture.probe(wid) }
+                catch {
+                    try Task.checkCancellation()
+                    try Execution.context.beforeDispatch()
+                    _ = try requireTarget()
+                    return result("unavailable", "Visual probe failed: \(error.localizedDescription)")
+                }
+                try Task.checkCancellation()
+                try Execution.context.beforeDispatch()
+                guard lock.withLock({ activity[wid]?.at == action.at }) else {
+                    return result("superseded", "A newer action arrived during the visual wait; observe that action's result.")
+                }
+                let record = try requireTarget()
+                let identity = "\(record.pid):\(record.bounds):\(changes.state(record.pid)?.count ?? 0)"
+                let decision = policy.sample(pixels: pixels, identity: identity, at: ProcessInfo.processInfo.systemUptime)
+                if decision == .quiet {
+                    return result("quiet", "Sampled target pixels and available AX notifications were quiet for 180 ms after a 1.6 s reaction allowance. This does not verify task success or frame freshness.")
+                }
+                if decision == .timedOut {
+                    return result("timed_out", "Visual quiet was not established within the probe budget. Inspect before acting; do not repeat an uncertain write.")
+                }
+                let remaining = policy.deadline - ProcessInfo.processInfo.systemUptime
+                if remaining > 0 { try await Task.sleep(nanoseconds: UInt64(min(0.08, remaining) * 1_000_000_000)) }
+            }
+        }
+    }
 
     private func paintWait(_ wid: CGWindowID) async {
         guard var changed = claimPaintWait(wid) else { return }

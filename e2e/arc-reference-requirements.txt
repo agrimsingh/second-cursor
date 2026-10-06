@@ -1,0 +1,2 @@
+# Optional reference driver; deliberately separate from Second Cursor's runtime.
+arc-cua[browser] @ git+https://github.com/shhivv/arc-cua.git@6ca19d62c95106732fad28f488ecd458c08e02f4

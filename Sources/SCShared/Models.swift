@@ -158,9 +158,12 @@ public struct SnapshotOptions: Sendable, Equatable {
     public var scopeLabel: String?
     /// Recognizes the text on the window's pixels and merges what accessibility does not already show.
     public var ocr: Bool
+    /// Explicit bounded visual-readiness probe for delayed custom drawing after a recent action.
+    public var visualSettle: Bool
 
     public init(includeScreenshot: Bool = true, includeMenuBar: Bool = false, maxElements: Int? = nil,
-                full: Bool = true, scope: Int? = nil, scopeLabel: String? = nil, ocr: Bool = false) {
+                full: Bool = true, scope: Int? = nil, scopeLabel: String? = nil, ocr: Bool = false,
+                visualSettle: Bool = false) {
         self.includeScreenshot = includeScreenshot
         self.includeMenuBar = includeMenuBar
         self.maxElements = maxElements
@@ -168,6 +171,29 @@ public struct SnapshotOptions: Sendable, Equatable {
         self.scope = scope
         self.scopeLabel = scopeLabel
         self.ocr = ocr
+        self.visualSettle = visualSettle
+    }
+}
+
+/// Pixel quietness only; it does not establish task success or the freshness of an off-Space surface.
+public struct VisualSettleResult: Codable, Sendable, Equatable {
+    public var status: String
+    public var elapsedMS: Int
+    public var samples: Int
+    public var changedDuringProbe: Bool
+    public var reason: String
+
+    public init(status: String, elapsedMS: Int, samples: Int, changedDuringProbe: Bool, reason: String) {
+        self.status = status
+        self.elapsedMS = elapsedMS
+        self.samples = samples
+        self.changedDuringProbe = changedDuringProbe
+        self.reason = reason
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case status, samples, reason
+        case elapsedMS = "elapsed_ms", changedDuringProbe = "changed_during_probe"
     }
 }
 
@@ -194,6 +220,7 @@ public struct WindowSnapshot: Sendable, Equatable {
     public var ocrMS: Int?
     public var ocrCount: Int?
     public var ocrError: String?
+    public var visualSettle: VisualSettleResult?
 
     public init(window: WindowInfo, snapshotID: String, tree: String, elementCount: Int, truncated: Bool,
                 isDiff: Bool = false, diffBase: String? = nil, scope: Int? = nil, screenshot: Screenshot? = nil) {

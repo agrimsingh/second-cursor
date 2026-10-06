@@ -276,6 +276,7 @@ extension ToolRouter {
         var json = base
         if let events = reply["events"] { json["events"] = events }
         if let outcome = reply["outcome"] { json["outcome"] = outcome }
+        if let settling = reply["settling"] { json["settling"] = settling }
         guard mode != "none" else { return ToolOutput(json: json) }
         let shot = Self.screenshot(reply["screenshot"])
         if reply["observation"] != nil || shot != nil || reply["observation_error"] != nil {
