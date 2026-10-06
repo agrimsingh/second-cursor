@@ -118,7 +118,7 @@ Second Cursor runs no model of its own; choose one in your connected client. The
 
 ## Safety
 
-- **App approval:** the first time an agent reads or operates an app, you choose Allow for this session, Always allow, or Deny. Your own tabs, browsing history, clipboard, raw DevTools, and file uploads always ask. See [the client contract](docs/api.md#approvals).
+- **App approval:** the first time an agent reads or operates an app, you choose Allow for this session, Always allow, or Deny. Your own tabs, browsing history, clipboard, raw DevTools, and file uploads always ask. `"approvals": "allow"` in `config.json` grants all of these without asking. See [the client contract](docs/api.md#approvals).
 - **Not a sandbox:** approvals limit what an agent can do through Second Cursor's tools. An agent that can also run shell commands as you could edit the config or start its own instance, so treat approvals as a guard against mistakes, not against a determined agent.
 - **Pause:** the menu bar item pauses all agent input; **Tasks…** provides controls for one task. `SecondCursor --pause` / `--resume` control the global pause from a shell. Already delivered input cannot be undone.
 - **Blocked apps:** `blockedBundleIDs` in `config.json` (password managers, Keychain Access, System Settings by default) can never be launched or touched.
@@ -159,8 +159,10 @@ python3 e2e/policy.py         # approvals in deny mode (no UI), turn end, action
 python3 e2e/instance.py       # test-instance isolation
 python3 e2e/cursor.py         # arrow and menu-bar presence, drawn on the agent display
 python3 e2e/clicks.py         # every pixel click, double-click and drag acts exactly once
-python3 e2e/latency.py        # per-call timings, written to latency.json
+python3 e2e/latency.py        # per-call timings, written to latency.json (--quiet-ms N tries browserQuietMs)
 python3 e2e/find.py           # find_elements, act, the compact tool surface
+python3 e2e/latency.py --ratchet  # also find.py: lower e2e/ratchets.json ceilings on characters read
+python3 scripts/timings.py    # where your own app's calls spend time ("recordTimings": true)
 python3 e2e/repl.py           # browser_repl: persistence, limits, sandbox, Playwright locators
 python3 e2e/tasks.py          # task ownership, pause/takeover/resume, restart recovery
 python3 e2e/transport_recovery.py  # automatic MCP sessions and durable operation reconciliation

@@ -44,7 +44,7 @@ public struct SCConfig: Codable, Sendable {
     /// Bundle ids the user chose "Always allow" for.
     public var approvedBundleIDs: [String]?
     /// How every local approval is answered: "prompt" (nil) asks the user; "deny" refuses without UI; "allow" grants
-    /// without UI, honored only when `SC_HOME` is set (disposable test instances), otherwise treated as "prompt".
+    /// every app, sensitive browser operation and confirmation-required tool without UI. Blocked apps stay blocked.
     public var approvals: String?
     /// Which tools tools/list advertises: every tool but `act` and `browser_repl` (nil); "compact", which lists `act`
     /// instead of `batch` and the single-action tools; "full", which adds `browser_repl`; or "repl", which lists only
@@ -59,6 +59,9 @@ public struct SCConfig: Codable, Sendable {
     /// "rules" condenses full window and page reads of 80 lines or more (footers and side panels hidden, long lists cut
     /// to their first chunk), each hidden run returned by `expand`; "off" (nil) returns them whole.
     public var condenseOutlines: String?
+    /// How long a browser read waits for the page to stop changing once every request its last action started has
+    /// finished. Nil uses 300 ms. Shorter answers sooner but can return a reaction a timer has not finished drawing.
+    public var browserQuietMs: Int?
 
     public init(port: Int, token: String, blockedBundleIDs: [String], confirmationRequiredTools: [String]) {
         self.port = port
@@ -193,6 +196,8 @@ public final class ActionLog: @unchecked Sendable {
 
 /// One line per tool call when `recordTimings` is on. Written off the call's path, unlike the action log.
 public final class TimingLog: @unchecked Sendable {
+    /// The log may stay on for months on the user's own app, so past this size it moves to `timings.jsonl.1`.
+    static let rotateBytes: UInt64 = 32 << 20
     private let queue = DispatchQueue(label: "dev.secondcursor.timinglog")
     public init() {}
 
@@ -204,7 +209,14 @@ public final class TimingLog: @unchecked Sendable {
         ]
         queue.async {
             guard let line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
-            ActionLog.append(line, to: SCPaths.timingLogURL)
+            let url = SCPaths.timingLogURL
+            let fm = FileManager.default
+            if let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? UInt64, size > Self.rotateBytes {
+                let previous = url.appendingPathExtension("1")
+                try? fm.removeItem(at: previous)
+                try? fm.moveItem(at: url, to: previous)
+            }
+            ActionLog.append(line, to: url)
         }
     }
 }

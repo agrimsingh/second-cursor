@@ -1,0 +1,13 @@
+{
+  "browser: first observation after 'click a button that adds a row', characters": 200,
+  "browser: first observation after 'click a button that does nothing', characters": 127,
+  "browser: first observation after 'click a button that says Saving, then Saved 200 ms later', characters": 135,
+  "browser: first observation after 'click a button whose content loads 400 ms later', characters": 142,
+  "browser: first observation after 'click a checkbox', characters": 151,
+  "browser: first observation after 'click an aria-expanded toggle', characters": 186,
+  "browser: first observation after 'press Tab', characters": 57,
+  "browser: first observation after 'type into a plain field', characters": 67,
+  "browser: first observation after 'type into a search box (results ~450 ms later)', characters": 446,
+  "browser: full read of reactions.html, characters": 276,
+  "tools/list characters, default surface": 52000
+}

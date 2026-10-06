@@ -148,8 +148,7 @@ final class AppApprovals: @unchecked Sendable {
         appApprovalRequired = config.appApproval != "off"
         switch config.approvals {
         case "deny": mode = .deny
-        // Granting without a person is only for disposable test instances, never the user's own app.
-        case "allow" where SCPaths.customHome != nil: mode = .allow
+        case "allow": mode = .allow
         default: mode = .prompt
         }
         always = Set(config.approvedBundleIDs ?? [])

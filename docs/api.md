@@ -94,7 +94,7 @@ The agent needs the user's approval to read or operate an app. The first window 
 
 Sensitive browser operations always ask, once per call: `user_tabs`, `claim`, `history`, `clipboard`, `cdp`, and `upload` (which hands local files to a web page). A claim lasts until the tab is released, the session or turn ends, or the tab sits idle for five minutes. `confirmationRequiredTools` lists extra tools that always ask. Listing a browser tool such as `browser_click` also covers the `browser_command` operations that do the same work (`click`, `check`, `perform_action`) and every `browser_repl` call, since a script can do it too. Prompts name the app, site, and every full file path involved, expire with the call deadline, close on cancellation, and intentionally take focus. The model cannot approve itself; the extension checks the grant again on its side.
 
-`approvals` in the config decides how every prompt is answered: `prompt` (default), `deny` (refuse without UI), or `allow` (grant without UI, honored only for disposable test instances started with `SC_HOME`).
+`approvals` in the config decides how every prompt is answered: `prompt` (default), `deny` (refuse without UI), or `allow` (grant without UI, including sensitive browser operations and `confirmationRequiredTools`). Blocked apps stay blocked under `allow`. The setting is read at launch.
 
 Approvals limit what an agent can do through Second Cursor's tools. They are not a sandbox: an agent that can also run shell commands as you can edit the config, or start its own instance with `SC_HOME`, and that instance inherits the app's Accessibility and Screen Recording permissions. If an agent has unrestricted shell access, treat approvals as a guard against mistakes, not against a determined agent.
 

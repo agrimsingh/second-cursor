@@ -151,6 +151,7 @@ final class ExtensionLink: @unchecked Sendable {
         params["observation_id"] = Execution.context.observationID
         let timings = Execution.context.timings
         if timings != nil { params["timings"] = true }
+        params["quiet_ms"] = BrowserBridge.quietMs
         let sent = DispatchTime.now().uptimeNanoseconds
         let reply = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Reply, Error>) in
             lock.lock()

@@ -20,7 +20,7 @@ Ways the feature could fail, written down before the code:
 12. The compact surface advertises the wrong tools, hides act or find_elements, makes hidden tools uncallable, or gives
     act a schema that drifts from batch's; /api and /mcp list different tools.
 13. The full surface advertises act, or omits find_elements.
-14. tools/list grows back past its budget, or still lists what only hosts use: session_id, mutation operation_id,
+14. tools/list grows past its ceiling in ratchets.json, or still lists what only hosts use: session_id, mutation operation_id,
     observation_id or timeout_ms on a tool (wait_for's and browser_repl's timeout_ms are the model's), or session,
     ownership and cancellation tools. Read-only operation_status must expose its required operation_id.
 15. A host parameter left out of tools/list stops working: an unlisted session cannot be created or own a tab, an
@@ -35,6 +35,7 @@ import sys
 import time
 import urllib.request
 
+import ratchet
 import run as harness
 from run import (Run, SCENARIOS, TestInstance, ToolError, clear_calculator, element_index, refused, scenario,
                  value_of)
@@ -46,9 +47,6 @@ FRAME = re.compile(r"\((-?\d+),(-?\d+) (\d+)x(\d+)\)")
 HIDDEN_IN_COMPACT = {"click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "batch"}
 HOST_TOOLS = {"session", "bind_target", "cancel_operation"}
 HOST_PARAMETERS = {"session_id", "operation_id", "observation_id", "timeout_ms"}
-# The default surface measured 63.8k characters before host parameters were hidden and expect, observe and caption
-# were described in full only on click and batch (browser_click for the browser).
-LISTING_BUDGET = 42000
 
 
 def parse(line):
@@ -350,8 +348,7 @@ def full_surface(ctx):
 def host_parameters(ctx):
     """Failure modes 14 and 15. The browser carries the parameter checks, so they run on any Space."""
     tools = ctx.mcp.rpc("tools/list")["tools"]
-    size = len(json.dumps(tools))
-    ctx.check(f"tools/list is at most {LISTING_BUDGET} characters", size <= LISTING_BUDGET, size)
+    ratchet.check(ctx, "tools/list characters, default surface", len(json.dumps(tools)))
     names = {t["name"] for t in tools}
     ctx.check("session, ownership and cancellation tools are not listed", not (HOST_TOOLS & names), sorted(HOST_TOOLS & names))
     leaked = sorted(f'{t["name"]}.{p}' for t in tools for p in t["inputSchema"].get("properties", {})
@@ -406,7 +403,9 @@ def compact_surface(ctx):
     inst.mcp.transcript = ctx.run.transcript
     call = lambda tool, **args: inst.mcp.call(tool, **args)[0]
 
-    tools = {t["name"]: t for t in inst.mcp.rpc("tools/list")["tools"]}
+    listed = inst.mcp.rpc("tools/list")["tools"]
+    ratchet.check(ctx, "tools/list characters, compact surface", len(json.dumps(listed)))
+    tools = {t["name"]: t for t in listed}
     names = set(tools)
     ctx.check("compact advertises act and find_elements", {"act", "find_elements"} <= names, sorted(names))
     ctx.check("and hides the single-action tools and batch", not (HIDDEN_IN_COMPACT & names), sorted(HIDDEN_IN_COMPACT & names))

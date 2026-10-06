@@ -4,6 +4,8 @@ import SCShared
 /// Drives Chrome through the Second Cursor extension, reached via sc-native-host on a Unix socket.
 public final class BrowserBridge: BrowserControlling, @unchecked Sendable {
     public static let socketURL = SCPaths.supportDir.appendingPathComponent("browser.sock")
+    /// Set once at launch from `SCConfig.browserQuietMs`.
+    nonisolated(unsafe) public static var quietMs: Int?
 
     private let link = ExtensionLink(socketURL: BrowserBridge.socketURL)
 

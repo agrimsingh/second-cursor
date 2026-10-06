@@ -40,6 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = makeMenu(config: config)
         if CommandLine.arguments.contains("--show-tasks") { tasks.show() }
         Desktop.cursorOnAgentDisplay = SCPaths.customHome != nil && config.cursorOnAgentDisplay == true
+        BrowserBridge.quietMs = config.browserQuietMs
 
         startBrowserBridge()
 

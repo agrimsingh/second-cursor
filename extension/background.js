@@ -20,6 +20,7 @@ import {
   sessionIsActive,
   sessionControlGeneration,
   setSessionControl,
+  setTrackedQuietMs,
   settleAround,
   settled,
   takeReports,
@@ -376,6 +377,7 @@ async function dispatch(activePort, { id, method, params, receivedAt, controlGen
   const started = performance.now();
   const timingKey = params?.tabId ?? "browser";
   const phases = params?.timings ? timing.begin(timingKey) : null;
+  setTrackedQuietMs(params?.quiet_ms);
   try {
     const handler = handlers[method];
     if (!handler)

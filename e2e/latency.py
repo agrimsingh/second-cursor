@@ -14,6 +14,9 @@ walk, capture, the browser round trip and the extension's phases inside it, as e
 
 --cursor draws the agent cursor on the agent display (cursorOnAgentDisplay), so native calls wait for its glide as
 they do on the user's screen. Without it nothing on the agent display draws a cursor: that measures the server alone.
+
+--quiet-ms N sets browserQuietMs, the browser's quiet period once an action's requests have finished, to compare it
+with the default. Observation sizes are ratchets (ratchet.py) in default-config runs and only reported otherwise.
 """
 import json
 import os
@@ -24,11 +27,14 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import ratchet
 from run import FixtureServer, Run, SCENARIOS, Skip, ToolError, scenario, element_index, links_document
 
 SCENARIOS.clear()
 ROUNDS = int(sys.argv[sys.argv.index("--rounds") + 1]) if "--rounds" in sys.argv else 7
 CURSOR = "--cursor" in sys.argv
+QUIET_MS = int(sys.argv[sys.argv.index("--quiet-ms") + 1]) if "--quiet-ms" in sys.argv else None
+GATED = not CURSOR and QUIET_MS is None
 EXTENSION = os.environ.get("SC_E2E_EXTENSION") or "extension"
 
 
@@ -122,7 +128,7 @@ def latency(ctx):
     for i in range(ROUNDS):
         timed("list_windows", "list_windows")
         full = timed("get_window_state full (links doc)", "get_window_state", window_id=wid, full=True)
-        sizes["get_window_state full (links doc)"] = len(full["tree"])
+        sizes.setdefault("get_window_state full (links doc)", []).append(len(full["tree"]))
         timed("get_window_state diff, no change", "get_window_state", window_id=wid)
         timed("screenshot, idle window", "screenshot", window_id=wid)
 
@@ -148,7 +154,11 @@ def latency(ctx):
          "median_ms": medians, "samples_ms": samples, "sizes_chars": sizes, "server": summary}, indent=2))
     scroll_sizes = sizes["scroll observation (links doc)"]
     ctx.check(f"scroll observation: median {statistics.median(scroll_sizes):.0f} chars "
-              f"(full tree {sizes['get_window_state full (links doc)']})", True, scroll_sizes)
+              f"(full tree {sizes['get_window_state full (links doc)'][0]})", True, scroll_sizes)
+    ratchet.check(ctx, "native: full read of the links document, characters",
+                  sizes["get_window_state full (links doc)"], GATED)
+    # Later rounds scroll back up; the first scroll down starts from the same place in every run.
+    ratchet.check(ctx, "native: first scroll-down observation of the links document, characters", scroll_sizes[0], GATED)
     # An on-screen target also waits for the agent arrow's glide (capped at ~150 ms) so the arrow lands with the click.
     ctx.check("click observe=none stays fast (median under 250 ms, arrow glide included)",
               medians["click observe=none"] < 250, medians["click observe=none"])
@@ -158,11 +168,12 @@ def latency(ctx):
 def browser_latency(ctx):
     if not ctx.call("browser_status").get("connected"):
         raise Skip("Chrome extension not connected")
-    samples, seen = {}, {}
+    samples, seen, first_sizes = {}, {}, {}
     with FixtureServer() as base:
         tid = ctx.call("browser_open", url=f"{base}/reactions.html")["tab"]["id"]
         ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
         outline = ctx.call("browser_snapshot", tab_id=tid, full=True)["outline"]
+        ratchet.check(ctx, "browser: full read of reactions.html, characters", len(outline), GATED)
 
         def ref(pattern):
             match = re.search(r"\[(\w+)\] " + pattern, outline)
@@ -170,7 +181,8 @@ def browser_latency(ctx):
             return match.group(1)
 
         name, search, agree = ref('textbox "Name"'), ref('textbox "Search"'), ref('checkbox "Agree"')
-        details, add, noop, load = (ref(f'button "{label}"') for label in ("Details", "Add row", "Nothing", "Load"))
+        details, add, noop, load, save = (ref(f'button "{label}"')
+                                          for label in ("Details", "Add row", "Nothing", "Load", "Save"))
 
         phases = Phases(ctx)
 
@@ -180,8 +192,10 @@ def browser_latency(ctx):
             elapsed = round((time.perf_counter() - started) * 1000, 1)
             samples.setdefault(label, []).append(elapsed)
             phases.take(label, tool, elapsed)
+            observed = (data.get("observation") or {}).get("outline", "")
+            if "observation" in data:
+                first_sizes.setdefault(label, len(observed))
             if reaction:
-                observed = (data.get("observation") or {}).get("outline", "")
                 seen.setdefault(label, []).append(bool(re.search(reaction, observed)))
 
         for i in range(ROUNDS):
@@ -193,6 +207,8 @@ def browser_latency(ctx):
             timed("click a button that adds a row", "browser_click", rf"Row {i + 1}", ref=add)
             timed("click a button that does nothing", "browser_click", ref=noop)
             timed("click a button whose content loads 400 ms later", "browser_click", rf"Loaded {i + 1}", ref=load)
+            timed("click a button that says Saving, then Saved 200 ms later", "browser_click", rf"Saved {i + 1}",
+                  ref=save)
             timed("press Tab", "browser_press_key", r"focused", keys="Tab")
             timed("click with observe=none", "browser_click", ref=noop, observe="none")
 
@@ -202,11 +218,16 @@ def browser_latency(ctx):
         ctx.check(f"{label}: median {value:.0f} ms" + (f", reaction shown {shown[label]}" if label in shown else ""),
                   True, samples[label])
     summary = report_phases(ctx, phases)
+    # Later rounds see a page earlier rounds changed (more rows, a toggle closed again); the first round never does.
+    for label, size in first_sizes.items():
+        ratchet.check(ctx, f"browser: first observation after '{label}', characters", size, GATED)
     (ctx.run.dir / "browser-latency.json").write_text(json.dumps(
         {"app": str(ctx.run.instance.app) if ctx.run.instance else ctx.run.target, "rounds": ROUNDS,
-         "extension": str(EXTENSION), "median_ms": medians, "reaction_in_own_observation": shown,
-         "samples_ms": samples, "server": summary}, indent=2))
-    for label in ("type into a search box (results ~450 ms later)", "click a button whose content loads 400 ms later"):
+         "extension": str(EXTENSION), "quiet_ms": QUIET_MS, "median_ms": medians,
+         "reaction_in_own_observation": shown, "first_observation_chars": first_sizes, "samples_ms": samples,
+         "server": summary}, indent=2))
+    for label in ("type into a search box (results ~450 ms later)", "click a button whose content loads 400 ms later",
+                  "click a button that says Saving, then Saved 200 ms later"):
         ctx.check(f"{label}: its own observation shows the late content every time", all(seen[label]), shown[label])
     toggle = medians["click an aria-expanded toggle"]
     ctx.check("a toggle that only changes aria-expanded and hidden counts as the page reacting (median under 1000 ms, "
@@ -221,6 +242,8 @@ def browser_latency(ctx):
 
 
 if __name__ == "__main__":
-    run = Run({"cursorOnAgentDisplay": True} if CURSOR else None)
+    overrides = {**({"cursorOnAgentDisplay": True} if CURSOR else {}),
+                 **({"browserQuietMs": QUIET_MS} if QUIET_MS is not None else {})}
+    run = Run(overrides or None)
     run.run([a for a in sys.argv[1:] if not a.isdigit()])
     sys.exit(1 if any(r["status"] == "FAIL" for r in run.results) else 0)

@@ -396,6 +396,13 @@ chrome.tabs.onRemoved.addListener((tabId) => loads.delete(tabId));
 // A load the last action started may take this long before the read gives up waiting for it.
 const ACTION_LOAD_MS = 10000;
 
+// The app's browserQuietMs, sent with every message. It replaces the default quiet period only while the action's
+// requests are tracked: without tracking, that period is all that stands in for a request the read cannot see.
+let trackedQuietMs = null;
+export function setTrackedQuietMs(ms) {
+  trackedQuietMs = Number.isInteger(ms) && ms >= 0 && ms <= 2000 ? ms : null;
+}
+
 /**
  * Input that may make the page fetch and render something (a filter, a search, "load more"), or (`load`) a page load.
  * `at` must be when the input was dispatched: a page that re-renders during the action has already reacted, and
@@ -417,7 +424,7 @@ export function noteAction(tabId, at = Date.now(), load = false) {
  * same action deadline. Pre-existing requests do not. Quietness is a readiness hint, not a verified postcondition.
  * The first probe of a document starts its clock, so an idle page costs `quietMs` once, and nothing on later reads.
  */
-export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs = 1200, requestTimeoutMs = ACTION_LOAD_MS } = {}) {
+export async function settled(tabId, { quietMs, timeoutMs = 2000, reactMs = 1200, requestTimeoutMs = ACTION_LOAD_MS } = {}) {
   const began = Date.now();
   const { at: actedAt = 0, reactMs: quick } = lastAction.get(tabId) ?? {};
   let { load = false } = lastAction.get(tabId) ?? {};
@@ -463,11 +470,12 @@ export async function settled(tabId, { quietMs = 300, timeoutMs = 2000, reactMs 
       if (awaitingReaction && load && (await networkIdle(tabId).catch(() => false))) awaitingReaction = false;
       network = actionNetworkState(tabId, actedAt);
       if (actedAt && (network.pending || network.enabling)) continue;
-      if (state.ready === "complete" && state.quiet >= quietMs && network.quiet >= quietMs && !awaitingReaction)
+      const quietFor = quietMs ?? (network.available && trackedQuietMs != null ? trackedQuietMs : 300);
+      if (state.ready === "complete" && state.quiet >= quietFor && network.quiet >= quietFor && !awaitingReaction)
         return network.incomplete
           ? result("unavailable", "Request tracking exceeded its bounded capacity; pending work may remain. Observe the intended postcondition before retrying.")
           : result("quiet");
-      const pause = awaitingReaction ? 50 : Math.min(100, Math.max(20, quietMs - state.quiet));
+      const pause = awaitingReaction ? 50 : Math.min(100, Math.max(20, quietFor - state.quiet));
       if (awaitingReaction) reacting += pause;
       await sleep(pause);
     }

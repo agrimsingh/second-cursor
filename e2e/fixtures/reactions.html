@@ -17,10 +17,12 @@
   <button id="noop">Nothing</button>
   <button id="load">Load</button>
   <p id="loaded"></p>
+  <button id="save">Save</button>
+  <p id="saved"></p>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
-let timer, rows = 0, loads = 0;
+let timer, rows = 0, loads = 0, saves = 0;
 // Like a typical autocomplete: a 300 ms debounce, then a request, then the list.
 $("search").addEventListener("input", () => {
   clearTimeout(timer);
@@ -41,6 +43,11 @@ $("add").addEventListener("click", () =>
 $("load").addEventListener("click", async () => {
   await fetch("reactions.html?delay_ms=400", { cache: "no-store" });
   $("loaded").textContent = `Loaded ${++loads}`;
+});
+// Reacts at once, then again from a timer with no request in between, like a toast or an optimistic save.
+$("save").addEventListener("click", () => {
+  $("saved").textContent = "Saving";
+  setTimeout(() => { $("saved").textContent = `Saved ${++saves}`; }, 200);
 });
 </script>
 </body>
