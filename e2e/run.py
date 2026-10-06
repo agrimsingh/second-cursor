@@ -2269,8 +2269,9 @@ def browser_cursor(ctx):
     - It outlives the turn (still in the page ~1 s after POST /turn-ended), or the next turn's action does not bring
       it back. Covered.
     - Pointer input does not wait for the cursor to arrive (the click lands before the person sees the cursor get
-      there), waits until the spring settles instead of its first arrival, waits the whole 0.4 s cap, or waits when
-      the cursor does not travel. Covered by timing browser_command clicks, which return right after input.
+      there), waits until the spring settles instead of its first arrival, arrives later than the spring's step
+      response says, waits the whole 0.4 s cap, or waits when the cursor does not travel. Covered by timing
+      browser_command clicks, which return right after input.
     - It waits in a tab nobody can see. Not exercised: headless Chrome reports every tab "visible", even behind a
       new foreground tab, after Target.activateTarget on another tab, or with its window minimized.
     - Not exercised: the 60 s idle fade (a minute of waiting), prefers-reduced-motion, cleanup on tab close, a newer
@@ -2450,10 +2451,11 @@ def browser_cursor(ctx):
         # The spring's step response first reaches the target at (pi - acos(z)) / (w * sqrt(1 - z^2)), w = 2 pi / r.
         response, damping = 0.15, 0.86
         arrives = (math.pi - math.acos(damping)) / (2 * math.pi / response * (1 - damping ** 2) ** 0.5)
-        travel = timed_click(*far)
+        travel = sorted(timed_click(*point) for point in (far, (80, 80), far))[1]
         ctx.check(f"a click {distance:.0f} px away waits for the cursor's first arrival (~{arrives * 1000:.0f} ms)",
                   travel - still >= arrives - 0.05, f"{travel:.3f} s vs {still:.3f} s with no travel")
-        ctx.check("and short of the 0.4 s cap", travel - still < 0.35, f"{travel:.3f} s vs {still:.3f} s")
+        ctx.check("and no more than two 60 Hz frames past it", travel - still < arrives + 2 / 60,
+                  f"{travel:.3f} s vs {still:.3f} s")
         state = overlay(tid2)
         ctx.check("it was dispatched at the cursor's target", at(state, *far), state)
 
