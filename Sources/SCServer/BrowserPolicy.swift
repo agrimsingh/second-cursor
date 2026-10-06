@@ -18,6 +18,24 @@ enum BrowserPolicy {
         return !readOnly.contains(operation)
     }
 
+    /// The discrete tool each extended operation does the work of, so `confirmationRequiredTools` naming the tool
+    /// also asks before browser_command or browser_repl does the same thing.
+    static let discreteTool: [String: String] = [
+        "click": "browser_click", "check": "browser_click", "perform_action": "browser_click",
+        "type": "browser_type", "fill": "browser_type", "press_key": "browser_press_key",
+        "scroll": "browser_scroll", "screenshot": "browser_screenshot",
+        "back": "browser_navigate", "forward": "browser_navigate", "reload": "browser_navigate",
+    ]
+
+    /// The discrete tools a browser_command call acts as, its batch steps included.
+    static func discreteTools(_ raw: [String: Value]) -> Set<String> {
+        guard let operation = raw["operation"]?.stringValue else { return [] }
+        if operation == "batch", let steps = raw["steps"]?.arrayValue {
+            return steps.reduce(into: []) { $0.formUnion($1.objectValue.map(discreteTools) ?? []) }
+        }
+        return discreteTool[operation].map { [$0] } ?? []
+    }
+
     static let sensitive: Set<String> = ["user_tabs", "claim", "history", "clipboard", "cdp", "upload"]
     // Deliberately read-only and tab-scoped. No Runtime, Network, Browser or Target escape hatch.
     static let allowedCDP: Set<String> = [
@@ -89,11 +107,9 @@ enum BrowserPolicy {
                 summary: "inspect \(tab)",
                 detail: "It runs one read-only inspection. Just this once.")
         case "upload":
-            let names = ((try? args.strings("files")) ?? []).map { ($0 as NSString).lastPathComponent }
-            let files =
-                names.isEmpty
-                ? "files"
-                : names.prefix(2).joined(separator: ", ") + (names.count > 2 ? " and \(names.count - 2) more" : "")
+            // Every full path, never a basename or a count: the folder is what tells ~/.ssh/id_rsa from a draft.
+            let paths = ((try? args.strings("files")) ?? []).map { ($0 as NSString).abbreviatingWithTildeInPath }
+            let files = paths.isEmpty ? "files" : paths.joined(separator: ", ")
             return ApprovalGrant(
                 title: "Upload \(files) to \(pageLabel.isEmpty ? "this page" : pageLabel)?",
                 summary: "upload \(files) to \(host)",

@@ -131,11 +131,13 @@ final class ToolRouter: Sendable {
                 noteTaskTarget(name, args, owner: owner, session: session)
                 if mutating { _ = TaskRegistry.shared.ensureTask(session: session) }
                 let readGeneration = TaskRegistry.shared.snapshot(session: session)?.controlGeneration
-                var configuredTools = [name]
+                var configuredTools: Set<String> = [name]
                 if name == "batch" {
-                    configuredTools += try args.objects("steps").compactMap { $0["tool"]?.stringValue?.lowercased() }
+                    configuredTools.formUnion(try args.objects("steps").compactMap { $0["tool"]?.stringValue?.lowercased() })
                 }
-                var grants = Set(configuredTools).intersection(appGuard.config.confirmationRequiredTools).sorted().map {
+                if name == "browser_command" { configuredTools.formUnion(BrowserPolicy.discreteTools(raw)) }
+                if name == "browser_repl" { configuredTools.formUnion(BrowserREPL.actsAs) }
+                var grants = configuredTools.intersection(appGuard.config.confirmationRequiredTools).sorted().map {
                     ApprovalGrant(
                         title: "Allow Second Cursor to \($0.replacingOccurrences(of: "_", with: " "))?",
                         summary: $0.replacingOccurrences(of: "_", with: " "), detail: "Just this once.")

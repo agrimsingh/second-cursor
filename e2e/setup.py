@@ -590,18 +590,21 @@ def install_mcp_write(ctx):
         ctx.check(f"{client}: every unrelated entry survived the merge", unrelated_preserved(client, doc), doc)
         backup = home / (rel + ".bak")
         ctx.check(f"{client}: .bak holds the exact original", backup.exists() and backup.read_bytes() == originals[client])
+        modes = {p.name: oct(p.stat().st_mode & 0o777) for p in (path, backup)}
+        ctx.check(f"{client}: the config and its .bak are private (0600), whatever the original's mode",
+                  set(modes.values()) == {"0o600"}, modes)
         if client == "codex":
             text = path.read_text()
             ctx.check("codex: the stale table was replaced, not duplicated",
                       text.count("[mcp_servers.second_cursor]") == 1 and "/old/SecondCursor" not in text, text)
         written = path.read_bytes()
+        path.chmod(0o644)
         again = cli(ctx, "install-mcp", "--client", client, env=env)
         ctx.check(f"{client}: re-running is idempotent (exit 0, file and .bak unchanged)",
                   again.returncode == 0 and path.read_bytes() == written and backup.read_bytes() == originals[client],
                   again.stdout[:300])
-    ctx.check("claude: a private (0600) config stays private",
-              (home / CLIENT_FILES["claude"]).stat().st_mode & 0o777 == 0o600,
-              oct((home / CLIENT_FILES["claude"]).stat().st_mode & 0o777))
+        ctx.check(f"{client}: re-running with nothing to write still makes a readable config private",
+                  path.stat().st_mode & 0o777 == 0o600, oct(path.stat().st_mode & 0o777))
 
     entry = json.loads((home / CLIENT_FILES["claude"]).read_text())["mcpServers"]["second-cursor"]
     code, out, raw, err = stdio(ctx, [rpc(1, "initialize", INITIALIZE)], env=entry.get("env", {}),

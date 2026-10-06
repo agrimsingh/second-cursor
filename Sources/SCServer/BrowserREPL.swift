@@ -11,6 +11,15 @@ final class BrowserREPL: @unchecked Sendable {
     static let outputLimit = 40_000
     static let memoryBudget: UInt64 = 1 << 30
 
+    /// Every tool a script can act as, so `confirmationRequiredTools` naming any of them asks before a script runs.
+    static let actsAs: Set<String> = Set(Session.methods.compactMap { methodTools[$0] })
+        .union(Session.operations.compactMap { BrowserPolicy.discreteTool[$0] })
+    private static let methodTools = [
+        "tabs.open": "browser_open", "tab.navigate": "browser_navigate", "tab.snapshot": "browser_snapshot",
+        "tabs.close": "browser_close", "tabs.list": "browser_tabs", "tab.screenshot": "browser_screenshot",
+        "extended": "browser_command",
+    ]
+
     private let browser: BrowserControlling
     private let log: ActionLog
     private let lock = NSLock()
@@ -133,11 +142,11 @@ private struct Pending {
 }
 
 private final class Session: @unchecked Sendable {
-    private static let methods: Set<String> = [
+    fileprivate static let methods: Set<String> = [
         "tabs.open", "tab.navigate", "tab.snapshot", "tabs.close", "tabs.list", "tab.screenshot", "extended",
     ]
     // No operation that needs local approval, reads beyond the page's controls, or runs page JavaScript.
-    private static let operations: Set<String> = [
+    fileprivate static let operations: Set<String> = [
         "inspect", "query", "click", "hover", "fill", "type", "press_key", "check", "select_option", "select_text",
         "perform_action", "scroll", "wait", "back", "forward", "reload", "dialog", "screenshot",
     ]

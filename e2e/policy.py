@@ -213,8 +213,10 @@ DENIAL = "local approval denied"
 @scenario
 def approvals_deny_mode_gates_without_ui(ctx):
     """Every local approval path must refuse immediately, with the user-denial error, and show nothing."""
+    # Browser calls resolve their browser before any gate, so the browser checks below need one connected.
     instance = harness.TestInstance(
-        {"approvals": "deny", "appApproval": "prompt", "confirmationRequiredTools": ["list_windows"]}
+        {"approvals": "deny", "appApproval": "prompt", "confirmationRequiredTools": ["list_windows", "browser_click"]},
+        browser=True,
     )
     ctx.cleanups.append(lambda: instance.stop(keep_logs=ctx.run.dir / "deny-instance"))
     client = harness.MCP(instance.url, instance.token, ctx.run.transcript)
@@ -263,6 +265,12 @@ def approvals_deny_mode_gates_without_ui(ctx):
     ctx.check("that batch is refused immediately", time.monotonic() - began < 2, round(time.monotonic() - began, 2))
     ctx.check("that batch shows no dialog", not observe()["second_cursor_windows"])
     refused_fast("a confirmationRequiredTools tool", "list_windows")
+    # Listing browser_click must also cover every other way to click in the browser.
+    refused_fast("browser_command click, under a listed browser_click", "browser_command", operation="click", tab_id=1,
+                 locator={"role": "button"})
+    refused_fast("a browser_command batch step that clicks", "browser_command", operation="batch", tab_id=1,
+                 steps=[{"operation": "wait", "timeout_ms": 1}, {"operation": "check", "locator": {"label": "x"}, "checked": True}])
+    refused_fast("a browser_repl script, which can click", "browser_repl", code="1")
 
     logged = instance.action_log.read_text().splitlines() if instance.action_log.exists() else []
     entries = [json.loads(line) for line in logged]
