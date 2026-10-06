@@ -2460,8 +2460,8 @@ def browser_cursor(ctx):
         ctx.check("it was dispatched at the cursor's target", at(state, *far), state)
 
         request = urllib.request.Request(
-            ctx.mcp.url.rsplit("/", 1)[0] + "/turn-ended", data=b"{}", method="POST",
-            headers={"Authorization": f"Bearer {ctx.mcp.token}", "Content-Type": "application/json"})
+            ctx.mcp.url.rsplit("/", 1)[0] + "/turn-ended", data=json.dumps({"session_id": ctx.mcp.session_id}).encode(),
+            method="POST", headers={"Authorization": f"Bearer {ctx.mcp.token}", "Content-Type": "application/json"})
         urllib.request.urlopen(request, timeout=15).read()
         gone = [poll(lambda t=t: overlay(t), lambda s: s is None, timeout=1.0) for t in (tid, tid2)]
         ctx.check("both tabs' cursors are gone within ~1 s of POST /turn-ended", gone == [None, None], gone)
