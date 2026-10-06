@@ -215,7 +215,7 @@ def approvals_deny_mode_gates_without_ui(ctx):
     """Every local approval path must refuse immediately, with the user-denial error, and show nothing."""
     # Browser calls resolve their browser before any gate, so the browser checks below need one connected.
     instance = harness.TestInstance(
-        {"approvals": "deny", "appApproval": "prompt", "confirmationRequiredTools": ["list_windows", "browser_click"]},
+        {"approvals": "deny", "appApproval": "prompt", "confirmationRequiredTools": ["list_windows"]},
         browser=True,
     )
     ctx.cleanups.append(lambda: instance.stop(keep_logs=ctx.run.dir / "deny-instance"))
@@ -265,12 +265,6 @@ def approvals_deny_mode_gates_without_ui(ctx):
     ctx.check("that batch is refused immediately", time.monotonic() - began < 2, round(time.monotonic() - began, 2))
     ctx.check("that batch shows no dialog", not observe()["second_cursor_windows"])
     refused_fast("a confirmationRequiredTools tool", "list_windows")
-    # Listing browser_click must also cover every other way to click in the browser.
-    refused_fast("browser_command click, under a listed browser_click", "browser_command", operation="click", tab_id=1,
-                 locator={"role": "button"})
-    refused_fast("a browser_command batch step that clicks", "browser_command", operation="batch", tab_id=1,
-                 steps=[{"operation": "wait", "timeout_ms": 1}, {"operation": "check", "locator": {"label": "x"}, "checked": True}])
-    refused_fast("a browser_repl script, which can click", "browser_repl", code="1")
 
     logged = instance.action_log.read_text().splitlines() if instance.action_log.exists() else []
     entries = [json.loads(line) for line in logged]
@@ -281,6 +275,54 @@ def approvals_deny_mode_gates_without_ui(ctx):
     )
     status, body = post_turn_ended(client, {})
     ctx.check("turn end works in deny mode", status == 200 and body.get("ok") is True, (status, body))
+
+
+@scenario
+def confirmation_covers_every_browser_path(ctx):
+    """confirmationRequiredTools naming a browser tool must also ask before any other call that does that tool's work."""
+    instance = harness.TestInstance(
+        {"approvals": "deny", "confirmationRequiredTools": ["browser_click", "browser_type", "browser_snapshot"]},
+        browser=True,
+    )
+    ctx.cleanups.append(lambda: instance.stop(keep_logs=ctx.run.dir / "confirmation-instance"))
+    client = harness.MCP(instance.url, instance.token, ctx.run.transcript)
+    client.initialize()
+    fixtures = harness.FixtureServer()
+    base = fixtures.__enter__()
+    ctx.cleanups.append(lambda: fixtures.__exit__(None, None, None))
+    tab = client.call("browser_open", url=f"{base}/reactions.html")[0]["tab"]["id"]
+    deadline = time.monotonic() + 3
+    while not instance.timings() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    opened = len(instance.timings())
+    calls = [
+        ("browser_command click", "browser_command", {"operation": "click", "locator": {"role": "button"}}),
+        ("a browser_command batch step that checks a box", "browser_command", {"operation": "batch", "steps": [
+            {"operation": "wait", "timeout_ms": 1}, {"operation": "check", "locator": {"label": "x"}, "checked": True}]}),
+        ("a browser_repl script", "browser_repl", {"code": "1"}),
+        ("a batch tab step named click", "batch", {"steps": [{"tool": "click", "ref": "e1"}]}),
+        ("an act tab step named click", "act", {"steps": [{"tool": "click", "ref": "e1"}]}),
+        ("browser_command paste, under browser_type", "browser_command", {"operation": "paste", "text": "x"}),
+        ("browser_command select_option", "browser_command",
+         {"operation": "select_option", "locator": {"label": "Name"}, "values": ["a"]}),
+        ("browser_command drag", "browser_command",
+         {"operation": "drag", "from_x": 10, "from_y": 10, "to_x": 20, "to_y": 20}),
+        ("browser_command dialog", "browser_command", {"operation": "dialog", "action": "accept"}),
+        ("browser_command dom_snapshot, under browser_snapshot", "browser_command", {"operation": "dom_snapshot"}),
+    ]
+    for label, tool, args in calls:
+        began = time.monotonic()
+        error = refused(lambda: client.call(tool, tab_id=tab, timeout_ms=10000, **args))
+        ctx.check(f"{label} is refused with the denial error", error is not None and DENIAL in error.lower(), error)
+        ctx.check(f"{label} is refused immediately", time.monotonic() - began < 2, round(time.monotonic() - began, 2))
+    ctx.check("none of them showed a dialog", not observe()["second_cursor_windows"])
+    deadline = time.monotonic() + 3
+    while len(instance.timings()) < opened + len(calls) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    entries = instance.timings(opened)
+    reached = [e["tool"] for e in entries if any(name.startswith("bridge") for name in e.get("phases", {}))]
+    ctx.check("every call has its timing line, and none of them reached the browser",
+              len(entries) == len(calls) and not reached, {"lines": len(entries), "reached": reached})
 
 
 @scenario

@@ -599,12 +599,14 @@ def install_mcp_write(ctx):
                       text.count("[mcp_servers.second_cursor]") == 1 and "/old/SecondCursor" not in text, text)
         written = path.read_bytes()
         path.chmod(0o644)
+        backup.chmod(0o644)
         again = cli(ctx, "install-mcp", "--client", client, env=env)
         ctx.check(f"{client}: re-running is idempotent (exit 0, file and .bak unchanged)",
                   again.returncode == 0 and path.read_bytes() == written and backup.read_bytes() == originals[client],
                   again.stdout[:300])
-        ctx.check(f"{client}: re-running with nothing to write still makes a readable config private",
-                  path.stat().st_mode & 0o777 == 0o600, oct(path.stat().st_mode & 0o777))
+        modes = {p.name: oct(p.stat().st_mode & 0o777) for p in (path, backup)}
+        ctx.check(f"{client}: re-running with nothing to write still makes a readable config and its .bak private",
+                  set(modes.values()) == {"0o600"}, modes)
 
     entry = json.loads((home / CLIENT_FILES["claude"]).read_text())["mcpServers"]["second-cursor"]
     code, out, raw, err = stdio(ctx, [rpc(1, "initialize", INITIALIZE)], env=entry.get("env", {}),
