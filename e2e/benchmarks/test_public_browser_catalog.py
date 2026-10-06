@@ -103,6 +103,42 @@ class PublicBrowserCatalogTests(unittest.TestCase):
         for surface in self.catalogs.values():
             self.assertEqual(next(tool for tool in surface if tool["name"] == "browser_command"), self.command)
 
+    def test_browser_postconditions_are_typed_on_every_supported_surface(self):
+        inputs = {"browser_click", "browser_type", "browser_press_key", "browser_scroll"}
+        for name, surface in self.catalogs.items():
+            with self.subTest(surface=name):
+                tools = {tool["name"]: tool for tool in surface}
+                for tool in inputs:
+                    expect = tools[tool]["inputSchema"]["properties"]["expect"]
+                    shapes = expect["anyOf"]
+                    self.assertEqual(shapes[1], {"type": "string"})
+                    self.assertEqual(shapes[0]["type"], "object")
+                    self.assertFalse(shapes[0]["additionalProperties"])
+                    fields = shapes[0]["properties"]
+                    self.assertEqual(set(fields), {"text", "ref", "value", "gone", "timeout_ms"})
+                    for field in ("text", "ref", "value"):
+                        self.assertEqual(fields[field]["type"], "string")
+                    self.assertEqual(fields["gone"]["type"], "boolean")
+                    self.assertEqual(fields["timeout_ms"]["minimum"], 0)
+                    self.assertEqual(fields["timeout_ms"]["maximum"], 10000)
+                    self.assertIn("preexisting", expect["description"])
+                    self.assertIn("observe=none", expect["description"])
+                batch = tools["act" if name == "compact" else "batch"]
+                condition = batch["inputSchema"]["properties"]["expect"]
+                fields = condition["anyOf"][0]["properties"]
+                self.assertIn("ref", fields)
+                self.assertIn("element_index", fields)
+                self.assertIn("failed/skipped", condition["description"])
+                for unsupported in ("browser_navigate", "browser_command", "browser_open", "browser_snapshot"):
+                    self.assertNotIn("expect", tools[unsupported]["inputSchema"]["properties"])
+                if "browser_repl" in tools:
+                    self.assertNotIn("expect", tools["browser_repl"]["inputSchema"]["properties"])
+        # The existing native contract retains its element_index field and shape.
+        native = self.tools["click"]["inputSchema"]["properties"]["expect"]
+        self.assertEqual(native["type"], "object")
+        self.assertIn("element_index", native["properties"])
+        self.assertNotIn("ref", native["properties"])
+
     def test_scoped_projection_preserves_contract_without_advertising_forbidden_frames(self):
         original = copy.deepcopy(self.command)
         with ScopedEngine("second-cursor", BROWSER, FakeMCP(list(self.tools.values()))) as engine:

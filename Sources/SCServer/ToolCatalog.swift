@@ -28,6 +28,11 @@ enum ToolCatalog {
         "browser_click", "browser_type", "browser_press_key", "browser_scroll", "browser_navigate",
     ]
 
+    /// Browser inputs that can check a postcondition before input and wait for it afterward.
+    static let expectingBrowserTools: Set<String> = [
+        "browser_click", "browser_type", "browser_press_key", "browser_scroll",
+    ]
+
     /// Actions that take a `caption` for the agent cursor.
     static let captionedTools: Set<String> = observingTools.union(observingBrowserTools).union([
         "batch", "browser_command",
@@ -82,7 +87,7 @@ enum ToolCatalog {
         "Act on one window: run a list of steps strictly in order, then get one observation after the UI settles. This is the way to act, with one step or many: put every step you already know in one call (pressing a known series of buttons, filling known fields, typing followed by a shortcut), and end the list before any step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet); then look at the observation and send the next list. Each step is a tool name (click, type_text, press_key, set_value, scroll, drag, perform_action, wait) plus that action's arguments. Element indexes come from get_window_state or find_elements and are not refreshed between steps. Pixel steps (x/y) take coordinate_space and stop the list if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the list stops at the first failure. The observation is a diff like get_window_state unless full=true. \(tabBatch)"
 
     private static let tabBatch =
-        "With tab_id instead of window_id, the steps act in that agent tab: browser_click (ref, or x and y), browser_type (text, optional ref and submit), browser_press_key, browser_scroll and wait, with refs from the tab's latest outline (not refreshed between steps, so end the list where a step re-renders what later steps target); the observation is the tab's diff. expect is only supported for native windows: omit it with tab_id and inspect the returned tab observation to check the result."
+        "With tab_id instead of window_id, the steps act in that agent tab: browser_click (ref, or x and y), browser_type (text, optional ref and submit), browser_press_key, browser_scroll and wait, with refs from the tab's latest outline (not refreshed between steps, so end the list where a step re-renders what later steps target); the observation is the tab's diff. expect checks once before the batch and waits after its last step: text, or ref with exact value for tabs (element_index with value for windows). Any failed or skipped step makes the expectation failed."
 
     private static let catalog: [Tool] =
         ([
@@ -460,6 +465,7 @@ enum ToolCatalog {
                 if observingTools.contains(tool.name) || tool.name == "batch" {
                     props["expect"] = tool.name == "batch" ? batchExpect : tool.name == "click" ? expect : expectPointer
                 }
+                if expectingBrowserTools.contains(tool.name) { props["expect"] = browserExpect }
                 if tool.name == "browser_snapshot" {
                     props["full"] = boolean(
                         "Return the whole outline instead of a diff from your previous read of this tab.", default: false)
@@ -647,11 +653,28 @@ enum ToolCatalog {
             "Optional check that the action worked, as in click: {text} or {element_index, value}, with optional gone and timeout_ms.",
     ]
 
+    private static let browserConditionFields: [String: Value] = [
+        "text": string("Case-sensitive substring in visible rendered page text or accessible name/value; excludes hidden content."),
+        "ref": string("With value: an element ref from this tab's latest observation, pinned before input."),
+        "value": string("With ref: the exact value required of that same element."),
+        "gone": boolean("Invert the combined condition. A stale or unreadable ref fails; it does not prove absence.", default: false),
+        "timeout_ms": ["type": "integer", "description": "Postcondition wait, separate from the call deadline.",
+                       "minimum": 0, "maximum": 10000, "default": 2000],
+    ]
+
+    private static let browserExpect: Value = [
+        "description": "Optional postcondition, checked before input then waited for after it: text, or ref with value; both must hold when combined. Returns expect.status verified, preexisting or failed, even with observe=none. Failed means reconcile before retrying, not that input did not happen. Accepts a JSON object string too.",
+        "anyOf": [["type": "object", "properties": .object(browserConditionFields), "additionalProperties": false],
+                  ["type": "string"]],
+    ]
+
     private static let batchExpect: Value = [
-        "type": "object",
-        "description":
-            "Native windows only (window_id or app); not accepted with tab_id. Checks text or an element_index/value condition before the batch and after its last step, as in click. For a browser tab, omit expect and inspect the returned observation.",
-        "properties": .object(conditionFields),
+        "description": "Check before the batch, then wait after its last step. Native: text or element_index with value, as in click. Tab: text or ref with value, as in browser_click; a failed/skipped tab step makes expect failed. Accepts a JSON object string too.",
+        "anyOf": [["type": "object", "properties": .object(conditionFields.merging([
+            "ref": browserConditionFields["ref"]!,
+            "value": string("The exact value for element_index (native window) or ref (browser tab)."),
+            "timeout_ms": integer("Wait after the steps: 0–10000 ms for tabs; capped at 10000 for native windows.", default: 2000),
+        ]) { $1 }), "additionalProperties": false], ["type": "string"]],
     ]
 
     /// Flat on each step rather than nested under args: Gemini through Cursor stringifies a free-form nested

@@ -138,8 +138,11 @@ final class ExtensionLink: @unchecked Sendable {
 
     private func callNow(_ method: String, _ params: [String: Any], timeout: TimeInterval) async throws -> [String: Any]
     {
+        let checksExpectation = (params["expect"] != nil && !(params["expect"] is NSNull))
+            || ["tab.expectPrepare", "tab.expectFinish"].contains(method)
+        let (connection, id) = try reserveCall(requiring: checksExpectation ? "browser_expect_v1" : nil)
+        // Unsupported postconditions are known refusals, before the operation journal records any dispatch.
         try Execution.context.beforeDispatch()
-        let (connection, id) = try reserveCall()
         var params = params
         // Override untrusted arguments; only the local approval flow can populate this grant.
         params["local_approvals"] = Array(Execution.context.browserApprovals)
@@ -176,7 +179,7 @@ final class ExtensionLink: @unchecked Sendable {
         return value
     }
 
-    private func reserveCall() throws -> (Connection, Int) {
+    private func reserveCall(requiring capability: String? = nil) throws -> (Connection, Int) {
         lock.lock()
         defer { lock.unlock() }
         let connection: Connection?
@@ -191,6 +194,15 @@ final class ExtensionLink: @unchecked Sendable {
         }
         guard let connection else {
             throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected")
+        }
+        if let capability {
+            // Check the selected connection while holding the same lock that resolved it. A different browser's
+            // newer extension must never authorize an expectation that this connection would silently ignore.
+            let browserID = active.first(where: { $0.value === connection })?.key
+            let capabilities = browserID.flatMap { metadata[$0]?["capabilities"] as? [String] } ?? []
+            guard capabilities.contains(capability) else {
+                throw SCError.browserUnavailable("the connected extension does not support browser expect; reload the updated Second Cursor extension before retrying")
+            }
         }
         let id = nextCallID
         nextCallID += 1

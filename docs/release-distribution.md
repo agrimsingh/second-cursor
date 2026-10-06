@@ -10,6 +10,7 @@
 - The final ZIP must contain the stapled app. The DMG must be independently signed, notarized, stapled, and validated. Both artifacts receive SHA-256 checksums and explicit trust metadata.
 - A locally signed package must describe itself as unnotarized. Local signing preserves development permissions but does not make a download trusted on another Mac.
 - Packaging never installs, launches, publishes, or replaces a previously completed artifact. `scripts/build_and_run.sh` remains the developer build/install/run entry point.
+- To install an already tested bundle without rebuilding it, use `scripts/install-built.sh <bundle.app>`. It verifies the signature, waits for graceful termination, retains the previous bundle under `build/install-backups`, and installs the extension from the bundle. Reload the browser extension after updating its files; a live capability check is required to confirm that Chrome is running the new code.
 
 ## Local distribution
 

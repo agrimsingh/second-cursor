@@ -1,9 +1,10 @@
 import { attach } from "./cdp.js";
 import { hideSession, setCaption, show } from "./cursor.js";
-import { BridgeError } from "./errors.js";
+import { BridgeError, sleep } from "./errors.js";
 import { click, pressKey, screenshot, scroll, type } from "./input.js";
 import { snapshot, structuredSnapshot } from "./snapshot.js";
 import { browserRevision } from "./freshness.js";
+import { cancelExpectations, expectationOutcome, failedExpectation, finishBatchExpectation, prepareBatchExpectation, prepareExpectation, waitExpectation } from "./expectations.js";
 import {
   closeTab,
   describe,
@@ -38,6 +39,7 @@ const HEALTHY_AFTER_MS = 10000;
 
 const observations = new Map();
 function invalidateSession(session) {
+  cancelExpectations(session);
   for (const key of observations.keys()) if (key.startsWith(session + ":")) observations.delete(key);
 }
 async function validateObservation(params) {
@@ -119,7 +121,42 @@ const handlers = {
     const tab = await navigateTab(tabId, url);
     return { tab };
   },
-  "tab.snapshot": async ({ tabId, session_id, full, structured }) => {
+  "tab.snapshot": params => tabSnapshot(params),
+  "tab.expectPrepare": params => prepareBatchExpectation(params),
+  "tab.expectFinish": async params => {
+    const generation = await sessionControlGeneration(params.session_id ?? "legacy");
+    const expect = await finishBatchExpectation(params);
+    const reply = { expect, outcome: expectationOutcome(expect) };
+    return appendObservation(params, reply, false, generation);
+  },
+  "tab.click": async (params) => {
+    const { tabId, ref, x, y } = params;
+    await requireAgentTab(tabId);
+    return act(params, guard => click(tabId, { ref, x, y }, () => validateObservation(params), guard), { quietMs: INPUT_NAVIGATION_MS });
+  },
+  "tab.type": async (params) => {
+    const { tabId, ref, text, submit } = params;
+    await requireAgentTab(tabId);
+    return act(params, guard => type(tabId, { ref, text, submit }, guard), { quietMs: submit ? INPUT_NAVIGATION_MS : 0 });
+  },
+  "tab.pressKey": async (params) => {
+    const { tabId, keys } = params;
+    await requireAgentTab(tabId);
+    return act(params, guard => pressKey(tabId, keys, guard), { quietMs: INPUT_NAVIGATION_MS });
+  },
+  "tab.scroll": async (params) => {
+    const { tabId, direction, amount } = params;
+    await requireAgentTab(tabId);
+    return act(params, guard => scroll(tabId, direction, amount, guard), null);
+  },
+  "tab.screenshot": async ({ tabId }) => {
+    await requireAgentTab(tabId);
+    return await timing.timed(tabId, "screenshot", () => screenshot(tabId));
+  },
+};
+
+async function tabSnapshot({ tabId, session_id, full, structured }, settle = true, guard = async () => {}) {
+    await guard();
     await requireAgentTab(tabId);
     // The page runs no script, and so cannot be read, until its dialog is answered.
     if (openDialog(tabId))
@@ -130,13 +167,14 @@ const handlers = {
     // Like Codex, the cursor is on the tab from the moment the agent works in it, not only once it acts.
     await timing.timed(tabId, "attach", () => attach(tabId));
     if (await sessionIsActive(session_id)) show(tabId, session_id);
-    const settling = await settled(tabId);
+    const settling = settle ? await settled(tabId) : undefined;
     const key = `${session_id}:${tabId}`;
     const previous = observations.get(key);
-    const beforeRevision = await browserRevision(tabId);
+    const beforeRevision = await browserRevision(tabId, guard);
     const capturedAt = Date.now();
-    const snapshot = await timing.timed(tabId, "collect", () => structuredSnapshot(tabId));
-    const revision = await browserRevision(tabId);
+    const snapshot = await timing.timed(tabId, "collect", () => structuredSnapshot(tabId, guard));
+    const revision = await browserRevision(tabId, guard);
+    await guard();
     const current = beforeRevision === revision;
     const id = crypto.randomUUID();
     observations.set(key, { id, outline: snapshot.outline, revision, current });
@@ -162,38 +200,13 @@ const handlers = {
       outline,
       ...(structured && !is_diff ? { elements: snapshot.elements } : {}),
       snapshot_id: id,
-      settling,
+      ...(settling ? { settling } : {}),
       freshness: { revision, captured_at_ms: capturedAt, age_ms: Date.now() - capturedAt,
         status: current ? "current" : "changed_during_capture" },
       is_diff,
       diff_base: is_diff ? previous.id : null,
     };
-  },
-  "tab.click": async (params) => {
-    const { tabId, ref, x, y } = params;
-    await requireAgentTab(tabId);
-    return act(params, () => click(tabId, { ref, x, y }, () => validateObservation(params)), { quietMs: INPUT_NAVIGATION_MS });
-  },
-  "tab.type": async (params) => {
-    const { tabId, ref, text, submit } = params;
-    await requireAgentTab(tabId);
-    return act(params, () => type(tabId, { ref, text, submit }), { quietMs: submit ? INPUT_NAVIGATION_MS : 0 });
-  },
-  "tab.pressKey": async (params) => {
-    const { tabId, keys } = params;
-    await requireAgentTab(tabId);
-    return act(params, () => pressKey(tabId, keys), { quietMs: INPUT_NAVIGATION_MS });
-  },
-  "tab.scroll": async (params) => {
-    const { tabId, direction, amount } = params;
-    await requireAgentTab(tabId);
-    return act(params, () => scroll(tabId, direction, amount), null);
-  },
-  "tab.screenshot": async ({ tabId }) => {
-    await requireAgentTab(tabId);
-    return await timing.timed(tabId, "screenshot", () => screenshot(tabId));
-  },
-};
+}
 
 const OBSERVING = new Set(["tree", "both", "screenshot"]);
 // A navigation that input starts in its own event handler (a link, a form submit, location set in the handler) shows
@@ -210,6 +223,30 @@ const INPUT_NAVIGATION_MS = 100;
  */
 async function act(params, action, settleOptions) {
   const { tabId, observe, session_id } = params;
+  if (params.expect != null) {
+    const prepared = await prepareExpectation(params);
+    const at = Date.now();
+    let blocked;
+    try {
+      // The complete precondition read may take time; the action must still be grounded in the caller's view.
+      await validateObservation(params);
+      const guardInput = async () => {
+        if (prepared.cancelled || Date.now() >= prepared.expires || openDialog(tabId)
+          || prepared.generation !== await sessionControlGeneration(session_id ?? "legacy"))
+          throw new BridgeError("failed", "The interrupted action cannot send further input; inspect the page before continuing");
+      };
+      blocked = await withDialog(tabId, () => timing.timed(tabId, "action", () => action(guardInput)));
+    } catch (error) {
+      prepared.cancelled = true;
+      throw error;
+    }
+    noteAction(tabId, at);
+    const expect = blocked?.dialog_open
+      ? failedExpectation("dialog_open") : await waitExpectation(prepared);
+    prepared.cancelled = true;
+    const reply = { ...(blocked ?? {}), expect, outcome: expectationOutcome(expect) };
+    return appendObservation(params, reply, false, prepared.generation);
+  }
   if (!OBSERVING.has(observe)) {
     const at = Date.now();
     await (settleOptions ? settleAround(tabId, action, settleOptions) : action());
@@ -223,13 +260,53 @@ async function act(params, action, settleOptions) {
   if (blocked?.dialog_open) return blocked;
   noteAction(tabId, at);
   const reply = { outcome: { state: "dispatched", verified: false, reason: "Input was dispatched; no postcondition was requested.", verification: "none" } };
-  try {
-    if (observe === "screenshot") reply.settling = await settled(tabId);
-    else reply.observation = await handlers["tab.snapshot"]({ tabId, session_id, full: false });
-    if (observe !== "tree") reply.screenshot = await timing.timed(tabId, "screenshot", () => screenshot(tabId));
-  } catch (error) {
-    reply.observation_error = error.message ?? String(error);
+  return appendObservation(params, reply);
+}
+
+async function appendObservation(params, reply, settle = true, expectedGeneration) {
+  const { tabId, observe, session_id = "legacy" } = params;
+  if (!OBSERVING.has(observe)) return reply;
+  if (openDialog(tabId)) {
+    reply.observation_error = "A JavaScript dialog is open; handle it before reading the page.";
+    return reply;
   }
+  if (!settle && ["control_changed", "deadline", "token_unavailable"].includes(reply.expect?.reason)) {
+    reply.observation_error = "Task control or the verification deadline changed; take a fresh observation when control is restored.";
+    return reply;
+  }
+  let cancelled = false;
+  const deadline = Math.min(params.deadline ?? Infinity, Date.now() + 3000);
+  const guard = settle ? async () => {} : async () => {
+    if (cancelled || Date.now() >= deadline || openDialog(tabId)) throw Error("Observation interrupted");
+    await requireAgentTab(tabId, session_id);
+    await requireSessionInput(session_id);
+    if (expectedGeneration !== await sessionControlGeneration(session_id)) throw Error("Task control changed");
+  };
+  const read = async () => {
+    await guard();
+    await requireAgentTab(tabId, session_id);
+    const result = {};
+    if (observe === "screenshot") {
+      if (settle) result.settling = await settled(tabId);
+    } else result.observation = await tabSnapshot({ tabId, session_id, full: params.full ?? false }, settle, guard);
+    await guard();
+    if (observe !== "tree") result.screenshot = await timing.timed(tabId, "screenshot", () => screenshot(tabId, guard));
+    await guard();
+    return result;
+  };
+  try {
+    if (settle) Object.assign(reply, await read());
+    else {
+      let done = false, result, failure;
+      const pending = read().then(value => { result = value; done = true; }, error => { failure = error; done = true; });
+      while (!done) { await Promise.race([pending, sleep(25)]); await guard(); }
+      if (failure) throw failure;
+      Object.assign(reply, result);
+    }
+  } catch (error) {
+    reply.observation_error = settle ? error.message ?? String(error)
+      : "The postcondition result is retained, but the final observation was interrupted or unavailable; inspect the tab before further input.";
+  } finally { cancelled = true; }
   return reply;
 }
 
@@ -287,7 +364,7 @@ const EXTENDED_ACTIONS = new Set(["click", "hover", "drag", "fill", "check", "se
 const GROUNDED_INPUT = new Set(["click", "hover", "drag", "fill", "check", "select_option", "select_text",
   "perform_action", "paste", "press_key", "scroll", "type", "upload"]);
 // Replies the app hands to the model; queued [system] lines ride on these and on nothing else, or they are lost.
-const REPORTING = new Set([...ACTIONS, "tabs.open", "tabs.close", "tab.snapshot", "extended"]);
+const REPORTING = new Set([...ACTIONS, "tabs.open", "tabs.close", "tab.snapshot", "tab.expectFinish", "extended"]);
 
 let port = null;
 let retryTimer = null;
@@ -330,9 +407,13 @@ async function dispatch(activePort, { id, method, params, receivedAt, controlGen
         (method === "extended" && ["claim", "dialog", "clipboard"].includes(params.operation)))
       inputToken = await beginAgentInput(params.tabId, params.session_id, await controlGeneration);
     if (acts) await noteInput(params.tabId);
+    // Explicit postconditions handle dialogs inside their action/wait, preserving failed verification metadata.
+    // A second outer race would drop that metadata and abandon a polling loop behind the returned reply.
+    const managesExpectation = (ACTIONS.has(method) && params.expect != null)
+      || ["tab.expectPrepare", "tab.expectFinish"].includes(method);
     reply = {
       id,
-      result: await (params.tabId != null
+      result: await (params.tabId != null && !managesExpectation
         ? withDialog(params.tabId, () => handler(params))
         : handler(params)),
     };
@@ -446,6 +527,7 @@ function connect() {
               ? "Chrome / Chromium"
               : "Chromium",
           capabilities: [
+            "browser_expect_v1",
             "ax",
             "dom",
             "input",

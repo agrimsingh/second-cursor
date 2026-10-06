@@ -175,7 +175,7 @@ async function refTarget(tabId, ref) {
   return { point, levels };
 }
 
-export async function click(tabId, { ref, x, y }, guardObservation) {
+export async function click(tabId, { ref, x, y }, guardObservation, guardInput) {
   let point;
   if (ref != null && ref !== "")
     point = await timed(tabId, "locate", () => reachablePoint(`Ref ${ref}`, () => refTarget(tabId, ref)));
@@ -185,7 +185,10 @@ export async function click(tabId, { ref, x, y }, guardObservation) {
   await timed(tabId, "cursor", () => pointTo(tabId, point, 1));
   if (ref != null && ref !== "") point = await reachablePoint(`Ref ${ref}`, () => refTarget(tabId, ref));
   else await guardObservation?.();
-  const mouse = (params) => cdp(tabId, "Input.dispatchMouseEvent", { x: point.x, y: point.y, modifiers: 0, ...params });
+  const mouse = async (params) => {
+    if (params.type !== "mouseReleased") await guardInput?.();
+    return cdp(tabId, "Input.dispatchMouseEvent", { x: point.x, y: point.y, modifiers: 0, ...params });
+  };
   await timed(tabId, "input", async () => {
     await mouse({ type: "mouseMoved", button: "none", buttons: 0 });
     // Hover handlers can open menus or move the target before mouseDown. Re-hit-test the live ref at that point.
@@ -320,7 +323,7 @@ async function checkTypingTarget(send, objectId, { focus = false, frameId, owner
 
 let typingOperation = 0;
 
-export async function type(tabId, { ref, text, submit }) {
+export async function type(tabId, { ref, text, submit }, guardInput) {
   const objectGroup = `second-cursor-typing-${++typingOperation}`;
   const releases = new Set();
   try {
@@ -336,6 +339,7 @@ export async function type(tabId, { ref, text, submit }) {
       throw new BridgeError("failed", "Typing was not sent: no editable focus could be identified; use a fresh browser_snapshot ref");
     await checkTypingTarget(send, objectId);
     if (hasRef) {
+      await guardInput?.();
       await send("DOM.focus", { backendNodeId: id }).catch(error => { throw refError(ref, error); });
       if (text && !submit && !(await suggests(send, id).catch(() => true))) expectQuickReaction(tabId, QUICK_REACT_MS);
       pointTo(tabId, async () => {
@@ -354,23 +358,29 @@ export async function type(tabId, { ref, text, submit }) {
     };
     // Do all cursor/metadata work first, then recheck the live target immediately before each input dispatch.
     await verifyFocus();
-    if (text) await cdp(tabId, "Input.insertText", { text: String(text) });
+    if (text) {
+      await guardInput?.();
+      await cdp(tabId, "Input.insertText", { text: String(text) });
+    }
     if (submit) {
       if (text) await verifyFocus().catch(error => {
         throw new BridgeError("failed", `Text was inserted, but Enter was not sent: ${String(error.message ?? error).replace(/^Typing was not sent: /, "")}`);
       });
-      await pressKey(tabId, "Enter");
+      await pressKey(tabId, "Enter", guardInput);
     }
   } finally {
     await Promise.all([...releases].map(send => send("Runtime.releaseObjectGroup", { objectGroup }).catch(() => {})));
   }
 }
 
-export async function pressKey(tabId, keys) {
+export async function pressKey(tabId, keys, guardInput) {
   const { modifiers, key, command } = parseChord(keys);
   show(tabId);
   if (FOCUS_KEYS.has(key.key) && modifiers.every((m) => m.key === "Shift")) expectQuickReaction(tabId, QUICK_REACT_MS);
-  const send = (params) => cdp(tabId, "Input.dispatchKeyEvent", params);
+  const send = async (params) => {
+    if (params.type !== "keyUp") await guardInput?.();
+    return cdp(tabId, "Input.dispatchKeyEvent", params);
+  };
   let bits = 0;
   const held = [];
   let mainDown = false;
@@ -403,13 +413,14 @@ export async function pressKey(tabId, keys) {
   }
 }
 
-export async function scroll(tabId, direction, amount) {
+export async function scroll(tabId, direction, amount, guardInput) {
   const distance = 100 * Math.min(Math.max(Number(amount) || 3, 1), 50);
   const delta = { up: [0, -distance], down: [0, distance], left: [-distance, 0], right: [distance, 0] }[direction];
   if (!delta) throw new BridgeError("invalid_argument", "direction must be up, down, left or right");
   const { cssLayoutViewport: viewport } = await cdp(tabId, "Page.getLayoutMetrics");
   const point = { x: viewport.clientWidth / 2, y: viewport.clientHeight / 2 };
   await pointTo(tabId, point);
+  await guardInput?.();
   await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", ...point, deltaX: delta[0], deltaY: delta[1] });
 }
 
@@ -420,20 +431,24 @@ function pngSize(base64) {
 }
 
 // Captured at 1 image pixel per CSS pixel so screenshot coordinates are directly clickable.
-export async function screenshot(tabId) {
+export async function screenshot(tabId, guard) {
+  await guard?.();
   const { cssVisualViewport: vp } = await cdp(tabId, "Page.getLayoutMetrics");
+  await guard?.();
   const { result } = await cdp(tabId, "Runtime.evaluate", { expression: "window.devicePixelRatio", returnByValue: true });
   const dpr = Number(result?.value) || 1;
-  const { data } = await concealDuring(tabId, () =>
-    withTimeout(
+  await guard?.();
+  const { data } = await concealDuring(tabId, async () => {
+    await guard?.();
+    return withTimeout(
       cdp(tabId, "Page.captureScreenshot", {
         format: "png",
         clip: { x: vp.pageX, y: vp.pageY, width: vp.clientWidth, height: vp.clientHeight, scale: 1 / dpr },
       }),
       15000,
       "Screenshot timed out; Chrome is not rendering this tab",
-    ),
-  );
+    );
+  });
   const { width, height } = pngSize(data);
   return { data, width, height, scale: 1 };
 }

@@ -101,11 +101,13 @@ const SCROLLS = new Set(["auto", "scroll", "overlay"]);
  * auto or scroll box whose content reaches past its edges. Layout bounds are absolute and unclipped, so a scrolled
  * panel's content reaches past its top instead, and content counts only for its nearest box that clips.
  */
-async function domFacts(send) {
+async function domFacts(send, strict = false) {
   const { documents = [], strings = [] } = await send("DOMSnapshot.captureSnapshot", { computedStyles: FACT_STYLES });
+  if (strict && !documents.length) throw Error("Privacy fact coverage is incomplete");
   const facts = new Map();
   const note = (id, fact) => facts.set(id, { hint: "", ...facts.get(id), ...fact });
   for (const { nodes, layout } of documents) {
+    if (strict) for (const id of nodes.backendNodeId) note(id, { observed: true });
     const box = new Map(layout.nodeIndex.map((node, i) => [node, i]));
     const style = (node, k) => (box.has(node) ? strings[layout.styles[box.get(node)][k]] : "");
     const attr = (node, name) => {
@@ -125,9 +127,35 @@ async function domFacts(send) {
       : descendants[node].map(textContent).join("");
     const sensitivityName = (node) => [attr(node, "aria-label"), attr(node, "placeholder"), attr(node, "title")]
       .filter(Boolean).join(" ");
+    const nativeValues = new Map();
+    if (strict) for (const sparse of [nodes.inputValue, nodes.textValue]) {
+      for (let i = 0; i < (sparse?.index?.length ?? 0); i++) {
+        const at = sparse.index[i], value = sparse.value?.[i];
+        if (!Number.isInteger(at) || at < 0 || at >= nodes.backendNodeId.length
+          || !Number.isInteger(value) || value < -1 || value >= strings.length)
+          throw Error("Native field value coverage is incomplete");
+        nativeValues.set(at, value === -1 ? "" : strings[value]);
+      }
+    }
+    if (strict) {
+      const overlays = new Set();
+      for (let node = 0; node < nodes.parentIndex.length; node++) {
+        if (attr(node, "id") === "second-cursor-overlay" || overlays.has(nodes.parentIndex[node])) {
+          overlays.add(node);
+          note(nodes.backendNodeId[node], { expectExcluded: true });
+        }
+      }
+    }
     const sensitiveSelects = new Set();
     for (let node = 0; node < nodes.parentIndex.length; node++) {
       const tag = strings[nodes.nodeName[node]];
+      if (strict && tag === "SELECT") note(nodes.backendNodeId[node], { nativeSelectHost: true });
+      if (strict && ["INPUT", "TEXTAREA"].includes(tag)) {
+        note(nodes.backendNodeId[node], { nativeValueHost: true,
+          ...(nativeValues.has(node) ? { nativeValue: nativeValues.get(node) } : {}) });
+        if (nativeValues.has(node) && isSecretField({ type: attr(node, "type"), autocomplete: attr(node, "autocomplete"),
+          name: sensitivityName(node), value: nativeValues.get(node) })) note(nodes.backendNodeId[node], { secret: true });
+      }
       if (!["INPUT", "TEXTAREA", "SELECT"].includes(tag)) continue;
       if (isSecretField({ type: attr(node, "type"), autocomplete: attr(node, "autocomplete"),
         name: sensitivityName(node), value: "present" })) {
@@ -382,7 +410,7 @@ export const isolatedFrame = (tabId, ordinal) => isolatedFrames.get(tabId)?.get(
  * iframes, so each frame is read on its own: through its process's session when Chrome isolated it, else by frame id.
  * Node ids are namespaced per frame; each node carries its ref and its DOM facts.
  */
-async function collect(tabId) {
+async function collect(tabId, { strict = false, guard = async () => {} } = {}) {
   const all = [];
   let reads = 0;
   const read = async (renderer, frameId, owner) => {
@@ -391,6 +419,76 @@ async function collect(tabId) {
       renderer.send("Accessibility.getFullAXTree", frameId !== renderer.frameId ? { frameId } : {}),
       renderer.facts,
     ]);
+    if (strict && !nodes.some(n => !n.parentId && n.role?.value === "RootWebArea"))
+      throw Error("Frame accessibility coverage is incomplete");
+    if (strict) {
+      // Chrome exposes native input/textarea value renderers in AX but omits those user-agent shadow nodes from
+      // DOMSnapshot. They duplicate their DOM-backed host's full AX value and are never independent targets.
+      // Exclude that internal subtree instead of trusting uncovered text; an unreadable host cannot establish
+      // absence when one of its internal renderers still contains text. Every other AX backend still needs facts.
+      const byID = new Map(nodes.map(n => [n.nodeId, n]));
+      const coveredModals = new Set(nodes.filter(n => !n.ignored && ["dialog", "alertdialog"].includes(n.role?.value)
+        && facts.get(n.backendDOMNodeId)?.observed).map(n => n.backendDOMNodeId));
+      const inactiveFor = node => node?.ignored === true && node.role?.value === "none"
+        && !node.name?.value && node.value?.value == null
+        ? (node.ignoredReasons ?? []).filter(reason => reason.name === "activeModalDialog")
+          .flatMap(reason => reason.value?.relatedNodes ?? []).map(related => related.backendDOMNodeId)
+          .filter(id => coveredModals.has(id)) : [];
+      for (const node of nodes) {
+        // aria-owns may place a real suggestion/listbox subtree beneath an input in AX. DOM-backed descendants
+        // are ordinary public content, not native internals, and must remain visible to text/gone conditions.
+        if (node.backendDOMNodeId && facts.get(node.backendDOMNodeId)?.observed) continue;
+        // A native SELECT's empty menu container is exposed only in AX. Its options remain ordinary DOM-backed
+        // nodes and must all be present in the captured facts; omit only this structural wrapper, never its text
+        // or descendants. This is deliberately distinct from the duplicate INPUT/TEXTAREA value renderers.
+        const selectParent = byID.get(node.parentId);
+        const nativeSelectPopup = node.role?.type === "internalRole" && node.role.value === "MenuListPopup"
+          && !node.name?.value && (node.value?.value == null || node.value.value === "")
+          && facts.get(selectParent?.backendDOMNodeId)?.nativeSelectHost
+          && (node.childIds ?? []).every(id => {
+            const child = byID.get(id);
+            return child?.backendDOMNodeId && facts.get(child.backendDOMNodeId)?.observed;
+          });
+        if (nativeSelectPopup) { node.expectExcluded = true; continue; }
+        // showModal reparents Chrome's empty, ignored native renderers outside their hosts. A SELECT wrapper
+        // retains its option leaves, so each child must itself be covered, empty, ignored and bound to the same
+        // covered modal. Never accept an unknown child, readable content or an unchecked descendant subtree.
+        const inactiveModalRenderer = inactiveFor(node).some(modal => (node.childIds ?? []).every(id => {
+          const child = byID.get(id);
+          return child?.parentId === node.nodeId && facts.get(child.backendDOMNodeId)?.observed
+            && !(child.childIds?.length) && inactiveFor(child).includes(modal);
+        }));
+        if (inactiveModalRenderer) continue;
+        const visited = new Set();
+        let parent = byID.get(node.parentId), host;
+        while (parent && !visited.has(parent.nodeId)) {
+          visited.add(parent.nodeId);
+          const covered = facts.get(parent.backendDOMNodeId);
+          if (covered?.observed) {
+            if (covered.nativeValueHost) host = parent;
+            break;
+          }
+          parent = byID.get(parent.parentId);
+        }
+        if (host) {
+          const hostFact = facts.get(host.backendDOMNodeId);
+          const hostValue = host.value?.value ?? hostFact.nativeValue;
+          // A concurrent aria-owns update can also create an uncovered descendant. Only plain value-rendering
+          // nodes whose content is already represented by the known host qualify; distinct text, values or
+          // interactive controls are incomplete coverage, never silently absent.
+          const duplicateRole = ["generic", "none", "StaticText", "InlineTextBox"].includes(node.role?.value);
+          const fragments = [node.name?.value, node.value?.value].filter(v => v != null && String(v) !== "");
+          const hostTexts = [hostValue, host.name?.value].filter(v => v != null).map(String);
+          if (hostValue == null && fragments.length && !node.ignored)
+            throw Error("Native field value coverage is incomplete");
+          if (!duplicateRole || fragments.some(v => !hostTexts.some(text => text.includes(String(v)))))
+            throw Error("Native field descendant coverage is incomplete");
+          node.expectExcluded = true;
+        } else if (node.backendDOMNodeId && !facts.get(node.backendDOMNodeId)?.observed) {
+          throw Error("Privacy fact coverage is incomplete");
+        }
+      }
+    }
     const id = (nodeId) => `${key}:${nodeId}`;
     const prefix = renderer.ordinal ? `f${renderer.ordinal}` : "";
     const own = nodes.map((n) => ({
@@ -412,30 +510,72 @@ async function collect(tabId) {
       own
         .filter((n) => n.role?.value === "Iframe" && !n.ignored && !n.tiny && n.backendDOMNodeId && !n.childIds?.length)
         .map(async (iframe) => {
-          const { node } = await renderer.send("DOM.describeNode", { backendNodeId: iframe.backendDOMNodeId }).catch(() => ({}));
+          const { node } = await renderer.send("DOM.describeNode", { backendNodeId: iframe.backendDOMNodeId }).catch(error => {
+            if (strict) throw error;
+            return {};
+          });
           const frameId = node?.frameId;
-          if (!frameId) return;
+          if (!frameId) {
+            if (strict) throw Error("Frame coverage is incomplete");
+            return;
+          }
           // A frame that detaches mid-read leaves its iframe line empty rather than failing the snapshot.
           const session = frameSession(tabId, frameId);
-          if (!session) return read(renderer, frameId, iframe).catch(() => {});
-          const send = (method, params) => frameCDP(tabId, frameId, method, params, { expectedSession: session });
+          if (!session) return read(renderer, frameId, iframe).catch(error => { if (strict) throw error; });
+          const send = async (method, params) => {
+            await guard();
+            return frameCDP(tabId, frameId, method, params, { expectedSession: session });
+          };
           const ordinal = frameOrdinal(tabId, frameId, session, renderer.ordinal, iframe.backendDOMNodeId);
-          const facts = domFacts(send).catch(() => new Map());
-          return read({ send, ordinal, frameId, facts }, frameId, iframe).catch(() => {});
+          const facts = domFacts(send, strict).catch(error => { if (strict) throw error; return new Map(); });
+          return read({ send, ordinal, frameId, facts }, frameId, iframe).catch(error => { if (strict) throw error; });
         }),
     );
   };
-  const send = (method, params) => cdp(tabId, method, params);
-  await read({ send, ordinal: 0, frameId: null, facts: domFacts(send).catch(() => new Map()) }, null, null);
+  const send = async (method, params) => { await guard(); return cdp(tabId, method, params); };
+  await read({ send, ordinal: 0, frameId: null, facts: domFacts(send, strict).catch(error => { if (strict) throw error; return new Map(); }) }, null, null);
   return all;
+}
+
+/** Complete, untruncated public AX content for postconditions, never serialized into a tool reply. A failed frame
+ * or privacy-fact read is an unavailable check, not evidence that text disappeared. Document identities exclude
+ * URLs and are checked around the read so a navigation cannot combine the old and new page into one sample. */
+export async function conditionSnapshot(tabId, guard = async () => {}) {
+  const identity = async () => {
+    await guard();
+    const { frameTree } = await cdp(tabId, "Page.getFrameTree");
+    if (!frameTree?.frame?.id || !frameTree.frame.loaderId) throw Error("Document identity unavailable");
+    const frames = [];
+    const walk = tree => {
+      frames.push([tree.frame.id, tree.frame.loaderId ?? "", frameSession(tabId, tree.frame.id) ?? ""]);
+      for (const child of tree.childFrames ?? []) walk(child);
+    };
+    walk(frameTree);
+    return { document: `${frameTree.frame.id}:${frameTree.frame.loaderId}`, frames: JSON.stringify(frames.sort()) };
+  };
+  const before = await identity();
+  const nodes = await collect(tabId, { strict: true, guard });
+  const byId = new Map(nodes.map(n => [n.nodeId, n]));
+  const root = nodes.find(n => !n.parentId);
+  if (!root) throw Error("Accessibility coverage is incomplete");
+  annotate(root, byId);
+  const after = await identity();
+  if (before.frames !== after.frames) throw Error("Document changed during the condition check");
+  return { document: after.document, elements: nodes.filter(n => !n.ignored && !n.withinSecret && !n.expectExcluded
+    && !["RootWebArea", "Iframe", ...SKIPPED].includes(n.role?.value)).map(n => ({
+      ref: n.ref, name: readName(n, String(n.name?.value ?? "")),
+      value: n.secret || n.secretValue || (n.value?.value == null && n.nativeValue === undefined)
+        ? null : String(n.value?.value ?? n.nativeValue),
+      secret: !!(n.secret || n.secretValue),
+    })) };
 }
 
 export async function snapshot(tabId) {
   return renderOutline(await collect(tabId));
 }
 
-export async function structuredSnapshot(tabId) {
-  const nodes=await collect(tabId);
+export async function structuredSnapshot(tabId, guard) {
+  const nodes=await collect(tabId, { guard });
   const outline=renderOutline(nodes);
   const elements=nodes.filter(n=>!n.ignored&&n.backendDOMNodeId&&!n.withinSecret).map(n=>{
     const value=redact(n,String(n.value?.value??""));

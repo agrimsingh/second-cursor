@@ -89,3 +89,5 @@ The signed debug app built successfully. Focused validation passed 188 extension
 The existing live browser regression suite passed all seven scenarios in `e2e/artifacts/20261006-143154/`: checkbox settling, delayed search, truthful outcomes, REPL uncertainty, freshness guards, live locator sequences and trusted hover.
 
 The full release gate is not claimed here. The existing public catalog size budget was already exceeded by the baseline; that unrelated budget remains outside this adaptation experiment. The installed application has not been replaced by the candidate.
+
+Follow-up: this exact candidate was subsequently pushed to main and installed. Its installation check and the next browser-postcondition comparison are recorded in [the browser-expect verification](verification-browser-expect-2026-10-06.md).

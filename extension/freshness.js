@@ -49,10 +49,11 @@ chrome.debugger.onDetach.addListener(({ tabId }) => {
   for (const key of contexts.keys()) if (key.startsWith(tabId + ":")) contexts.delete(key);
 });
 
-async function frameRevision(tabId, frameId) {
+async function frameRevision(tabId, frameId, guard) {
   const key = `${tabId}:${frameId}`;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
+      await guard?.();
       let contextId = contexts.get(key);
       if (contextId == null) {
         ({ executionContextId: contextId } = await frameCDP(tabId, frameId, "Page.createIsolatedWorld", {
@@ -60,6 +61,7 @@ async function frameRevision(tabId, frameId) {
         }));
         contexts.set(key, contextId);
       }
+      await guard?.();
       const { result, exceptionDetails } = await frameCDP(tabId, frameId, "Runtime.evaluate", {
         expression: PROBE, contextId, returnByValue: true,
       });
@@ -73,11 +75,12 @@ async function frameRevision(tabId, frameId) {
 /** Covers the DOM, form properties and viewport of every document Chrome exposes, including isolated frames.
  * Canvas/video paint and render-only layout are not DOM revisions; live targets still need actionability checks.
  */
-export async function browserRevision(tabId) {
+export async function browserRevision(tabId, guard) {
+  await guard?.();
   const { frameTree } = await cdp(tabId, "Page.getFrameTree");
   const frames = [];
   const walk = tree => { frames.push(tree.frame.id); for (const child of tree.childFrames ?? []) walk(child); };
   walk(frameTree);
-  const revisions = await Promise.all(frames.sort().map(async id => `${id}:${await frameRevision(tabId, id)}`));
+  const revisions = await Promise.all(frames.sort().map(async id => `${id}:${await frameRevision(tabId, id, guard)}`));
   return revisions.join("|");
 }

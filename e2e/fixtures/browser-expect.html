@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Browser postcondition workspace</title>
+<style>
+  body { font:16px system-ui; color:#172330; background:#f4f6f8; margin:0; }
+  main { max-width:900px; padding:28px; margin:auto; }
+  section { padding:20px; margin:18px 0; background:white; border:1px solid #d8dfe7; border-radius:12px; }
+  button,input { font:inherit; padding:10px; margin:6px; }
+  input { width:420px; } #status { min-height:24px; font-weight:600; }
+  #scroll-status { position:fixed; right:12px; top:12px; background:white; padding:12px; }
+  dialog { border:1px solid #aab6c5; border-radius:12px; padding:24px; }
+  .spacer { height:1800px; }
+</style>
+<main id="workspace">
+  <h1>Release operations</h1><p id="case-description">Loading the assigned record.</p>
+  <section><h2 id="record-title">Assigned record</h2><p id="revision"></p>
+    <p id="instruction"></p><label for="note">Approved note</label><input id="note">
+    <div><button id="save">Save record</button><button id="reload">Reload record</button></div>
+    <p id="status" role="status">Ready for review.</p>
+  </section>
+  <section><h2>Adjacent record, preserve unchanged</h2><p id="canary"></p></section>
+  <section id="controls"><h2>Focused controls</h2>
+    <button id="noop">Do nothing</button><button id="replace">Replace field</button>
+    <button id="long">Set long value</button><button id="wrong">Set wrong suffix</button>
+    <button id="dialog">Open JavaScript confirmation</button><button id="navigate">Navigate record</button>
+    <button id="stage">Stage one</button>
+    <label for="value">Exact value</label><input id="value" value="before">
+    <label for="typing">Typing target</label><input id="typing" value="">
+    <label for="password">Password</label><input id="password" type="password" value="fixture-secret-postcondition">
+    <div hidden id="hidden">Hidden ready sentinel</div>
+  </section>
+  <dialog id="review"><h2>Review before saving</h2><p>Check the approved note before recording it.</p>
+    <button id="confirm">Confirm save</button><button id="cancel">Back to editing</button></dialog>
+  <div id="scroll-status" role="status">Scroll pending</div><div class="spacer"></div>
+</main>
+<script>
+(() => {
+  const query = new URLSearchParams(location.search), scenario = query.get('case'), decoy = query.get('decoy') === '1';
+  const $ = id => document.getElementById(id), delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  let record, config, saving = false;
+  const request = async (path, body) => {
+    const response = await fetch(path, body === undefined ? {cache:'no-store'} : {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    return response.json();
+  };
+  window.__expectEvents = [];
+  const event = name => { window.__expectEvents.push(name); return request('/event', {name}); };
+  async function load() {
+    const state = await request('/state'); record = state.target; config = state.config;
+    $('case-description').textContent = 'Update only the assigned release record, using its current approved note.';
+    $('record-title').textContent = 'Record ' + record.id;
+    $('revision').textContent = 'Revision ' + record.revision;
+    $('instruction').textContent = 'Current approved note: ' + state.approved_note;
+    $('note').value = state.approved_note;
+    $('canary').textContent = state.unrelated.id + ': ' + state.unrelated.note;
+    $('status').textContent = decoy ? 'Saved record ' + record.id :
+      query.get('landed') === '1' ? 'Navigation complete' :
+      scenario === 'preexisting' ? 'Already saved' : 'Ready for review.';
+    $('save').disabled = decoy;
+  }
+  async function submit() {
+    if (saving || decoy) return;
+    saving = true; $('save').disabled = true;
+    // Deliberately start the request after an otherwise quiet timer. No hidden
+    // evaluator mutation makes the tool wait; this is the application's work.
+    await delay(config.delay_ms);
+    const result = await request('/save', {id:record.id, revision:record.revision, note:$('note').value});
+    if (result.ok) { record = result.target; $('status').textContent = 'Saved record ' + record.id; }
+    else if (result.error === 'stale_revision') $('status').textContent = 'Record changed; reload before saving.';
+    else if (result.error === 'pending') $('status').textContent = 'Save is still pending.';
+    else $('status').textContent = 'Save refused: ' + result.error;
+    saving = false; $('save').disabled = false;
+  }
+  $('save').onclick = async () => {
+    if (scenario === 'delayed_modal') {
+      $('save').disabled = true; await delay(config.delay_ms); $('review').showModal();
+      $('status').textContent = 'Review before saving';
+    } else await submit();
+  };
+  $('confirm').onclick = () => { $('review').close(); submit(); };
+  $('cancel').onclick = () => { $('review').close(); $('save').disabled = false; };
+  $('reload').onclick = load;
+  $('noop').onclick = () => event('noop');
+  $('stage').onclick = () => { event('stage'); $('status').textContent = 'Stage one complete'; };
+  $('replace').onclick = () => { const old = $('value'), fresh = old.cloneNode(); fresh.value = 'after'; old.replaceWith(fresh); event('replace'); };
+  $('long').onclick = () => { $('value').value = 'L'.repeat(1800) + '-correct-tail'; event('long'); };
+  $('wrong').onclick = () => { $('value').value = 'L'.repeat(1800) + '-wrong-tail'; event('wrong'); };
+  $('dialog').onclick = () => { event('dialog'); window.confirm('Confirm this local fixture action?'); };
+  $('navigate').onclick = () => { event('navigate'); location.href = '/browser-expect.html?case=navigation&landed=1'; };
+  $('typing').onkeydown = event => { if (event.key === 'Enter') $('status').textContent = 'Key accepted'; };
+  window.addEventListener('scroll', () => { $('scroll-status').textContent = 'Scroll observed'; }, {passive:true});
+  load();
+})();
+</script>
+</html>
