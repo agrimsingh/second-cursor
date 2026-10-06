@@ -118,7 +118,7 @@ Second Cursor runs no model of its own; choose one in your connected client. The
 
 ## Safety
 
-- **App approval:** the first time an agent reads or operates an app, you choose Allow for this session, Always allow, or Deny. Your own tabs, browsing history, clipboard, raw DevTools, and file uploads always ask. `"approvals": "allow"` in `config.json` grants all of these without asking. See [the client contract](docs/api.md#approvals).
+- **App approval:** the first time an agent reads or operates an app, you choose Allow for this session, Always allow, or Deny. Your own tabs, browsing history, clipboard, raw DevTools, and file uploads ask every time, unless `"approvals": "allow"` in `config.json` grants all of these without asking. See [the client contract](docs/api.md#approvals).
 - **Not a sandbox:** approvals limit what an agent can do through Second Cursor's tools. An agent that can also run shell commands as you could edit the config or start its own instance, so treat approvals as a guard against mistakes, not against a determined agent.
 - **Pause:** the menu bar item pauses all agent input; **Tasks…** provides controls for one task. `SecondCursor --pause` / `--resume` control the global pause from a shell. Already delivered input cannot be undone.
 - **Blocked apps:** `blockedBundleIDs` in `config.json` (password managers, Keychain Access, System Settings by default) can never be launched or touched.
