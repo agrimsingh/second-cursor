@@ -2456,7 +2456,7 @@ def browser_cursor(ctx):
                   travel - still >= arrives - 0.05, f"{travel:.3f} s vs {still:.3f} s with no travel")
         ctx.check("and no more than two 60 Hz frames past it", travel - still < arrives + 2 / 60,
                   f"{travel:.3f} s vs {still:.3f} s")
-        state = overlay(tid2)
+        state = poll(lambda: overlay(tid2), lambda s: at(s, *far))
         ctx.check("it was dispatched at the cursor's target", at(state, *far), state)
 
         request = urllib.request.Request(

@@ -436,14 +436,19 @@ function overlayProgram(c) {
       if (o.queue.length) aim(o.queue.shift(), true);
     }
 
+    // Solved exactly: pointer input waits for the first crossing, which a fixed-step integration delays by ~50 ms.
     function spring(value, velocity, goal, response, dt) {
-      const w = (2 * Math.PI) / response;
-      for (let left = dt; left > 1e-9; left -= 1 / 240) {
-        const h = Math.min(left, 1 / 240);
-        velocity += (-w * w * (value - goal) - 2 * 0.86 * w * velocity) * h;
-        value += velocity * h;
-      }
-      return [value, velocity];
+      const w = (2 * Math.PI) / response,
+        z = 0.86,
+        wd = w * Math.sqrt(1 - z * z);
+      const x = value - goal,
+        decay = Math.exp(-z * w * dt),
+        cos = Math.cos(wd * dt),
+        sin = Math.sin(wd * dt);
+      return [
+        goal + decay * (x * cos + ((velocity + z * w * x) / wd) * sin),
+        decay * (velocity * cos - ((w * w * x + z * w * velocity) / wd) * sin),
+      ];
     }
 
     function setCaption(next, instant) {
