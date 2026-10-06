@@ -22,12 +22,13 @@ enum BrowserPolicy {
     /// also asks before browser_command or browser_repl does the same thing.
     static let discreteTool: [String: String] = [
         "click": "browser_click", "check": "browser_click", "perform_action": "browser_click",
-        "type": "browser_type", "fill": "browser_type", "press_key": "browser_press_key",
+        "select_option": "browser_click", "drag": "browser_click", "dialog": "browser_click",
+        "type": "browser_type", "fill": "browser_type", "paste": "browser_type", "press_key": "browser_press_key",
         "scroll": "browser_scroll", "screenshot": "browser_screenshot",
+        "dom_snapshot": "browser_snapshot", "inspect": "browser_snapshot", "query": "browser_snapshot",
         "back": "browser_navigate", "forward": "browser_navigate", "reload": "browser_navigate",
     ]
 
-    /// The discrete tools a browser_command call acts as, its batch steps included.
     static func discreteTools(_ raw: [String: Value]) -> Set<String> {
         guard let operation = raw["operation"]?.stringValue else { return [] }
         if operation == "batch", let steps = raw["steps"]?.arrayValue {

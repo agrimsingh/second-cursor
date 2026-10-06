@@ -4,7 +4,8 @@
     python3 scripts/timings.py [--days N] [--tool NAME] [--top N] [timings.jsonl ...]
 
 Reads ~/Library/Logs/SecondCursor/timings.jsonl and the file it last rotated to (SC_HOME/logs under SC_HOME). Tools
-are listed by total time spent, each with its calls, failures, p50/p75/p95 ms, and its slowest phases at p50/p75.
+are listed by total time spent, each with its calls, failures, p50/p75/p95 ms, and its slowest phases at p50/p75 over
+the calls that had them ("in N" when not every call did).
 Phases nest (ext.action holds ext.cursor, ext.settled holds ext.settled_*), so they do not add up to the call. The
 browser round trip (bridge, bridge.tab.*, ext.total) is the whole call for browser tools and is left out.
 """
@@ -62,9 +63,10 @@ def main():
         ms = [row["ms"] for row in rows]
         names = {name for row in rows for name in row.get("phases", {})
                  if name not in ("bridge", "ext.total") and not name.startswith("bridge.tab")}
-        phases = {name: [row.get("phases", {}).get(name, 0) for row in rows] for name in names}
+        phases = {name: [row["phases"][name] for row in rows if name in row.get("phases", {})] for name in names}
         slowest = sorted(names, key=lambda name: -pct(phases[name], 75))[: args.top]
         shown = ", ".join(f"{name} {pct(phases[name], 50):.0f}/{pct(phases[name], 75):.0f}"
+                          + (f" in {len(phases[name])}" if len(phases[name]) < len(rows) else "")
                           for name in slowest if pct(phases[name], 75) >= 1)
         failed = sum(1 for row in rows if not row.get("ok", True))
         print(f"{tool:<24}{len(rows):>7}{failed:>8}{pct(ms, 50):>7.0f}{pct(ms, 75):>7.0f}{pct(ms, 95):>7.0f}   {shown}")

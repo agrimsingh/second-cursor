@@ -11,7 +11,6 @@ final class BrowserREPL: @unchecked Sendable {
     static let outputLimit = 40_000
     static let memoryBudget: UInt64 = 1 << 30
 
-    /// Every tool a script can act as, so `confirmationRequiredTools` naming any of them asks before a script runs.
     static let actsAs: Set<String> = Set(Session.methods.compactMap { methodTools[$0] })
         .union(Session.operations.compactMap { BrowserPolicy.discreteTool[$0] })
     private static let methodTools = [

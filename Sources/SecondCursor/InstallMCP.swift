@@ -151,14 +151,16 @@ enum InstallMCP {
         }
         // The files hold bearer tokens and API keys, so they and their backups are always private, even when an
         // earlier install or the client itself left them readable by other accounts.
+        let backup = target.appendingPathExtension("bak")
         if unchanged {
-            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+            for path in [target, backup] where fm.fileExists(atPath: path.path) {
+                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+            }
             return ["\(target.path): \(merge.change); nothing to write"]
         }
         try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
         var note = "created"
         if original != nil {
-            let backup = target.appendingPathExtension("bak")
             try? fm.removeItem(at: backup)
             try fm.copyItem(at: target, to: backup)
             try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)

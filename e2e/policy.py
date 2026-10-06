@@ -213,7 +213,6 @@ DENIAL = "local approval denied"
 @scenario
 def approvals_deny_mode_gates_without_ui(ctx):
     """Every local approval path must refuse immediately, with the user-denial error, and show nothing."""
-    # Browser calls resolve their browser before any gate, so the browser checks below need one connected.
     instance = harness.TestInstance(
         {"approvals": "deny", "appApproval": "prompt", "confirmationRequiredTools": ["list_windows"]},
         browser=True,

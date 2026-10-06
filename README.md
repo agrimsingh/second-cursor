@@ -161,7 +161,7 @@ python3 e2e/cursor.py         # arrow and menu-bar presence, drawn on the agent 
 python3 e2e/clicks.py         # every pixel click, double-click and drag acts exactly once
 python3 e2e/latency.py        # per-call timings, written to latency.json (--quiet-ms N tries browserQuietMs)
 python3 e2e/find.py           # find_elements, act, the compact tool surface
-python3 e2e/latency.py --ratchet  # also find.py: lower e2e/ratchets.json ceilings on characters read
+python3 e2e/latency.py --ratchet  # also find.py: set or lower e2e/ratchets.json ceilings, written only if the run passes
 python3 scripts/timings.py    # where your own app's calls spend time ("recordTimings": true)
 python3 e2e/repl.py           # browser_repl: persistence, limits, sandbox, Playwright locators
 python3 e2e/tasks.py          # task ownership, pause/takeover/resume, restart recovery

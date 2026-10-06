@@ -196,7 +196,6 @@ public final class ActionLog: @unchecked Sendable {
 
 /// One line per tool call when `recordTimings` is on. Written off the call's path, unlike the action log.
 public final class TimingLog: @unchecked Sendable {
-    /// The log may stay on for months on the user's own app, so past this size it moves to `timings.jsonl.1`.
     static let rotateBytes: UInt64 = 32 << 20
     private let queue = DispatchQueue(label: "dev.secondcursor.timinglog")
     public init() {}

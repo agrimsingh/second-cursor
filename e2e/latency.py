@@ -157,7 +157,6 @@ def latency(ctx):
               f"(full tree {sizes['get_window_state full (links doc)'][0]})", True, scroll_sizes)
     ratchet.check(ctx, "native: full read of the links document, characters",
                   sizes["get_window_state full (links doc)"], GATED)
-    # Later rounds scroll back up; the first scroll down starts from the same place in every run.
     ratchet.check(ctx, "native: first scroll-down observation of the links document, characters", scroll_sizes[0], GATED)
     # An on-screen target also waits for the agent arrow's glide (capped at ~150 ms) so the arrow lands with the click.
     ctx.check("click observe=none stays fast (median under 250 ms, arrow glide included)",
@@ -218,7 +217,6 @@ def browser_latency(ctx):
         ctx.check(f"{label}: median {value:.0f} ms" + (f", reaction shown {shown[label]}" if label in shown else ""),
                   True, samples[label])
     summary = report_phases(ctx, phases)
-    # Later rounds see a page earlier rounds changed (more rows, a toggle closed again); the first round never does.
     for label, size in first_sizes.items():
         ratchet.check(ctx, f"browser: first observation after '{label}', characters", size, GATED)
     (ctx.run.dir / "browser-latency.json").write_text(json.dumps(

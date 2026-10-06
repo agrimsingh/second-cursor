@@ -152,6 +152,23 @@ extension ToolRouter {
         let caption: String?
     }
 
+    /// Every public tool a call does the work of, so `confirmationRequiredTools` naming any of them asks before it runs.
+    static func actsAs(_ name: String, _ args: Arguments) throws -> Set<String> {
+        var tools: Set<String> = [name]
+        switch name {
+        case "batch":
+            let steps = try args.objects("steps").compactMap { $0["tool"]?.stringValue?.lowercased() }
+            tools.formUnion(isTabBatch(name, args) ? steps.map { tabSteps[$0]?.tool ?? $0 } : steps)
+        case "browser_command":
+            tools.formUnion(BrowserPolicy.discreteTools(args.raw))
+        case "browser_repl":
+            tools.formUnion(BrowserREPL.actsAs)
+        default:
+            break
+        }
+        return tools
+    }
+
     static func isTabBatch(_ name: String, _ args: Arguments) -> Bool {
         name == "batch" && !(args.raw["tab_id"]?.isNull ?? true)
     }
