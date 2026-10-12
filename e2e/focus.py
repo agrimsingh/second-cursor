@@ -128,6 +128,14 @@ class FocusProbe:
         extra = ["--avoid", f"{avoid['x']},{avoid['y']},{avoid['width']},{avoid['height']}"] if avoid else []
         subprocess.run(["open", "-n", str(app), "--args", "--state", str(self.state_path), *extra],
                        check=True, capture_output=True, timeout=30)
+        return self.await_front("the probe app became active with a key window")
+
+    def reactivate(self, label):
+        """Brings the running probe back to the front after a setup step that activated another app by itself."""
+        subprocess.run(["open", str(build_probe_app())], check=True, capture_output=True, timeout=30)
+        return self.await_front(label)
+
+    def await_front(self, label):
         deadline, state = time.time() + 15, None
         while time.time() < deadline:
             state = self.read()
@@ -136,7 +144,7 @@ class FocusProbe:
                 if state["active"] and state["key"]:
                     break
             time.sleep(0.2)
-        self.ctx.require("the probe app became active with a key window", state and state["active"] and state["key"], state)
+        self.ctx.require(label, state and state["active"] and state["key"], state)
         time.sleep(0.5)
         self.baseline = self.read()
         front = observe()["frontmost"]
@@ -321,6 +329,8 @@ def focus_chrome_occluded(ctx):
         subprocess.run([
             "open", "-n", "-g", "-a", str(app), "--args",
             f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", "--use-mock-keychain",
+            # Chrome stops rendering a page whose window macOS reports fully covered, which empties its web tree.
+            "--disable-backgrounding-occluded-windows",
             f"--window-position={int(cover['x']) + 40},{int(cover['y']) + 40}", f"--window-size={width},{height}",
             f"{base}/focus/click.html?token={token}",
         ], check=True, capture_output=True, timeout=30)
@@ -328,10 +338,8 @@ def focus_chrome_occluded(ctx):
         wid, chrome_pid = window["id"], window["pid"]
         ctx.cleanups.append(lambda: stop_process(chrome_pid))
         time.sleep(1.5)
-        state = probe.read()
-        ctx.require("launching Chrome in the background left the probe active and key",
-                    state and state["active"] and state["key"], state)
-        probe.baseline = state
+        # Chrome for Testing activates itself at launch even under open -g; the subject here is the click, not the launch.
+        probe.reactivate("the probe is active and key again after Chrome's launch")
         cover = probe.window()
         window = ctx.wait_for_window("Chrome for Testing", pid=chrome_pid, title=token)
 
