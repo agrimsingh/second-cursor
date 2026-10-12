@@ -281,7 +281,7 @@ def approvals_deny_mode_gates_without_ui(ctx):
         entries and all("refused" in (e.get("detail") or "") for e in entries),
         entries[-5:],
     )
-    status, body = post_turn_ended(client, {})
+    status, body = post_turn_ended(client, {"session_id": client.session_id})
     ctx.check("turn end works in deny mode", status == 200 and body.get("ok") is True, (status, body))
 
 
@@ -471,9 +471,9 @@ def capture(ctx, window, name):
         ctx.screenshots.append(path.relative_to(ctx.run.dir).as_posix())
 
 
-def prompting_instance(ctx):
+def prompting_instance(ctx, browser=False):
     """A second, disposable instance with appApproval "prompt"; the default instance runs with it off."""
-    instance = harness.TestInstance({"appApproval": "prompt", "approvals": "prompt"})
+    instance = harness.TestInstance({"appApproval": "prompt", "approvals": "prompt"}, browser=browser)
     ctx.cleanups.append(lambda: instance.stop(keep_logs=ctx.run.dir / "prompting-instance"))
     client = harness.MCP(instance.url, instance.token, ctx.run.transcript)
     client.initialize()
@@ -560,7 +560,7 @@ def app_approval_prompt(ctx):
         )
     else:
         ctx.check("Allow for this session left the config unchanged", config_after == config_before, config_after)
-        status, body = post_turn_ended(client, {})
+        status, body = post_turn_ended(client, {"session_id": client.session_id})
         ctx.check(
             "turn end clears the session approval",
             status == 200 and isinstance(body, dict) and body.get("cleared_app_approvals", 0) >= 1,
@@ -571,7 +571,8 @@ def app_approval_prompt(ctx):
 @scenario
 def sensitive_browser_prompts(ctx):
     interactive()
-    _, client = prompting_instance(ctx)
+    # Without a connected browser the call stops at "Browser unavailable" before any approval step.
+    _, client = prompting_instance(ctx, browser=True)
     for operation, extra in [
         ("upload", {"files": ["/etc/hosts"]}),
         ("claim", {}),
@@ -596,7 +597,8 @@ def sensitive_browser_prompts(ctx):
         if "approval" in outcome[0].lower():
             ctx.check(f"unanswered {operation} prompt refused the call without dispatching", True)
         else:
-            ctx.check(f"a person approved {operation}; the call went on to dispatch", True, outcome[0])
+            ctx.check(f"a person approved {operation}; the call went on to dispatch",
+                      "unavailable" not in outcome[0].lower(), outcome[0])
 
 
 @scenario
@@ -604,7 +606,7 @@ def late_session_grant_after_turn_end(ctx):
     """Human-attended: click "Allow for this session" only after the harness says the turn ended. The late answer
     lets the waiting call through once, but must not carry the grant into the next turn."""
     interactive()
-    _, client = prompting_instance(ctx)
+    instance, client = prompting_instance(ctx)
     wid = ctx.launch_scratch_textedit("late-grant.txt", "late")["id"]
     outcome = []
 
@@ -618,13 +620,15 @@ def late_session_grant_after_turn_end(ctx):
     thread = threading.Thread(target=read)
     thread.start()
     ctx.require("reading an unapproved app shows a prompt", bool(prompt_windows(3)))
-    status, body = post_turn_ended(client, {})
+    status, body = post_turn_ended(client, {"session_id": client.session_id})
     ctx.require("the turn ends while the prompt is up", status == 200, (status, body))
     print('      turn ended: click "Allow for this session" now (30 s)')
     thread.join(35)
     if outcome != ["allowed"]:
         raise Skip(f"nobody clicked Allow for this session; late-grant path not exercised ({outcome})")
     ctx.check("the late answer let the waiting call through once", True)
+    approved = json.loads(instance.config_path.read_text()).get("approvedBundleIDs") or []
+    ctx.require('the answer was "Allow for this session", not "Always allow"', TEXTEDIT not in approved, approved)
     # Too short for a person to answer, so a pass can't come from someone clicking this check's own prompt.
     error = refused(lambda: client.call("get_window_state", window_id=wid, timeout_ms=400))
     ctx.check(
