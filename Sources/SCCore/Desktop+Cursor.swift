@@ -64,6 +64,26 @@ extension Desktop {
         return nil
     }
 
+    /// Whether the user cannot see any of the window: off the current Space, minimized, or behind other windows at
+    /// every sampled point. Chromium stops rendering pages in such windows.
+    static func isHidden(_ record: CGWindowRecord) -> Bool {
+        guard record.isOnScreen else { return true }
+        let above = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], record.id)
+            as? [[String: Any]] ?? []
+        let covers = above.compactMap { info -> CGRect? in
+            guard let window = CGWindowRecord(info), window.layer == 0, !isSecondCursor(window.pid),
+                  (info[kCGWindowAlpha as String] as? Double ?? 1) > 0.01 else { return nil }
+            return window.bounds
+        }
+        let b = record.bounds
+        return (1...3).allSatisfy { i in
+            (1...3).allSatisfy { j in
+                let point = CGPoint(x: b.minX + b.width * Double(i) / 4, y: b.minY + b.height * Double(j) / 4)
+                return covers.contains { $0.contains(point) }
+            }
+        }
+    }
+
     private static func isSecondCursor(_ pid: pid_t) -> Bool {
         if pid == getpid() { return true }
         guard let own = Bundle.main.bundleIdentifier else { return false }

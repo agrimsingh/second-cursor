@@ -926,11 +926,23 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             return result
         }
 
-        var builder = TreeBuilder(maxNodes: maxNodes)
         let app = AXUIElementCreateApplication(record.pid)
-        Timing.measure("walk") {
-            let menuBar = options.includeMenuBar ? app.element(kAXMenuBarAttribute) : nil
-            builder.build(window: window, menuBar: menuBar)
+        let menuBar = options.includeMenuBar ? app.element(kAXMenuBarAttribute) : nil
+        func walk() -> TreeBuilder {
+            var builder = TreeBuilder(maxNodes: maxNodes)
+            Timing.measure("walk") { builder.build(window: window, menuBar: menuBar) }
+            return builder
+        }
+        var builder = walk()
+        let webEngine = resolver.engine(record.pid) != .native
+        func hasPage() -> Bool { builder.nodes.contains { $0.role == "AXWebArea" } }
+        // Chromium builds a window's page tree about 2 s after the first accessibility client asks for it.
+        if webEngine, tree.snapshotID == nil, !hasPage() {
+            let deadline = Date().addingTimeInterval(3)
+            while !hasPage(), Date() < deadline {
+                usleep(250_000)
+                builder = walk()
+            }
         }
         let title = window.string(kAXTitleAttribute) ?? record.title
         var out = Timing.measure("render") {
@@ -984,6 +996,11 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
         result.elements = out.structured
         result.ocrCount = ocrCount
         result.capabilities = capabilities(record)
+        if webEngine, !hasPage(), Self.isHidden(record) {
+            result.hint = "No page content: Chromium-based apps stop rendering a page while its window is hidden "
+                + "(covered, minimized or on another Space), which removes the page from this tree. For a web page, use "
+                + "the browser tools; for an app, move_to_agent_display renders it again (tell the user, then return_window)."
+        }
         return result
     }
 

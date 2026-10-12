@@ -463,6 +463,7 @@ extension ToolRouter {
         if let base = snapshot.diffBase { json["diff_base"] = base }
         if let scope = snapshot.scope { json["scope"] = scope }
         if let label = snapshot.scopeLabel { json["scope"] = label }
+        if let hint = snapshot.hint { json["hint"] = hint }
         return json
     }
 

@@ -1384,7 +1384,7 @@ def wide_document(ctx, name, lines):
                     + "\\\n".join(lines) + "}")
     launched = ctx.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True, on_agent_display=True)
     ctx.kill_on_exit(launched["app"]["pid"])
-    return ctx.wait_for_window("TextEdit", pid=launched["app"]["pid"], title=name)
+    return ctx.settled_textedit(ctx.wait_for_window("TextEdit", pid=launched["app"]["pid"], title=name))
 
 
 def screenshot_shape(ctx, label, shot, image, window):

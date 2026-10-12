@@ -221,6 +221,8 @@ public struct WindowSnapshot: Sendable, Equatable {
     public var ocrCount: Int?
     public var ocrError: String?
     public var visualSettle: VisualSettleResult?
+    /// Why the tree may be missing content the window would normally show.
+    public var hint: String?
 
     public init(window: WindowInfo, snapshotID: String, tree: String, elementCount: Int, truncated: Bool,
                 isDiff: Bool = false, diffBase: String? = nil, scope: Int? = nil, screenshot: Screenshot? = nil) {
