@@ -943,6 +943,7 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
                 usleep(250_000)
                 builder = walk()
             }
+            tree.layoutFingerprint = TreeBuilder.layoutFingerprint(window: window)
         }
         let title = window.string(kAXTitleAttribute) ?? record.title
         var out = Timing.measure("render") {
