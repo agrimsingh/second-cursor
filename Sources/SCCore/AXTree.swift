@@ -165,7 +165,9 @@ struct TreeBuilder {
             }
             hasher.combine((values[7] as? NSNumber)?.boolValue)
             hasher.combine((values[8] as? NSNumber)?.boolValue)
-            let children = values[6] as? [AXUIElement] ?? []
+            // A button's frame is its hit target. Its internals are not, and some appear only once queried
+            // (macOS 26 adds a glyph group inside a window's zoom button), which would refuse the first action.
+            let children = role == kAXButtonRole ? [] : values[6] as? [AXUIElement] ?? []
             hasher.combine(children.count)
             if depth < 60 { pending.append(contentsOf: children.reversed().map { ($0, depth + 1) }) }
         }
