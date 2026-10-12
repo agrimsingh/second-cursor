@@ -311,35 +311,39 @@ def focus_concurrent_handoffs(ctx):
         ctx.check(f"every click in window {wid} landed where aimed", value == "AAAline one\nline twoZZZ", value)
 
 
-@scenario
-def focus_chrome_occluded(ctx):
+def covered_chrome(ctx, probe, base, token, *flags):
+    """Starts the probe and a Chrome for Testing window on the fixture page, fully under the probe."""
     app = chrome_for_testing()
     if not app:
         raise Skip("no Chrome for Testing under ~/.agent-browser/browsers or ~/Library/Caches/ms-playwright")
-    probe = FocusProbe(ctx)
     profile = pathlib.Path(tempfile.mkdtemp(prefix="sc-focus-chrome-", dir="/tmp"))
     # Runs after Chrome is stopped; its helper processes need a moment to release the profile.
     ctx.cleanups.append(lambda: (time.sleep(1), shutil.rmtree(profile, ignore_errors=True)))
+    # Window managers may resize the probe, so Chrome is placed inside wherever the probe really is.
+    probe.start()
+    cover = probe.window()["frame"]
+    width, height = min(900, int(cover["width"]) - 80), min(640, int(cover["height"]) - 80)
+    subprocess.run([
+        "open", "-n", "-g", "-a", str(app), "--args",
+        f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", "--use-mock-keychain", *flags,
+        f"--window-position={int(cover['x']) + 40},{int(cover['y']) + 40}", f"--window-size={width},{height}",
+        f"{base}/focus/click.html?token={token}",
+    ], check=True, capture_output=True, timeout=30)
+    window = ctx.wait_for_window("Chrome for Testing", title=f"{token} clicks=0", timeout=30)
+    ctx.cleanups.append(lambda: stop_process(window["pid"]))
+    time.sleep(1.5)
+    # Chrome for Testing activates itself at launch even under open -g; that is setup, not behavior under test.
+    probe.reactivate("the probe is active and key again after Chrome's launch")
+    return window["id"], window["pid"]
+
+
+@scenario
+def focus_chrome_occluded(ctx):
+    probe = FocusProbe(ctx)
     token = f"focus-{uuid.uuid4().hex[:8]}"
     with FixtureServer() as base:
-        # Window managers may resize the probe, so Chrome is placed inside wherever the probe really is.
-        probe.start()
-        cover = probe.window()["frame"]
-        width, height = min(900, int(cover["width"]) - 80), min(640, int(cover["height"]) - 80)
-        subprocess.run([
-            "open", "-n", "-g", "-a", str(app), "--args",
-            f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", "--use-mock-keychain",
-            # Chrome stops rendering a page whose window macOS reports fully covered, which empties its web tree.
-            "--disable-backgrounding-occluded-windows",
-            f"--window-position={int(cover['x']) + 40},{int(cover['y']) + 40}", f"--window-size={width},{height}",
-            f"{base}/focus/click.html?token={token}",
-        ], check=True, capture_output=True, timeout=30)
-        window = ctx.wait_for_window("Chrome for Testing", title=f"{token} clicks=0", timeout=30)
-        wid, chrome_pid = window["id"], window["pid"]
-        ctx.cleanups.append(lambda: stop_process(chrome_pid))
-        time.sleep(1.5)
-        # Chrome for Testing activates itself at launch even under open -g; the subject here is the click, not the launch.
-        probe.reactivate("the probe is active and key again after Chrome's launch")
+        # Chrome stops rendering a page whose window macOS reports fully covered, which empties its web tree.
+        wid, chrome_pid = covered_chrome(ctx, probe, base, token, "--disable-backgrounding-occluded-windows")
         cover = probe.window()
         window = ctx.wait_for_window("Chrome for Testing", pid=chrome_pid, title=token)
 
@@ -371,6 +375,32 @@ def focus_chrome_occluded(ctx):
         final = title()
         ctx.check("covered Chrome received exactly one DOM click", final.startswith(f"{token} clicks=1"), final)
         probe.check("after Chrome handled the click")
+
+
+@scenario
+def chrome_hidden_page_hint(ctx):
+    probe = FocusProbe(ctx)
+    token = f"focus-{uuid.uuid4().hex[:8]}"
+    with FixtureServer() as base:
+        wid, _ = covered_chrome(ctx, probe, base, token)
+        # The first read switches Chrome's accessibility on; a visible page needs about 2 s to appear after it.
+        ctx.tree(wid, include_screenshot=False)
+        time.sleep(4)
+        hidden = ctx.call("get_window_state", window_id=wid, full=True, include_screenshot=False)
+        ctx.require("a fully covered Chrome window shows its toolbar but not its page",
+                    "Address and search bar" in hidden["tree"] and "Click me" not in hidden["tree"], hidden["tree"][:600])
+        hint = hidden.get("hint", "")
+        ctx.check("the read says the page is paused because the window is hidden", "hidden" in hint and "covered" in hint, hint)
+        ctx.check("and points to the browser tools and move_to_agent_display",
+                  "browser tools" in hint and "move_to_agent_display" in hint, hint)
+
+        probe.stop()
+        shown, deadline = hidden, time.time() + 10
+        while "Click me" not in shown["tree"] and time.time() < deadline:
+            time.sleep(0.5)
+            shown = ctx.call("get_window_state", window_id=wid, full=True, include_screenshot=False)
+        ctx.check("once the cover is gone, the page is back in the tree", "Click me" in shown["tree"], shown["tree"][:600])
+        ctx.check("and the read carries no hint", "hint" not in shown, shown.get("hint"))
 
 
 @scenario
