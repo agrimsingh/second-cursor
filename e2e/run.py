@@ -486,8 +486,11 @@ class Context:
         if on_agent_display and not window.get("on_agent_display") and observe()["main_space_full_screen"]:
             raise Skip("the user is viewing a full-screen app, so the new window opened on a desktop Space macOS "
                        "won't let it leave (see launch_on_hidden_space); rerun from a desktop Space")
-        # TextEdit can finish adjusting its frame after launch_app returns (for example 658 -> 656 px wide).
-        # Wait for that fixture setup to settle before taking the snapshot used by coordinate actions.
+        return self.settled_textedit(window)
+
+    def settled_textedit(self, window):
+        """TextEdit can finish adjusting its frame after launch_app returns (for example 658 -> 656 px wide).
+        Wait for that fixture setup to settle before taking the snapshot used by coordinate actions."""
         deadline, stable_since = time.monotonic() + 3, time.monotonic()
         while time.monotonic() < deadline:
             time.sleep(0.1)
@@ -930,8 +933,9 @@ def tree_diffs(ctx):
 
 
 def shown(tree):
-    """What a full tree or a diff says is on screen now: a diff's '-' lines are gone."""
-    return "\n".join(line for line in tree.splitlines() if not line.startswith("-"))
+    """What a full tree or a diff says is on screen now: a diff's '-' lines are gone, and so are invisible
+    left-to-right marks (macOS 26 Calculator prefixes its display value with one)."""
+    return "\n".join(line for line in tree.splitlines() if not line.startswith("-")).replace("\u200e", "")
 
 
 def refused(ctx, tool, **args):
@@ -988,7 +992,7 @@ def action_observations(ctx):
     bad = refused(ctx, "click", window_id=wid, element_index=buttons["9"], observe="everything")
     ctx.check("an invalid observe value is refused before acting", bad and "observe" in bad, bad)
     after = ctx.call("get_window_state", window_id=wid, full=True)["tree"]
-    ctx.check("the refused calls did not press 9", 'value="778"' in after, after[:400])
+    ctx.check("the refused calls did not press 9", 'value="778"' in shown(after), after[:400])
 
 
 @scenario
@@ -1068,21 +1072,25 @@ def app_target(ctx):
     area = element_index(tree, "AXTextArea")
     frame = element_frame(tree, area) if area is not None else None
     ctx.require("text area and its frame are reported", frame is not None, tree[:400])
-    ctx.call("select_text", window_id=wid, element_index=area, text="line", selection_type="cursor_after", observe="none")
-    ctx.call("press_key", window_id=wid, key="Return", observe="none")
-    ctx.call("type_text", window_id=wid, text="next", observe="none")
-    value = value_of(ctx.tree(wid))
-    ctx.check('press_key accepts key="Return"', value == "line\nnext", value)
-
+    # Coordinates first: the first edit animates TextEdit's title-bar "Edited" button, which the layout guard
+    # rightly refuses to click through within a few milliseconds of a read.
     ctx.call("click", window_id=wid, x=frame[0] + 12, y=frame[1] + 6, click_count=2, mouse_button="left", observe="none")
     ctx.call("type_text", window_id=wid, text="WORD", observe="none")
     value = value_of(ctx.tree(wid))
-    ctx.check("click_count=2 double-clicked (the word was selected and replaced)", value == "WORD\nnext", value)
+    ctx.check("click_count=2 double-clicked (the word was selected and replaced)", value == "WORD", value)
+
+    ctx.call("select_text", window_id=wid, element_index=area, text="WORD", selection_type="cursor_after", observe="none")
+    ctx.call("press_key", window_id=wid, key="Return", observe="none")
+    ctx.call("type_text", window_id=wid, text="next", observe="none")
+    value = value_of(ctx.tree(wid))
+    ctx.check('press_key accepts key="Return"', value == "WORD\nnext", value)
     bad_button = refused(ctx, "click", window_id=wid, element_index=area, mouse_button="sideways")
     ctx.check("mouse_button is read as button", bad_button and "button" in bad_button, bad_button)
     bad_pages = refused(ctx, "scroll", window_id=wid, direction="down", pages="lots")
     ctx.check("pages is read as the scroll amount", bad_pages and "pages" in bad_pages, bad_pages)
-    ctx.check("pages=1 scrolls", ctx.call("scroll", window_id=wid, element_index=area, direction="down", pages=1).get("ok"))
+    # Two lines have nowhere to scroll, so an unconfirmed scroll still shows pages=1 was accepted.
+    unmoved = refused(ctx, "scroll", window_id=wid, element_index=area, direction="down", pages=1)
+    ctx.check("pages=1 is accepted as the scroll amount", unmoved is None or "scrolling was not confirmed" in unmoved, unmoved)
 
 
 def untitled_window(ctx, window):
@@ -1277,7 +1285,7 @@ def links_document(ctx, name, count=200, on_agent_display=True):
     launched = ctx.call("launch_app", app="TextEdit", urls=[str(path)], new_instance=True,
                         on_agent_display=on_agent_display)
     ctx.kill_on_exit(launched["app"]["pid"])
-    return ctx.wait_for_window("TextEdit", pid=launched["app"]["pid"], title=name)
+    return ctx.settled_textedit(ctx.wait_for_window("TextEdit", pid=launched["app"]["pid"], title=name))
 
 
 MOVED_LINE = re.compile(r"^~ (\d+) elements moved \(scroll or resize\); frames above are current", re.M)
@@ -1332,7 +1340,7 @@ def element_limit(ctx):
     ctx.check("max_elements=60 lists exactly 60 elements", cut["element_count"] == 60 and cut["truncated"],
               {k: cut[k] for k in ("truncated", "element_count")})
     ctx.check("the outline ends with a truncation footer", footer.startswith("… truncated at 60 elements; not shown: "), footer)
-    ctx.check('the footer names the omitted "Formatting" group', re.search(r'"Formatting" \(\d+ elements\)', footer), footer)
+    ctx.check('the footer names the omitted "font size" container', re.search(r'"font size" \(\d+ elements\)', footer), footer)
     ctx.check("the footer names the text area whose links were cut", re.search(r"\[\d+\] AXTextArea \(1\d\d elements\)", footer), footer)
     ctx.check("the footer says how to see the rest", "max_elements" in footer and "scope" in footer, footer)
 
@@ -1341,19 +1349,21 @@ def element_limit(ctx):
     sticky = ctx.call("get_window_state", window_id=wid, full=True)
     ctx.check("later reads of the window keep the last max_elements", sticky["element_count"] == 50, sticky["element_count"])
 
-    scoped = ctx.call("get_window_state", window_id=wid, scope="Formatting")
+    # The font size combo box and its stepper button share a label; the container must win over the leaf.
+    scoped = ctx.call("get_window_state", window_id=wid, scope="font size")
     lines = scoped["tree"].splitlines()
-    ctx.check("scope takes a container label", len(lines) > 1 and lines[1].startswith('AXGroup "Formatting"'), lines[:3])
-    bold = element_index(scoped["tree"], "AXCheckBox", "bold")
-    ctx.check("the labelled scope holds the group's controls at full depth",
-              bold is not None and element_index(scoped["tree"], "AXButton", "font size") is not None, scoped["tree"][:600])
-    ctx.check("the labelled scope excludes the rest of the window", "AXLink" not in scoped["tree"], scoped["tree"][:300])
+    ctx.check("scope takes a container label", len(lines) > 1 and 'AXComboBox "font size"' in lines[1], lines[:3])
+    stepper = element_index(scoped["tree"], "AXButton", "font size")
+    ctx.check("the labelled scope holds the container's children", stepper is not None, scoped["tree"][:600])
+    ctx.check("the labelled scope excludes the rest of the window",
+              "AXLink" not in scoped["tree"] and '"bold"' not in scoped["tree"], scoped["tree"][:300])
+    combo = element_index(scoped["tree"], "AXComboBox", "font size")
     ctx.check("an element found through a labelled scope can be acted on",
-              bold is not None and ctx.call("click", window_id=wid, element_index=bold, observe="none").get("ok"))
-    folded = ctx.call("get_window_state", window_id=wid, scope="formatting")["tree"]
-    ctx.check("label matching falls back to case-insensitive", 'AXGroup "Formatting"' in folded, folded[:200])
+              combo is not None and ctx.call("click", window_id=wid, element_index=combo, observe="none").get("ok"))
+    folded = ctx.call("get_window_state", window_id=wid, scope="FONT SIZE")["tree"]
+    ctx.check("label matching falls back to case-insensitive", 'AXComboBox "font size"' in folded, folded[:200])
     unknown = refused(ctx, "get_window_state", window_id=wid, scope="No Such Panel")
-    ctx.check("an unknown label is refused with candidate labels", unknown and '"Formatting"' in unknown, unknown)
+    ctx.check("an unknown label is refused with candidate labels", unknown and '"font size"' in unknown, unknown)
 
     everything = ctx.call("get_window_state", window_id=wid, full=True, max_elements=3000)
     ctx.check("max_elements=3000 lists the whole window again",
@@ -1463,7 +1473,7 @@ def perception_docs(ctx):
     ctx.check("screenshot explains the 1024 px limit and coordinate_space",
               "1024" in tools["screenshot"]["description"] and "coordinate_space" in tools["screenshot"]["description"])
     ctx.check("get_window_state explains the ~ moved line", "~" in tools["get_window_state"]["description"])
-    ctx.check("press_key says what verified means", "verified" in tools["press_key"]["description"]
+    ctx.check("press_key says a menu press does not verify the effect", "verif" in tools["press_key"]["description"]
               and "effect" in tools["press_key"]["description"], tools["press_key"]["description"])
 
 
