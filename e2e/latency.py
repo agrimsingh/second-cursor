@@ -155,8 +155,9 @@ def latency(ctx):
     scroll_sizes = sizes["scroll observation (links doc)"]
     ctx.check(f"scroll observation: median {statistics.median(scroll_sizes):.0f} chars "
               f"(full tree {sizes['get_window_state full (links doc)'][0]})", True, scroll_sizes)
+    # Odd rounds read after scrolling down, so their link frames (and length) differ; even rounds read from the top.
     ratchet.check(ctx, "native: full read of the links document, characters",
-                  sizes["get_window_state full (links doc)"], GATED)
+                  sizes["get_window_state full (links doc)"][::2], GATED)
     ratchet.check(ctx, "native: first scroll-down observation of the links document, characters", scroll_sizes[0], GATED)
     # An on-screen target also waits for the agent arrow's glide (capped at ~150 ms) so the arrow lands with the click.
     ctx.check("click observe=none stays fast (median under 250 ms, arrow glide included)",

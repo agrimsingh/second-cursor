@@ -733,8 +733,15 @@ def clear_calculator(ctx, wid):
     if clear is not None:
         ctx.call("click", window_id=wid, element_index=clear, observe="none")
         tree = ctx.tree(wid, include_screenshot=False)
-    ctx.require("Calculator starts from 0", re.search(r'"Edit field" value="0"', tree), tree[:400])
+    ctx.require("Calculator starts from 0", calculator_display(tree) == "0", tree[:400])
     return tree
+
+
+def calculator_display(tree):
+    """Older Calculators label the value itself; macOS 26 nests an unlabeled AXStaticText under an AXScrollArea
+    "Edit field" and prefixes the value with a left-to-right mark."""
+    match = re.search(r'"Edit field"[^\n]*?(?: value="([^"]*)"|\n\s+AXStaticText value="([^"]*)")', tree)
+    return (match.group(1) or match.group(2)).lstrip("\u200e") if match else None
 
 
 @scenario

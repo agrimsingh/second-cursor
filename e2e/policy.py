@@ -66,25 +66,34 @@ def refused(fn):
 @scenario
 def turn_end_resets_baseline(ctx):
     wid = ctx.launch_scratch_textedit("turn.txt", "turn one")["id"]
+    # Calls without session_id run in this MCP connection's own session; legacy is only /api's.
+    connection = ctx.mcp.session_id
     first = ctx.call("get_window_state", window_id=wid)
-    ctx.require("first legacy read is full", not first["is_diff"], first.get("is_diff"))
+    ctx.require("first connection read is full", not first["is_diff"], first.get("is_diff"))
     second = ctx.call("get_window_state", window_id=wid)
-    ctx.require("second legacy read is a diff", second["is_diff"], second.get("is_diff"))
+    ctx.require("second connection read is a diff", second["is_diff"], second.get("is_diff"))
 
     status, body = post_turn_ended(ctx.mcp, {})
+    ctx.check(
+        "an empty turn-ended body ends legacy, not this connection",
+        status == 200 and isinstance(body, dict) and body.get("session_id") == "legacy"
+        and ctx.call("get_window_state", window_id=wid)["is_diff"],
+        (status, body),
+    )
+    status, body = post_turn_ended(ctx.mcp, {"session_id": connection})
     ctx.require("turn-ended answers 200", status == 200, (status, body))
     ctx.check(
         "response has ok, session_id, released_tabs, cleared_app_approvals",
         isinstance(body, dict)
         and body.get("ok") is True
-        and body.get("session_id") == "legacy"
+        and body.get("session_id") == connection
         and isinstance(body.get("released_tabs"), int)
         and isinstance(body.get("cleared_app_approvals"), int),
         body,
     )
     third = ctx.call("get_window_state", window_id=wid)
     ctx.check(
-        "first legacy read after the turn ends is full",
+        "first connection read after its turn ends is full",
         not third["is_diff"] and not third.get("diff_base"),
         {k: third.get(k) for k in ("is_diff", "diff_base")},
     )
@@ -113,7 +122,7 @@ def turn_end_resets_baseline(ctx):
     after = ctx.call("get_window_state", window_id=wid, session_id=sid)
     ctx.check("explicit session stays open and its next read is full", not after["is_diff"], after.get("is_diff"))
     ctx.check(
-        "another session's turn end leaves the legacy baseline alone",
+        "another session's turn end leaves the connection's baseline alone",
         ctx.call("get_window_state", window_id=wid)["is_diff"],
     )
 
@@ -397,6 +406,9 @@ def batch_steps_respect_leases(ctx):
     """A batch addressed to a free window must not reach, through a step, a window another session holds."""
     window = ctx.launch_scratch_textedit("lease-held.txt", "held")
     held, free = window["id"], untitled_window(ctx, window)["id"]
+    # Setup's cmd+n and move claimed both windows for this connection's own session.
+    for wid in (held, free):
+        ctx.call("bind_target", target=f"window:{wid}", action="release")
     a = ctx.call("session", action="create")["session_id"]
     b = ctx.call("session", action="create")["session_id"]
     for sid in (a, b):
@@ -411,8 +423,7 @@ def batch_steps_respect_leases(ctx):
         ctx.require("the held window's text area is indexed", area is not None, tree[:300])
         return {"tool": "set_value", "args": {"window_id": held, "element_index": area, "value": marker}}
 
-    # Legacy first: session b's batch below leases the free window, which legacy then may not use.
-    for label, session in [("a legacy", {}), ("session b's", {"session_id": b})]:
+    for label, session in [("this connection's", {}), ("session b's", {"session_id": b})]:
         result = ctx.call("batch", window_id=free, observe="none", steps=[held_step(session)], **session)
         step = result["steps"][0]
         ctx.check(
@@ -420,6 +431,8 @@ def batch_steps_respect_leases(ctx):
             not step["ok"] and "claimed by another session" in (step.get("error") or ""),
             result["steps"],
         )
+        # The batch leased the free window to its session; hand it on to the next one.
+        ctx.call("bind_target", target=f"window:{free}", action="release", **session)
     value = value_of(ctx.call("get_window_state", window_id=held, full=True)["tree"])
     ctx.check("nothing reached the held window", value == "held", value)
     logged = [e for e in action_log_entries(start) if e.get("target") == f"window_id={held}"]

@@ -9,5 +9,8 @@
   "browser: first observation after 'type into a plain field', characters": 67,
   "browser: first observation after 'type into a search box (results ~450 ms later)', characters": 446,
   "browser: full read of reactions.html, characters": 276,
+  "native: first scroll-down observation of the links document, characters": 121,
+  "native: full read of the links document, characters": 11036,
+  "tools/list characters, compact surface": 40050,
   "tools/list characters, default surface": 52000
 }
