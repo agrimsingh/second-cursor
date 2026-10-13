@@ -19,15 +19,16 @@ import subprocess
 import sys
 import time
 
+from benchmarks.flight_fixtures import FLIGHT_TASKS
 from benchmarks.workspace_fixtures import WORKSPACE_TASKS
 
 ROOT = pathlib.Path(__file__).resolve().parent
 REPO = ROOT.parent
 CONTRACT = "second-cursor-benchmark/1"
 DEFAULT_TASKS = ("native_notes", "browser_work_order", "canvas_route", "transient_dialog")
-TASKS = DEFAULT_TASKS + WORKSPACE_TASKS
-FIXTURE_FILES = ("fixture.html", "fixtures.py", "workspace.html", "workspace_fixtures.py")
-TASK_FILES = (*FIXTURE_FILES, "tasks.py", "workspace_driver.py")
+TASKS = DEFAULT_TASKS + WORKSPACE_TASKS + FLIGHT_TASKS
+FIXTURE_FILES = ("fixture.html", "fixtures.py", "workspace.html", "workspace_fixtures.py", "flight.html", "flight_fixtures.py")
+TASK_FILES = (*FIXTURE_FILES, "tasks.py", "workspace_driver.py", "flight_driver.py")
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 INTERFACE_TRACKS = ("native-tools", "screenshot-actions")
 MODEL_CONFIG_FIELDS = ("model", "reasoning_effort", "max_steps", "timeout_seconds", "model_host_version")
@@ -35,8 +36,8 @@ MODEL_HOSTS = ("codex", "cursor-sdk")
 
 
 def case_seed_semantics(tasks):
-    if any(task in WORKSPACE_TASKS for task in tasks):
-        return ("Workspace seeds generate reproducible case data; legacy task fixtures remain fixed. "
+    if any(task in WORKSPACE_TASKS or task in FLIGHT_TASKS for task in tasks):
+        return ("Workspace and flight seeds generate reproducible case data; legacy task fixtures remain fixed. "
                 "No case seed controls provider sampling.")
     return "Trial identity only; this pilot uses fixed fixtures and does not seed provider sampling."
 
@@ -541,7 +542,7 @@ def validate_comparison(payloads):
     task_sets = [{t["task_id"] for t in p["trials"]} for p in payloads]
     if any(t != task_sets[0] for t in task_sets[1:]):
         raise ValueError("Cannot compare different task selections")
-    if profiles[0] != "model" and any(task in WORKSPACE_TASKS for task in task_sets[0]):
+    if profiles[0] != "model" and any(task in WORKSPACE_TASKS or task in FLIGHT_TASKS for task in task_sets[0]):
         schedules = []
         for payload in payloads:
             schedule = []

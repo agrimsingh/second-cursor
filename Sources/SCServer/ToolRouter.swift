@@ -57,7 +57,10 @@ final class ToolRouter: Sendable {
             if case .text(let text, _, _) = content { return text }
             return nil
         }.first : nil
-        timingLog.record(tool: called, ms: Timing.since(started), ok: result.isError != true, phases: timings.phasesMS, error: error)
+        let session: String? = if case .string(let id) = arguments["session_id"] { id } else { nil }
+        timingLog.record(
+            tool: called, ms: Timing.since(started), ok: result.isError != true, phases: timings.phasesMS, error: error,
+            session: session)
         return result
     }
 

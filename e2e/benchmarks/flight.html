@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Book travel · Flights</title>
+<style>
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 0; background: #f4f5f7; color: #1d2433; }
+  header { background: #12204a; color: #fff; padding: 12px 24px; font-weight: 600; }
+  main { max-width: 1040px; margin: 20px auto; padding: 0 16px; }
+  .search { background: #fff; border-radius: 10px; padding: 16px; display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; position: relative; }
+  .field { display: flex; flex-direction: column; gap: 4px; position: relative; }
+  .field label, .field .label { font-size: 12px; color: #5b6478; }
+  input, button { font: inherit; }
+  input[type=text] { padding: 8px 10px; border: 1px solid #c7ccd6; border-radius: 6px; width: 220px; }
+  .pill { padding: 8px 12px; border: 1px solid #c7ccd6; border-radius: 6px; background: #fff; cursor: pointer; min-width: 150px; text-align: left; }
+  .primary { background: #2756d8; color: #fff; border: 0; border-radius: 6px; padding: 9px 18px; cursor: pointer; }
+  .menu, .suggestions { position: absolute; top: 100%; left: 0; margin: 4px 0 0; padding: 4px 0; list-style: none; background: #fff;
+    border: 1px solid #c7ccd6; border-radius: 6px; box-shadow: 0 6px 18px rgba(0,0,0,.12); z-index: 60; min-width: 100%; }
+  .menu li, .suggestions li { padding: 8px 12px; cursor: pointer; white-space: nowrap; }
+  .menu li:hover, .suggestions li:hover, .suggestions li[aria-selected=true] { background: #eef2fd; }
+  .backdrop { position: fixed; inset: 0; z-index: 50; background: transparent; }
+  .picker { position: absolute; top: 100%; left: 0; margin-top: 4px; background: #fff; border: 1px solid #c7ccd6; border-radius: 8px;
+    box-shadow: 0 6px 18px rgba(0,0,0,.14); padding: 12px; z-index: 40; width: 280px; }
+  .picker .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; text-align: center; }
+  .grid .dow { font-size: 11px; color: #8a92a6; }
+  .grid button { border: 0; background: none; padding: 6px 0; border-radius: 4px; cursor: pointer; }
+  .grid button[aria-pressed=true] { background: #2756d8; color: #fff; }
+  .grid button:disabled { color: #c3c8d4; cursor: default; }
+  .picker .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+  .error { color: #b42318; width: 100%; }
+  .spinner { margin: 40px auto; text-align: center; color: #5b6478; }
+  .spinner::before { content: ""; display: block; width: 28px; height: 28px; margin: 0 auto 10px; border-radius: 50%;
+    border: 3px solid #c7ccd6; border-top-color: #2756d8; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .layout { display: grid; grid-template-columns: 220px 1fr; gap: 16px; margin-top: 16px; }
+  aside { background: #fff; border-radius: 10px; padding: 14px; align-self: start; }
+  aside h3 { font-size: 13px; margin: 0 0 8px; }
+  aside label { display: block; margin: 6px 0; cursor: pointer; }
+  .results ul { list-style: none; margin: 0; padding: 0; }
+  .flight { background: #fff; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; display: grid;
+    grid-template-columns: 1.6fr 1.1fr 0.8fr 1fr 0.7fr auto; gap: 10px; align-items: center; }
+  .flight .fno { font-size: 12px; color: #5b6478; }
+  .badge { font-size: 11px; padding: 2px 6px; border-radius: 10px; }
+  .badge.in { background: #e3f5ea; color: #146c2e; }
+  .badge.out { background: #fdecea; color: #b42318; }
+  .fare { font-weight: 600; }
+  .summary { color: #5b6478; margin-bottom: 8px; }
+  .notice { background: #fff6dd; padding: 8px 12px; border-radius: 6px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<header>Book travel</header>
+<main>
+  <form class="search" id="search" onsubmit="return false" aria-label="Flight search">
+    <div class="field">
+      <span class="label" id="trip-label">Trip</span>
+      <button type="button" class="pill" id="trip" aria-labelledby="trip-label trip" aria-haspopup="listbox" aria-expanded="false">Round-trip</button>
+    </div>
+    <div class="field">
+      <label for="from">From</label>
+      <input type="text" id="from" value="Singapore (SIN)" readonly>
+    </div>
+    <div class="field">
+      <label for="to">To</label>
+      <input type="text" id="to" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="to-list"
+             placeholder="City or airport" autocomplete="off">
+    </div>
+    <div class="field">
+      <span class="label" id="depart-label">Depart</span>
+      <button type="button" class="pill" id="depart" aria-labelledby="depart-label depart" data-picker="depart">Select date</button>
+    </div>
+    <div class="field" id="return-field">
+      <span class="label" id="return-label">Return</span>
+      <button type="button" class="pill" id="return" aria-labelledby="return-label return" data-picker="return">Select date</button>
+    </div>
+    <div class="field">
+      <span class="label">Cabin</span>
+      <span class="pill" style="cursor:default">Economy · 1 traveler</span>
+    </div>
+    <button type="button" class="primary" id="go">Search flights</button>
+    <div class="error" id="error" role="alert"></div>
+  </form>
+  <div id="output"></div>
+</main>
+<script>
+const AIRPORTS = __AIRPORTS__;
+const TODAY = "__TODAY__";
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const state = { trip: "roundtrip", to: null, depart: null, return: null, results: null, cap: null, nonstop: false, policy: false };
+const $ = (id) => document.getElementById(id);
+const el = (tag, props = {}, ...children) => {
+  const node = Object.assign(document.createElement(tag), props);
+  for (const [k, v] of Object.entries(props.attrs || {})) node.setAttribute(k, v);
+  node.append(...children);
+  return node;
+};
+const pad = (n) => String(n).padStart(2, "0");
+const iso = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
+const label = (value) => {
+  const [y, m, d] = value.split("-").map(Number);
+  const day = new Date(y, m - 1, d);
+  return `${DAYS[day.getDay()].slice(0, 3)}, ${MONTHS[m - 1].slice(0, 3)} ${d}`;
+};
+
+// Trip type: an open menu covers the whole page with a transparent backdrop, as many travel sites do.
+function closeTripMenu() {
+  document.querySelectorAll("#trip-menu, #trip-backdrop").forEach((node) => node.remove());
+  $("trip").setAttribute("aria-expanded", "false");
+}
+$("trip").addEventListener("click", () => {
+  if ($("trip-menu")) return closeTripMenu();
+  const backdrop = el("div", { id: "trip-backdrop", className: "backdrop" });
+  backdrop.addEventListener("click", closeTripMenu);
+  document.body.append(backdrop);
+  const menu = el("ul", { id: "trip-menu", className: "menu", attrs: { role: "listbox", "aria-label": "Trip type" } });
+  for (const [value, text] of [["roundtrip", "Round-trip"], ["oneway", "One-way"]]) {
+    const option = el("li", { attrs: { role: "option", "aria-selected": String(state.trip === value), tabindex: "-1" } }, text);
+    option.addEventListener("click", () => {
+      state.trip = value;
+      $("trip").textContent = text;
+      $("return-field").hidden = value === "oneway";
+      if (value === "oneway") state.return = null;
+      closeTripMenu();
+    });
+    menu.append(option);
+  }
+  $("trip").parentElement.append(menu);
+  $("trip").setAttribute("aria-expanded", "true");
+});
+
+// Destination: typing filters airports after a pause; only a picked suggestion sets the destination.
+let suggestTimer = null;
+function closeSuggestions() {
+  $("to-list")?.remove();
+  $("to").setAttribute("aria-expanded", "false");
+}
+function pickAirport(airport) {
+  state.to = airport.code;
+  $("to").value = `${airport.city.split(",")[0]} (${airport.code})`;
+  closeSuggestions();
+}
+$("to").addEventListener("input", () => {
+  state.to = null;
+  clearTimeout(suggestTimer);
+  closeSuggestions();
+  const query = $("to").value.trim().toLowerCase();
+  if (query.length < 2) return;
+  suggestTimer = setTimeout(() => {
+    const matches = AIRPORTS.filter((a) => a.code.toLowerCase().startsWith(query) || a.name.toLowerCase().includes(query)
+      || a.city.toLowerCase().includes(query));
+    const list = el("ul", { id: "to-list", className: "suggestions", attrs: { role: "listbox", "aria-label": "Airports" } });
+    if (!matches.length) list.append(el("li", { attrs: { role: "presentation" } }, "No airports match"));
+    for (const airport of matches) {
+      const option = el("li", { attrs: { role: "option", "aria-selected": "false" } }, `${airport.name} (${airport.code}) · ${airport.city}`);
+      option.addEventListener("mousedown", (event) => event.preventDefault());
+      option.addEventListener("click", () => pickAirport(airport));
+      list.append(option);
+    }
+    $("to").parentElement.append(list);
+    $("to").setAttribute("aria-expanded", "true");
+  }, 400);
+});
+$("to").addEventListener("keydown", (event) => {
+  const options = [...document.querySelectorAll("#to-list [role=option]")];
+  if (!options.length) return;
+  let index = options.findIndex((o) => o.getAttribute("aria-selected") === "true");
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    index = event.key === "ArrowDown" ? Math.min(index + 1, options.length - 1) : Math.max(index - 1, 0);
+    options.forEach((o, i) => o.setAttribute("aria-selected", String(i === index)));
+  } else if (event.key === "Enter" && index >= 0) {
+    event.preventDefault();
+    options[index].click();
+  } else if (event.key === "Escape") {
+    closeSuggestions();
+  }
+});
+
+// Dates: a day is only applied by Confirm.
+function closePicker() { $("picker")?.remove(); }
+function openPicker(which) {
+  closePicker();
+  const start = TODAY.split("-").map(Number);
+  let year = start[0], month = start[1] - 1, chosen = state[which];
+  const dialog = el("div", { id: "picker", className: "picker", attrs: { role: "dialog", "aria-label": which === "depart" ? "Choose departure date" : "Choose return date" } });
+  const confirm = el("button", { type: "button", className: "primary" }, "Confirm");
+  const render = () => {
+    dialog.replaceChildren();
+    const prev = el("button", { type: "button", attrs: { "aria-label": "Previous month" } }, "‹");
+    const next = el("button", { type: "button", attrs: { "aria-label": "Next month" } }, "›");
+    prev.disabled = year === start[0] && month === start[1] - 1;
+    prev.onclick = () => { month -= 1; if (month < 0) { month = 11; year -= 1; } render(); };
+    next.onclick = () => { month += 1; if (month > 11) { month = 0; year += 1; } render(); };
+    dialog.append(el("div", { className: "head" }, prev, el("span", {}, `${MONTHS[month]} ${year}`), next));
+    const grid = el("div", { className: "grid" });
+    for (const d of ["S", "M", "T", "W", "T", "F", "S"]) grid.append(el("span", { className: "dow", attrs: { "aria-hidden": "true" } }, d));
+    const first = new Date(year, month, 1).getDay();
+    for (let i = 0; i < first; i++) grid.append(el("span"));
+    const days = new Date(year, month + 1, 0).getDate();
+    for (let d = 1; d <= days; d++) {
+      const value = iso(year, month, d);
+      const day = new Date(year, month, d);
+      const button = el("button", { type: "button", attrs: {
+        "aria-label": `${DAYS[day.getDay()]}, ${MONTHS[month]} ${d}, ${year}`, "aria-pressed": String(chosen === value) } }, String(d));
+      button.disabled = value < TODAY || (which === "return" && state.depart && value < state.depart);
+      button.onclick = () => {
+        chosen = value;
+        grid.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
+        confirm.disabled = false;
+      };
+      grid.append(button);
+    }
+    dialog.append(grid);
+    const cancel = el("button", { type: "button" }, "Cancel");
+    cancel.onclick = closePicker;
+    confirm.disabled = !chosen;
+    confirm.onclick = () => {
+      state[which] = chosen;
+      $(which).textContent = label(chosen);
+      closePicker();
+    };
+    dialog.append(el("div", { className: "actions" }, cancel, confirm));
+  };
+  render();
+  $(which).parentElement.append(dialog);
+}
+document.querySelectorAll("[data-picker]").forEach((button) => button.addEventListener("click", () => openPicker(button.dataset.picker)));
+
+// Search: results arrive after a few seconds behind a spinner.
+$("go").addEventListener("click", async () => {
+  const error = !state.to ? "Choose a destination from the list."
+    : !state.depart ? "Choose a departure date."
+    : state.trip === "roundtrip" && !state.return ? "Choose a return date, or switch to One-way." : "";
+  $("error").textContent = error;
+  if (error) return;
+  closePicker();
+  state.results = null;
+  $("output").replaceChildren(el("div", { className: "spinner", attrs: { role: "status" } }, "Searching flights…"));
+  const started = Date.now();
+  const response = await fetch("/api/search", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trip: state.trip, from: "SIN", to: state.to, depart: state.depart, return: state.return }) });
+  const body = await response.json();
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, 3000 - (Date.now() - started))));
+  if (!response.ok) {
+    $("output").replaceChildren();
+    $("error").textContent = body.error;
+    return;
+  }
+  Object.assign(state, { results: body.results, cap: body.policy_cap, nonstop: false, policy: false });
+  const filters = el("aside", { attrs: { "aria-label": "Filters" } });
+  const toggle = (key, text) => {
+    const box = el("input", { type: "checkbox" });
+    box.addEventListener("change", () => { state[key] = box.checked; renderList(); });
+    return el("label", {}, box, " ", text);
+  };
+  filters.append(el("h3", {}, "Stops"), toggle("nonstop", "Nonstop only"),
+    el("h3", {}, "Travel policy"), toggle("policy", `In policy only (≤ $${state.cap})`));
+  const results = el("section", { id: "results", className: "results", attrs: { "aria-label": "Results" } });
+  $("output").replaceChildren(el("div", { className: "layout" }, filters, results));
+  renderList();
+});
+
+function renderList() {
+  const shown = state.results.filter((r) => (!state.nonstop || r.stops === 0) && (!state.policy || r.in_policy));
+  const route = `SIN → ${state.to} · ${label(state.depart)}${state.return ? " – " + label(state.return) : ""} · ${state.trip === "oneway" ? "One-way" : "Round-trip"}`;
+  const list = el("ul", { attrs: { "aria-label": "Flights" } });
+  for (const r of shown) {
+    const select = el("button", { type: "button", className: "primary" }, `Select $${r.fare}`);
+    select.onclick = async () => {
+      await fetch("/api/select", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ flight: r.flight, fare: r.fare }) });
+      $("results-notice").textContent = `Fare held for ${r.flight}. Nothing is booked until you check out.`;
+    };
+    const hours = `${Math.floor(r.duration / 60)}h ${pad(r.duration % 60)}m`;
+    list.append(el("li", { className: "flight" },
+      el("div", {}, el("div", {}, r.airline), el("div", { className: "fno" }, r.flight)),
+      el("div", {}, `${r.depart_time} – ${r.arrive_time}`),
+      el("div", {}, hours),
+      el("div", {}, r.stops === 0 ? "Nonstop" : `${r.stops} stop${r.stops > 1 ? "s" : ""} · ${r.via.join(", ")}`),
+      el("div", {}, el("div", { className: "fare" }, `$${r.fare}`),
+        el("span", { className: "badge " + (r.in_policy ? "in" : "out") }, r.in_policy ? "In policy" : "Out of policy")),
+      select));
+  }
+  const summary = el("div", { className: "summary", attrs: { role: "status" } },
+    shown.length === state.results.length ? `${state.results.length} flights · ${route}` : `${shown.length} of ${state.results.length} flights · ${route}`);
+  $("results").replaceChildren(el("div", { id: "results-notice" }), summary, list);
+}
+</script>
+</body>
+</html>

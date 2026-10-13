@@ -8,6 +8,7 @@ import time
 
 import best_in_class as report
 from benchmarks.fixtures import FixtureServer, judge
+from benchmarks.flight_fixtures import FLIGHT_TASKS, FlightFixture
 from benchmarks.workspace_fixtures import WORKSPACE_TASKS, WorkspaceFixture
 
 NOTE = "Dispatch notes\nKeep this existing line."
@@ -24,7 +25,7 @@ MODES = {"browser_work_order": "form", "canvas_route": "canvas", "transient_dial
 
 
 def browser_task(task):
-    return task in MODES or task in WORKSPACE_TASKS
+    return task in MODES or task in WORKSPACE_TASKS or task in FLIGHT_TASKS
 
 
 def native_placement(args):
@@ -117,6 +118,9 @@ def execute_builtin(ctx, task, targets, meter):
     if task in WORKSPACE_TASKS:
         from benchmarks.workspace_driver import execute
         return execute(ctx, task, targets, meter)
+    if task in FLIGHT_TASKS:
+        from benchmarks.flight_driver import execute
+        return execute(ctx, targets, meter, "single")
     from run import element_index
     call = meter.call
     if task == "native_notes":
@@ -191,8 +195,9 @@ def execute_external(ctx, request, output, args, row):
                 raise ValueError("Each adapter event must be an object")
             events.append(event)
     metrics = adapter_metrics(events, proc["seconds"] * 1000, args.model)
-    row["metrics"] = metrics
     final = next(event for event in events if event.get("type") == "result")
+    metrics["model_tool_calls"] = final.get("model_tool_calls")
+    row["metrics"] = metrics
     if args.model:
         row["adapter_result"] = final
         row["adapter_tools"] = [event for event in events if event.get("type") == "tool"]
@@ -331,6 +336,21 @@ def judge_workspace(ctx, server, row):
     return evidence
 
 
+def judge_flight(ctx, server, row):
+    """The server's ledger and expected flights, against the reply the adapter returned; never the page's state."""
+    time.sleep(.2)
+    events = server.read()
+    answer = (row.get("adapter_result") or {}).get("final_response")
+    checks = server.judge(events, answer)
+    evidence = {"events": events, "answer": answer, "checks": checks, "diagnostics": server.diagnostics(events, answer)}
+    row["independent_checks"] = checks
+    row["independent_diagnostics"] = evidence["diagnostics"]
+    row["independent_task_success"] = all(checks.values())
+    for name, passed in checks.items():
+        ctx.check("independent flight search: " + name, passed, evidence["diagnostics"])
+    return evidence
+
+
 def task_trial(ctx, task, round_number, args, row, output):
     import run as harness
     trial_dir = output / "trials" / f"{task}-{round_number}"
@@ -375,6 +395,12 @@ def task_trial(ctx, task, round_number, args, row, output):
             row["case_metadata"] = server.case_metadata()
             report.write_json(trial_dir / "case-manifest.json", row["case_metadata"])
             targets["url"] = server.url
+        elif task in FLIGHT_TASKS:
+            server = FlightFixture(row["case_seed"], trial_dir).__enter__()
+            ctx.cleanups.append(lambda: server.__exit__(None, None, None))
+            row["case_metadata"] = server.case_metadata()
+            report.write_json(trial_dir / "case-manifest.json", row["case_metadata"])
+            targets["url"] = server.url
         else:
             server = FixtureServer().__enter__()
             ctx.cleanups.append(lambda: server.__exit__(None, None, None))
@@ -393,14 +419,15 @@ def task_trial(ctx, task, round_number, args, row, output):
         if not args.adapter_command:
             # Workspace smoke tests exercise the same initial navigation as the
             # model's claimed blank tab, including the server's document boundary.
-            tid = ctx.call("browser_open", url="about:blank" if task in WORKSPACE_TASKS else targets["url"])["tab"]["id"]
+            blank = task in WORKSPACE_TASKS or task in FLIGHT_TASKS
+            tid = ctx.call("browser_open", url="about:blank" if blank else targets["url"])["tab"]["id"]
             targets["tab_id"] = tid
             ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tid))
             if task in WORKSPACE_TASKS:
                 ctx.call("browser_navigate", tab_id=tid, url=targets["url"])
     request = {"protocol": report.CONTRACT, "task_id": task, "trial": round_number, "track": args.track,
                "native_placement": native_placement(args),
-               "model": args.model, "prompt": (server.prompt if task in WORKSPACE_TASKS else PROMPTS[task]) + RULES,
+               "model": args.model, "prompt": (server.prompt if task in WORKSPACE_TASKS or task in FLIGHT_TASKS else PROMPTS[task]) + RULES,
                "targets": targets, "timeout_seconds": args.timeout}
     if args.model:
         request.update(model_config=report.model_config_for(args), case_seed=row["case_seed"],
@@ -429,7 +456,9 @@ def task_trial(ctx, task, round_number, args, row, output):
         else:
             meter = Meter(ctx)
             builtin_targets = {**targets, "goal": request["prompt"]} if task in WORKSPACE_TASKS else targets
-            execute_builtin(ctx, task, builtin_targets, meter)
+            answer = execute_builtin(ctx, task, builtin_targets, meter)
+            if task in FLIGHT_TASKS:
+                row["adapter_result"] = {"final_response": answer}
     except Exception as error:
         adapter_error = error
     finally:
@@ -443,7 +472,7 @@ def task_trial(ctx, task, round_number, args, row, output):
             row["adapter_invariants"] = ctx.run.invariants(before, after, time.time() - started)
             report.write_json(trial_dir / "adapter-invariants.json", row["adapter_invariants"])
         except Exception as error:
-            if task not in WORKSPACE_TASKS:
+            if task not in WORKSPACE_TASKS and task not in FLIGHT_TASKS:
                 raise
             row["post_adapter_error"] = f"{type(error).__name__}: {error}"
             adapter_error = adapter_error or error
@@ -467,6 +496,8 @@ def task_trial(ctx, task, round_number, args, row, output):
             require_off_space(ctx, final_window, active_space, "After task")
     elif task in WORKSPACE_TASKS:
         evidence = judge_workspace(ctx, server, row)
+    elif task in FLIGHT_TASKS:
+        evidence = judge_flight(ctx, server, row)
     else:
         # Judge persistence after the adapter stops, not merely its own final observation.
         deadline = time.monotonic() + 2
