@@ -45,6 +45,10 @@ class ScopeError(EngineError):
     """
 
 
+class ScopeBreach(ScopeError):
+    """An action already left the fixture scope. The trial fails and every later call is refused."""
+
+
 def _objects(value):
     if isinstance(value, dict):
         yield value
@@ -439,9 +443,60 @@ KEY_SCOPE_DESCRIPTION = (
     "Command/Super mean Cmd and Control means Ctrl. Clipboard, browser chrome, file and app shortcuts are unavailable."
 )
 
+BROWSER_SURFACES = ("discrete", "repl")
+# --browser-surface repl also offers browser_repl. Arbitrary JavaScript cannot be validated statically like a typed
+# call, so its fixture-only scope is enforced in three layers: a lexical refusal before the call, an audit of the
+# isolated instance's actions.jsonl via=browser_repl lines after it, and a host browser_tabs read of every agent tab's
+# URL after it. A failed audit is a ScopeBreach: the trial fails and the engine refuses every later call.
+# Failure modes, and what covers each:
+# 1. A URL built at run time (concatenation, fromCharCode, a variable) passes the lexical check. Its navigation is
+#    logged as browser_navigate/browser_open with the URL and fails the audit, after the request was sent. The
+#    profile is disposable Chrome for Testing with no logins, so the exposure is one unauthenticated page load.
+# 2. A page-initiated navigation (a link or form on the page, a redirect) writes no REPL line. The tab audit sees it
+#    only if the tab is still off the fixture origin when the call returns; a round trip inside one call is missed.
+#    Discrete browser_click has the same gap.
+# 3. back/forward/reload log no URL. History holds only about:blank and audited URLs, and the tab audit reads the
+#    result.
+# 4. Logged values are cut at 200 characters. The origin is at the front; a URL with userinfo or an unparsable one
+#    fails closed. Relative URLs resolve against the fixture URL, as the page would.
+# 5. The app's log append is best effort; a lost line hides that action from the audit, leaving the tab audit. An
+#    unreadable log fails closed.
+# 6. Lines from other sessions: the instance is per run, and every via=browser_repl line is audited regardless of
+#    session, so a stray line can only fail a trial, never pass one.
+# 7. Work an earlier call left pending: BrowserREPL rejects orphaned promises before the next call, and the adapter
+#    runs a final audit after the model finishes, before cleanup.
+# 8. Clipboard and files: BrowserREPL offers no paste/clipboard/upload operation and strips `files`; clipboard key
+#    chords are refused lexically when literal and fail the audit when logged.
+# 9. New tabs (context.newPage) are adopted after the tab audit, so cleanup closes them and discrete tools may act
+#    on them; one off the fixture origin is a breach.
+# 10. Reads (inspect, query, snapshot, screenshot) are not logged; they cannot leave the page.
+# 11. The lexical check also matches URLs in comments or printed strings: a false refusal the model can recover from.
+# 12. Detection is after the fact. It fails the trial; it does not undo the request.
+# 13. The audit's browser_tabs read is host time inside the REPL arm's wall clock, recorded as repl_audit.audit_ms.
+REPL_LOGGED_NAVIGATION = {"browser_navigate", "browser_open"}
+REPL_FORBIDDEN_OPERATIONS = {"paste", "clipboard", "upload", "set_input_files", "cdp", "evaluate", "history", "user_tabs", "claim"}
+REPL_URL = re.compile(r"(?i)[a-z][a-z0-9+.-]*://[^\s'\"`<>\\)]*")
+REPL_SCHEMELESS = re.compile(r"(?i)(?:javascript|data|file|blob|view-source|chrome|chrome-extension|devtools|about|mailto):")
+REPL_STRING = re.compile(r"(['\"`])((?:\\.|(?!\1).)*)\1", re.S)
+REPL_SCOPE_DESCRIPTION = (" Fixture-only benchmark: page.goto only the provided fixture URL (its origin); no other URLs, "
+                          "clipboard chords or files. Code naming another URL is refused, and a navigation that leaves "
+                          "the fixture origin fails the trial.")
+
+
+def clipboard_chord(keys):
+    """Chords that reach the system clipboard in Chrome on macOS, in Playwright or Second Cursor spelling."""
+    if not isinstance(keys, str) or "+" not in keys:
+        return False
+    parts = [part.strip().lower() for part in keys.split("+")]
+    modifiers, key = set(parts[:-1]), parts[-1]
+    key = key[3:] if re.fullmatch(r"key[a-z]", key) else key
+    command = modifiers & {"meta", "cmd", "command", "control", "ctrl", "controlormeta", "super"}
+    return (bool(command) and key in {"c", "v", "x"} or key == "insert" and bool(modifiers & {"shift", "ctrl", "control"})
+            or key == "delete" and "shift" in modifiers)
+
 
 class ScopedEngine:
-    def __init__(self, name, request, client, emit=None, clock_start=None, pinned_identity=None):
+    def __init__(self, name, request, client, emit=None, clock_start=None, pinned_identity=None, action_log=None):
         if request.get("task_id") not in TASKS:
             raise UnsupportedEngine("Unknown benchmark task")
         if request.get("track", "host-background") != "host-background":
@@ -449,6 +504,16 @@ class ScopedEngine:
         self.name, self.request, self.client = name, copy.deepcopy(request), client
         self.emit, self.clock_start = emit or (lambda event: None), clock_start or time.monotonic()
         self.native = request["task_id"] == "native_notes"
+        self.surface = request.get("browser_surface", "discrete")
+        if self.surface not in BROWSER_SURFACES:
+            raise UnsupportedEngine("Unknown browser surface")
+        if self.surface == "repl" and (name != "second-cursor" or self.native):
+            raise UnsupportedEngine("The repl browser surface needs Second Cursor and a browser task")
+        if self.surface == "repl" and action_log is None:
+            raise UnsupportedEngine("The repl browser surface audits the isolated instance's action log, which needs SC_HOME")
+        self.action_log, self.action_offset, self.breach = action_log, 0, None
+        self.repl_audit = {"repl_calls": 0, "logged_actions": 0, "navigations": [], "tabs_adopted": [],
+                           "audit_ms": 0.0, "breach": None} if self.surface == "repl" else None
         self.targets = request.get("targets", {})
         self.windows = {self.targets[key] for key in ("calculator_window_id", "notes_window_id") if type(self.targets.get(key)) is int}
         if self.native and len(self.windows) != 2:
@@ -518,6 +583,17 @@ class ScopedEngine:
         names = (SC_NATIVE if self.native else SC_BROWSER) if self.name == "second-cursor" else (CUA_NATIVE if self.native else CUA_BROWSER | CUA_WEB_NATIVE)
         if self.name == "second-cursor" and "harness_browser" in self.identity:
             names = names - {"browser_open"}  # The matched headed profile uses its visible initial tab.
+        if self.surface == "repl":
+            if "browser_repl" not in self.catalog or "browser_tabs" not in self.catalog:
+                raise UnsupportedEngine("Driver does not advertise browser_repl and browser_tabs")
+            names = names | {"browser_repl"}
+            try:
+                self.action_offset = self.action_log.stat().st_size if self.action_log.exists() else 0
+            except OSError as exc:
+                raise EngineError("Cannot read the isolated instance's action log") from exc
+        self.identity["browser_surface"] = self.surface
+        if self.surface == "repl":
+            self.identity["repl_scope"] = "lexical-urls+action-log+tab-audit-v1"
         self.allowed = {name: self._schema(self.catalog[name]) for name in names if name in self.catalog}
         if not self.allowed:
             raise UnsupportedEngine("Driver advertises none of the task's allowed tools")
@@ -675,6 +751,8 @@ class ScopedEngine:
             if "keys" in step_props:
                 step_props["keys"]["description"] = step_props["keys"].get("description", "") + KEY_SCOPE_DESCRIPTION
         schema["required"] = [key for key in schema["required"] if key in props]
+        if name == "browser_repl":
+            tool["description"] = tool.get("description", "") + REPL_SCOPE_DESCRIPTION
         tool["description"] = tool.get("description", "") + " Benchmark scope: only the provided fixture targets; background delivery only."
         return tool
 
@@ -717,6 +795,98 @@ class ScopedEngine:
         elif not any(isinstance(locator.get(key), str) and locator[key] for key in ("role", "label", "name", "text", "placeholder", "test_id")):
             raise ScopeError("A rendered-page locator needs a semantic anchor")
         return {**locator, "visible": True}
+
+    def _on_fixture_origin(self, url, blank_ok=True):
+        if blank_ok and url == "about:blank":
+            return True
+        if not isinstance(url, str) or not url:
+            return False
+        try:
+            target, fixture = urllib.parse.urlsplit(urllib.parse.urljoin(self.url, url)), urllib.parse.urlsplit(self.url)
+            return (target.scheme == fixture.scheme and target.hostname == fixture.hostname
+                    and target.port == fixture.port and target.username is None and target.password is None)
+        except ValueError:
+            return False
+
+    def _repl_code(self, code):
+        if not isinstance(code, str) or not code.strip():
+            raise ScopeError("browser_repl needs code")
+        strings = [match.group(2) for match in REPL_STRING.finditer(code)]
+        if (any(not self._on_fixture_origin(url, blank_ok=False) for url in REPL_URL.findall(code))
+                or any(REPL_SCHEMELESS.match(text.strip()) and text.strip() != "about:blank" or text.startswith("//")
+                       for text in strings)):
+            raise ScopeError("browser_repl code may name only the provided fixture URL; other URLs and schemes are outside the benchmark")
+        if any(clipboard_chord(text) for text in strings):
+            raise ScopeError("Clipboard key chords are outside the benchmark")
+
+    def _repl_breach(self, reason):
+        self.breach = self.repl_audit["breach"] = reason
+        raise ScopeBreach(reason + "; this trial has failed and no further actions run")
+
+    def _audit_repl_log(self):
+        """Every via=browser_repl action line the isolated instance wrote since the last audit."""
+        try:
+            with self.action_log.open("rb") as stream:
+                stream.seek(self.action_offset)
+                data = stream.read()
+        except OSError:
+            self._repl_breach("The isolated instance's action log could not be read to audit browser_repl")
+        complete = data[:data.rfind(b"\n") + 1]
+        self.action_offset += len(complete)
+        for line in complete.decode(errors="replace").splitlines():
+            try:
+                entry = json.loads(line)
+                detail = json.loads(entry.get("detail") or "{}")
+            except (ValueError, AttributeError):
+                if "browser_repl" in line:
+                    self._repl_breach("An unparsable browser_repl action line cannot be audited")
+                continue
+            if not isinstance(detail, dict) or detail.get("via") != "browser_repl":
+                continue
+            self.repl_audit["logged_actions"] += 1
+            tool, operation = entry.get("tool"), detail.get("operation")
+            if tool in REPL_LOGGED_NAVIGATION:
+                url = detail.get("url", "about:blank" if tool == "browser_open" else None)
+                if isinstance(url, str) and url.endswith("…"):
+                    url = url[:-1]
+                ok = self._on_fixture_origin(url)
+                self.repl_audit["navigations"].append({"tool": tool, "on_fixture_origin": ok})
+                if not ok:
+                    self._repl_breach("browser_repl navigated outside the fixture origin")
+            if (tool in REPL_FORBIDDEN_OPERATIONS or operation in REPL_FORBIDDEN_OPERATIONS
+                    or "files" in detail or clipboard_chord(detail.get("keys"))):
+                self._repl_breach("browser_repl used a clipboard, file or privileged browser operation")
+
+    def _audit_tabs(self):
+        """Read every agent tab's URL; adopt the fixture tabs the REPL opened so cleanup closes them."""
+        observed = self._host("browser_tabs", {}, "audit")
+        tabs = [row for value in payloads(observed) if isinstance(value, dict) and isinstance(value.get("tabs"), list)
+                for row in value["tabs"]]
+        if any(not isinstance(tab, dict) or type(tab.get("id")) is not int for tab in tabs):
+            self._repl_breach("The tab audit returned a malformed tab")
+        if any(not self._on_fixture_origin(tab.get("url")) for tab in tabs):
+            self._repl_breach("An agent tab is outside the fixture origin after browser_repl")
+        for tab in tabs:
+            if tab["id"] not in self.owned_tabs:
+                self.owned_tabs.add(tab["id"])
+                self.repl_audit["tabs_adopted"].append(tab["id"])
+
+    def audit_repl(self):
+        """Fail the trial if any browser_repl effect so far left the fixture scope. Safe to call repeatedly."""
+        if self.surface != "repl":
+            return None
+        if self.breach is None:
+            started = time.monotonic()
+            try:
+                self._audit_repl_log()
+                self._audit_tabs()
+            except ScopeBreach:
+                pass
+            except EngineError:
+                self.breach = self.repl_audit["breach"] = "The agent-tab audit after browser_repl could not run"
+            finally:
+                self.repl_audit["audit_ms"] += (time.monotonic() - started) * 1000
+        return self.breach
 
     def _validate(self, name, args, nested=False):
         if name not in self.allowed:
@@ -764,6 +934,8 @@ class ScopedEngine:
                     raise ScopeError("Capture was not observed for this exact fixture window")
             if name == "perform_action" and args.get("action") not in {"AXPress", "AXConfirm", "AXCancel", "AXPick", "AXShowMenu", "AXIncrement", "AXDecrement"}:
                 raise ScopeError("Accessibility action is not fixture-scoped")
+        elif name == "browser_repl":
+            self._repl_code(args.get("code"))
         else:
             if self.name == "second-cursor" and name != "browser_open":
                 static_help = name == "browser_command" and args.get("operation") == "capabilities" and "tab_id" not in args
@@ -835,8 +1007,14 @@ class ScopedEngine:
     def call(self, name, args):
         if self.closed:
             raise EngineError("Engine is closed")
+        if self.breach:
+            raise ScopeBreach(self.breach + "; this trial has failed and no further actions run")
         arguments = self._validate(name, args)
         result = self._invoke(name, arguments)
+        if name == "browser_repl":
+            self.repl_audit["repl_calls"] += 1
+            if self.audit_repl():
+                raise ScopeBreach(self.breach + "; this trial has failed and no further actions run")
         if _ok(result) and self.name == "cua-driver" and name == "get_window_state":
             result = self._project_window(result, arguments["window_id"])
             wid = arguments["window_id"]
@@ -987,6 +1165,7 @@ class ScopedEngine:
 def create_engine(name, request, emit=None, clock_start=None, env=None):
     env = dict(os.environ if env is None else env)
     timeout = min(float(request.get("timeout_seconds", 60)), 60)
+    action_log = None
     if name in {"second-cursor", "second-cursor-model"}:
         name = "second-cursor"
         url, token = env.get("SC_BENCH_MCP_URL"), env.get("SC_BENCH_MCP_TOKEN")
@@ -1001,6 +1180,8 @@ def create_engine(name, request, emit=None, clock_start=None, env=None):
                 url, token = "http://127.0.0.1:" + str(config["port"]) + "/mcp", config["token"]
             except (OSError, ValueError, KeyError) as exc:
                 raise UnsupportedEngine("Fixture SC_HOME has no usable MCP configuration") from exc
+            # Explicit credentials may name another instance, whose log this would not be.
+            action_log = pathlib.Path(home) / "logs/actions.jsonl"
         client = HTTPMCP(url, token, timeout)
         bundle = pathlib.Path(env.get("SC_E2E_APP") or pathlib.Path.home() / "Applications/SecondCursor.app").expanduser().resolve()
         binary = bundle / "Contents/MacOS/SecondCursor"
@@ -1038,4 +1219,4 @@ def create_engine(name, request, emit=None, clock_start=None, env=None):
         client = StdioMCP(command, timeout, env)
     else:
         raise UnsupportedEngine("Unknown benchmark engine")
-    return ScopedEngine(name, request, client, emit, clock_start, pinned_identity)
+    return ScopedEngine(name, request, client, emit, clock_start, pinned_identity, action_log)

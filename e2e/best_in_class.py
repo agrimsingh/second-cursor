@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 
+from benchmarks.engines import BROWSER_SURFACES
 from benchmarks.flight_fixtures import FLIGHT_TASKS
 from benchmarks.workspace_fixtures import WORKSPACE_TASKS
 
@@ -563,6 +564,9 @@ def validate_comparison(payloads):
         catalogs = [p.get("catalog_mode", "full") for p in payloads]
         if any(mode not in {"full", "compact"} for mode in catalogs) or len(set(catalogs)) != 1:
             raise ValueError("Cannot compare different or unknown catalog_mode values; use the explicit efficiency experiment")
+        surfaces = [p.get("browser_surface", "discrete") for p in payloads]
+        if any(surface not in BROWSER_SURFACES for surface in surfaces) or len(set(surfaces)) != 1:
+            raise ValueError("Cannot compare different or unknown browser_surface values; compare the per-trial tables instead")
         browser_tasks = any(task != "native_notes" for task in task_sets[0])
         configs = [validate_model_config(p.get("model_config")) for p in payloads]
         if any(c != configs[0] for c in configs[1:]):
@@ -677,6 +681,8 @@ def parser():
     task_cli.add_argument("--max-steps", type=int, default=40, help="Maximum total control-tool attempts per trial, including upfront observations")
     task_cli.add_argument("--observation-mode", choices=("on-demand", "upfront"), default="on-demand")
     task_cli.add_argument("--catalog-mode", choices=("full", "compact"), default="full")
+    task_cli.add_argument("--browser-surface", choices=BROWSER_SURFACES, default="discrete",
+                          help="repl also offers browser_repl to the model (Second Cursor browser tasks only)")
     task_cli.add_argument("--seed", type=int, action="append",
                           help="Workspace case seed or legacy trial ID; repeat once per round (not a model sampling seed)")
     task_cli.add_argument("--model-host-version", help="Pinned model host/version fingerprint, required for model runs")
