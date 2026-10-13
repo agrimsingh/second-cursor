@@ -15,7 +15,8 @@ For any task on a web page (Google Docs, Sheets, Gmail, a site), use the browser
 
 - `browser_open` the page's URL in your own background tab. It has the user's logins, and you get the page's DOM and screenshots. The user's clicks and typing in their own windows do not interrupt it. On the user's Chrome window, web apps that draw their own content (Docs, Sheets, Figma) are mostly missing from the outline, and every touch by the user stops you.
 - If the user names a tab they have open, claim it with `browser_command` `operation: "claim"` instead of reopening it.
-- `browser_instances` names each connected Chrome profile by its signed-in account. With more than one, pass `browser_id` for the profile signed in to the page's account.
+- Start with `browser_open`; don't call `status` or `browser_instances` first. Without `browser_id` it opens in the Chrome profile the user focused last, and tab calls follow the tab's profile. Only when the page needs a different account, find it in `browser_instances` and pass its `browser_id`.
+- Read prices and text from the outline the actions return, not from screenshots, and fill a known form in one `batch` with `tab_id`.
 - If `browser_status` says the extension is not connected, or no instance is signed in to the account the page needs, stop and ask the user to install or enable the Second Cursor extension in that Chrome profile. Do not fall back to driving their Chrome window.
 
 If tools fail with "not running" or permission errors, run `SecondCursor doctor` (the binary is `~/Applications/SecondCursor.app/Contents/MacOS/SecondCursor`) and report what it says. Never ask the user to click or switch apps for you.

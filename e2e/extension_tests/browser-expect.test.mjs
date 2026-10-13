@@ -35,6 +35,7 @@ function fixture({ integrate = false } = {}) {
     chrome: { tabs: { onRemoved: { addListener() {} }, get: async id => ({ id }) },
       runtime: { getManifest: () => ({ version: 'test' }), onStartup: { addListener() {} }, onInstalled: { addListener() {} } },
       alarms: { onAlarm: { addListener() {} }, get: async () => undefined, create() {} },
+      windows: { WINDOW_ID_NONE: -1, onFocusChanged: { addListener() {} } },
       debugger: { onEvent: { addListener() {} } } },
     attach: async () => {}, show() {}, hideSession: async () => {}, setCaption() {},
     structuredSnapshot: async (_tab, guard) => { observations.push('tree'); if (state.observation) return state.observation(guard); return { outline: 'public result', elements: [] }; },

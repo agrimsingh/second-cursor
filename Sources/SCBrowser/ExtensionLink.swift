@@ -57,6 +57,7 @@ final class ExtensionLink: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var active: [String: Connection] = [:]
     private var metadata: [String: [String: Any]] = [:]
+    private var tabOwners: [Int: String] = [:]
     private var extensionVersion: String?
     private var nextConnectionID = 1
     private var nextCallID = 1
@@ -140,7 +141,9 @@ final class ExtensionLink: @unchecked Sendable {
     {
         let checksExpectation = (params["expect"] != nil && !(params["expect"] is NSNull))
             || ["tab.expectPrepare", "tab.expectFinish"].contains(method)
-        let (connection, id) = try reserveCall(requiring: checksExpectation ? "browser_expect_v1" : nil)
+        let tabID = (params["tabId"] as? NSNumber)?.intValue
+        let (connection, browserID, id) = try reserveCall(
+            requiring: checksExpectation ? "browser_expect_v1" : nil, tabID: tabID)
         // Unsupported postconditions are known refusals, before the operation journal records any dispatch.
         try Execution.context.beforeDispatch()
         var params = params
@@ -167,6 +170,7 @@ final class ExtensionLink: @unchecked Sendable {
                     id, .failure(SCError.actionFailed("Browser call \(method) timed out after \(Int(timeout))s")))
             }
         }
+        if let browserID { recordOwner(browserID, of: reply.value, tabID: tabID) }
         guard let timings else { return reply.value }
         let roundTrip = Timing.since(sent)
         timings.add("bridge", ms: roundTrip)
@@ -180,34 +184,59 @@ final class ExtensionLink: @unchecked Sendable {
         return value
     }
 
-    private func reserveCall(requiring capability: String? = nil) throws -> (Connection, Int) {
+    /// Without browser_id, a tab goes to the browser that reported it and anything else to the profile the user
+    /// focused last. An unknown tab is refused rather than guessed: the guess could act in another profile's tab.
+    private func reserveCall(requiring capability: String? = nil, tabID: Int? = nil) throws -> (Connection, String?, Int) {
         lock.lock()
         defer { lock.unlock() }
-        let connection: Connection?
+        let browserID: String?
         if let id = Execution.context.browserID {
-            connection = active[id]
-        } else if active.count == 1 {
-            connection = active.values.first
-        } else if active.count > 1 {
-            throw SCError.invalidArgument("Multiple browsers connected; provide browser_id from browser_instances")
+            browserID = id
+        } else if active.count <= 1 {
+            browserID = active.keys.first
+        } else if let tabID {
+            guard let owner = tabOwners[tabID], active[owner] != nil else {
+                throw SCError.invalidArgument(
+                    "Multiple browsers connected and tab \(tabID) is not known to any; provide browser_id from browser_instances")
+            }
+            browserID = owner
         } else {
-            connection = nil
+            guard let recent = lastFocusedBrowser() else {
+                throw SCError.invalidArgument("Multiple browsers connected; provide browser_id from browser_instances")
+            }
+            browserID = recent
         }
-        guard let connection else {
+        guard let browserID, let connection = active[browserID] else {
             throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected")
         }
         if let capability {
             // Check the selected connection while holding the same lock that resolved it. A different browser's
             // newer extension must never authorize an expectation that this connection would silently ignore.
-            let browserID = active.first(where: { $0.value === connection })?.key
-            let capabilities = browserID.flatMap { metadata[$0]?["capabilities"] as? [String] } ?? []
+            let capabilities = metadata[browserID]?["capabilities"] as? [String] ?? []
             guard capabilities.contains(capability) else {
                 throw SCError.browserUnavailable("the connected extension does not support browser expect; reload the updated Second Cursor extension before retrying")
             }
         }
         let id = nextCallID
         nextCallID += 1
-        return (connection, id)
+        return (connection, browserID, id)
+    }
+
+    /// Caller holds `lock`. Extensions too old to report focus are never chosen.
+    private func lastFocusedBrowser() -> String? {
+        active.keys
+            .compactMap { id in (metadata[id]?["focused_at"] as? NSNumber).map { (id, $0.doubleValue) } }
+            .max { $0.1 < $1.1 }?.0
+    }
+
+    private func recordOwner(_ browserID: String, of value: [String: Any], tabID: Int?) {
+        var ids = tabID.map { [$0] } ?? []
+        let tabs = [value["tab"] as? [String: Any]].compactMap { $0 } + (value["tabs"] as? [[String: Any]] ?? [])
+        ids += tabs.compactMap { ($0["id"] as? NSNumber)?.intValue }
+        guard !ids.isEmpty else { return }
+        lock.lock()
+        for id in ids { tabOwners[id] = browserID }
+        lock.unlock()
     }
 
     private func finish(_ id: Int, _ result: Result<Reply, Error>) {
@@ -264,6 +293,12 @@ final class ExtensionLink: @unchecked Sendable {
             promote(connection, message: message)
             return
         }
+        if message["type"] as? String == "focus" {
+            lock.lock()
+            for id in active.keys where active[id] === connection { metadata[id]?["focused_at"] = message["at"] }
+            lock.unlock()
+            return
+        }
         guard let id = (message["id"] as? NSNumber)?.intValue else { return }
         lock.lock()
         let belongs = pending[id]?.connectionID == connection.id
@@ -280,9 +315,11 @@ final class ExtensionLink: @unchecked Sendable {
     func instances() -> Data {
         lock.lock()
         defer { lock.unlock() }
+        let preferred = active.count == 1 ? active.keys.first : lastFocusedBrowser()
         let browsers = active.keys.sorted().map { id -> [String: Any] in
             var info = metadata[id] ?? [:]
             info["id"] = id
+            info["default"] = id == preferred
             return info
         }
         return (try? JSONSerialization.data(withJSONObject: ["browsers": browsers])) ?? Data()
@@ -341,6 +378,7 @@ final class ExtensionLink: @unchecked Sendable {
         metadata[id] = [
             "name": message["name"] ?? "Chromium", "profile_name": message["profile_name"] ?? "",
             "extension_version": message["version"] ?? "", "capabilities": message["capabilities"] ?? [],
+            "focused_at": message["focused_at"] ?? NSNull(),
         ]
         extensionVersion = message["version"] as? String
         lock.unlock()

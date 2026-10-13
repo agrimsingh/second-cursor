@@ -344,7 +344,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_open",
                 description:
-                    "Open a URL in a new background Chrome tab owned by the agent, wait for the page to finish rendering, and return its outline (as browser_snapshot does). Use the returned tab id with the other browser tools.",
+                    "Open a URL in a new background Chrome tab owned by the agent, wait for the page to finish rendering, and return its outline (as browser_snapshot does). Use the returned tab id with the other browser tools. Without browser_id it opens in the Chrome profile the user focused last; call browser_instances only when the page needs a different profile's account.",
                 inputSchema: schema(["url": string("URL to open.")], required: ["url"])
             ),
             Tool(
@@ -555,7 +555,7 @@ enum ToolCatalog {
                 ], required: ["text"])),
         Tool(
             name: "browser_instances",
-            description: "Discover connected browser instances/profiles and their capabilities.",
+            description: "List connected browser profiles by signed-in account. default marks the profile calls without browser_id go to (the one the user focused last); tab calls follow the profile that owns the tab.",
             inputSchema: schema([:])),
         Tool(
             name: "browser_command",
@@ -563,7 +563,7 @@ enum ToolCatalog {
                 "Extended browser control. inspect requires arguments.locator; select_option requires arguments.locator and arguments.value. Snapshot refs work with browser_click/browser_type, not as top-level targets for inspect/select_option. Tab operations require an agent-owned or explicitly claimed tab. Call operation=capabilities for other operations and approval requirements.",
             inputSchema: schema(
                 [
-                    "browser_id": string("Instance from browser_instances; required when more than one is connected"),
+                    "browser_id": string("Instance from browser_instances; defaults to the tab's profile, else the profile the user focused last"),
                     "tab_id": tabID,
                     "operation": string(
                         "Operation",

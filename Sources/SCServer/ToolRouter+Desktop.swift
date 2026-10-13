@@ -84,6 +84,9 @@ extension ToolRouter {
             var runtime = sessions.statistics()
             runtime["http_connections"] = connectionCount()
             runtime["observed_apps"] = desktop.observedApps()
+            var browserJSON = Shape.browser(await browser.status())
+            browserJSON["instances"] =
+                (try? JSONSerialization.jsonObject(with: await browser.instances()) as? [String: Any])?["browsers"]
             return ToolOutput(json: [
                 "permissions": [
                     "accessibility": permissions.accessibility, "screen_recording": permissions.screenRecording,
@@ -91,7 +94,7 @@ extension ToolRouter {
                 "paused": PauseState.isPaused,
                 "runtime": runtime,
                 "agent_display": Shape.display(await agentDisplay.status()),
-                "browser": Shape.browser(await browser.status()),
+                "browser": browserJSON,
                 "native_capabilities": Shape.codable(await desktop.nativeCapabilities(windowID: nil)),
             ])
         case "capabilities":

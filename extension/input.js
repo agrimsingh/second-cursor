@@ -71,7 +71,11 @@ const COVERING = `function (hit) {
   }
   const text = (el.getAttribute("aria-label") || el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
   const what = el.getAttribute("role") || el.localName;
-  return text ? what + ' "' + (text.length > 60 ? text.slice(0, 60) + "…" : text) + '"' : what;
+  if (text) return what + ' "' + (text.length > 60 ? text.slice(0, 60) + "…" : text) + '"';
+  const box = el.getBoundingClientRect();
+  if (box.width * box.height >= 0.5 * innerWidth * innerHeight)
+    return "an empty " + what + " over the page, usually the backdrop of an open menu or dialog (press Escape or finish choosing in it)";
+  return what + (el.id ? "#" + el.id : "");
 }`;
 
 /**

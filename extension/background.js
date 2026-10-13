@@ -513,7 +513,7 @@ function connect() {
     scheduleRetry();
   });
   chrome.storage.local
-    .get(["instance_id", "profile_name"])
+    .get(["instance_id", "profile_name", "focused_at"])
     .then(async (data) => {
       const instance_id = data.instance_id ?? crypto.randomUUID();
       await chrome.storage.local.set({ instance_id });
@@ -521,6 +521,7 @@ function connect() {
       const account = await chrome.identity
         .getProfileUserInfo({ accountStatus: "ANY" })
         .catch(() => null);
+      const focusedNow = (await chrome.windows.getLastFocused().catch(() => null))?.focused;
       const ua = navigator.userAgent;
       try {
         current.postMessage({
@@ -528,6 +529,7 @@ function connect() {
           version: VERSION,
           instance_id,
           profile_name: data.profile_name ?? (account?.email || "Default"),
+          focused_at: focusedNow ? Date.now() : (data.focused_at ?? null),
           name: ua.includes("Edg/")
             ? "Edge"
             : ua.includes("Chrome/")
@@ -561,6 +563,18 @@ chrome.alarms.get(RECONNECT_ALARM).then((alarm) => {
   if (!alarm) chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 });
 
+// Each profile's extension sees only its own windows, so each reports when the user focuses one; the app sends
+// calls without browser_id to the profile focused last.
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  const at = Date.now();
+  chrome.storage.local.set({ focused_at: at });
+  try {
+    port?.postMessage({ type: "focus", at });
+  } catch {
+    // The host is gone; the next hello carries focused_at.
+  }
+});
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 connect();
