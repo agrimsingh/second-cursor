@@ -186,27 +186,38 @@ final class ExtensionLink: @unchecked Sendable {
 
     /// Without browser_id, a tab goes to the browser that reported it and anything else to the profile the user
     /// focused last. An unknown tab is refused rather than guessed: the guess could act in another profile's tab.
-    private func reserveCall(requiring capability: String? = nil, tabID: Int? = nil) throws -> (Connection, String?, Int) {
+    func selectInstance(tabID: Int?) throws -> String {
         lock.lock()
         defer { lock.unlock() }
-        let browserID: String?
-        if let id = Execution.context.browserID {
-            browserID = id
-        } else if active.count <= 1 {
-            browserID = active.keys.first
-        } else if let tabID {
+        return try selectedInstance(tabID: tabID)
+    }
+
+    /// Caller holds `lock`.
+    private func selectedInstance(tabID: Int?) throws -> String {
+        if active.count <= 1 {
+            guard let only = active.keys.first else {
+                throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected")
+            }
+            return only
+        }
+        if let tabID {
             guard let owner = tabOwners[tabID], active[owner] != nil else {
                 throw SCError.invalidArgument(
                     "Multiple browsers connected and tab \(tabID) is not known to any; provide browser_id from browser_instances")
             }
-            browserID = owner
-        } else {
-            guard let recent = lastFocusedBrowser() else {
-                throw SCError.invalidArgument("Multiple browsers connected; provide browser_id from browser_instances")
-            }
-            browserID = recent
+            return owner
         }
-        guard let browserID, let connection = active[browserID] else {
+        guard let recent = lastFocusedBrowser() else {
+            throw SCError.invalidArgument("Multiple browsers connected; provide browser_id from browser_instances")
+        }
+        return recent
+    }
+
+    private func reserveCall(requiring capability: String? = nil, tabID: Int? = nil) throws -> (Connection, String?, Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let browserID = try Execution.context.browserID ?? selectedInstance(tabID: tabID)
+        guard let connection = active[browserID] else {
             throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected")
         }
         if let capability {

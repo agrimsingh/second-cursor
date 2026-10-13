@@ -18,6 +18,8 @@ public final class BrowserBridge: BrowserControlling, @unchecked Sendable {
 
     public func instances() async -> Data { link.instances() }
 
+    public func selectInstance(tabID: Int?) async throws -> String { try link.selectInstance(tabID: tabID) }
+
     public func command(_ method: String, params: Data) async throws -> Data {
         let object = try JSONSerialization.jsonObject(with:params) as? [String:Any] ?? [:]
         if ["session.close", "session.pause", "session.resume", "session.takeover"].contains(method) {

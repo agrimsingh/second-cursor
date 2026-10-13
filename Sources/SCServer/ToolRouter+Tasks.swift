@@ -178,19 +178,16 @@ extension ToolRouter {
     func resolveBrowserTarget(_ name: String, _ raw: [String: Value]) async throws -> [String: Value] {
         guard (name.hasPrefix("browser_") && !["browser_status", "browser_instances"].contains(name))
             || Self.isTabBatch(name, Arguments(raw)) else { return raw }
-        let data = await browser.instances()
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        let ids = (json["browsers"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
+        let args = Arguments(raw)
         let chosen: String
-        if let requested = try Arguments(raw).optionalString("browser_id") {
+        if let requested = try args.optionalString("browser_id") {
+            let data = await browser.instances()
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            let ids = (json["browsers"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
             guard ids.contains(requested) else { throw SCError.browserUnavailable("The selected browser is not connected") }
             chosen = requested
         } else {
-            guard ids.count == 1 else {
-                if ids.isEmpty { throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected") }
-                throw SCError.invalidArgument("Multiple browsers connected; provide browser_id from browser_instances")
-            }
-            chosen = ids[0]
+            chosen = try await browser.selectInstance(tabID: try args.optionalInt("tab_id"))
         }
         var result = raw
         result["browser_id"] = .string(chosen)

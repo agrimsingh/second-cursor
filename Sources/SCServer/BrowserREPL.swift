@@ -107,15 +107,7 @@ final class BrowserREPL: @unchecked Sendable {
         // A Page retains a numeric Chrome tab id. Pin the selected browser before looking up its JS context so
         // switching profiles cannot silently redirect an old Page to a different tab with the same numeric id.
         var context = Execution.context
-        if context.browserID == nil {
-            let metadata = (try? JSONSerialization.jsonObject(with: await browser.instances())) as? [String: Any]
-            let browsers = metadata?["browsers"] as? [[String: Any]] ?? []
-            if browsers.isEmpty { throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected") }
-            guard let preferred = browsers.first(where: { $0["default"] as? Bool == true })?["id"] as? String else {
-                throw SCError.invalidArgument("Multiple browsers connected; provide browser_id from browser_instances")
-            }
-            context.browserID = preferred
-        }
+        if context.browserID == nil { context.browserID = try await browser.selectInstance(tabID: nil) }
         let key = SessionKey(sessionID: id, browserID: context.browserID!)
         let session = try lock.withLock { () throws -> Session in
             if sessions[key] == nil {

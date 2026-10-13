@@ -173,6 +173,8 @@ public protocol AgentDisplayControlling: AnyObject, Sendable {
 /// opened itself; implementations must not act on the user's own tabs.
 public protocol BrowserControlling: AnyObject, Sendable {
     func instances() async -> Data
+    /// The instance a call without browser_id goes to: the tab's browser, else the profile the user focused last.
+    func selectInstance(tabID: Int?) async throws -> String
     func command(_ method: String, params: Data) async throws -> Data
     func status() async -> BrowserStatus
     func listTabs() async throws -> [BrowserTab]
