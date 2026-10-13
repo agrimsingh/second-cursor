@@ -40,7 +40,7 @@ export async function ensureActionNetwork(tabId) {
   await attach(tabId);
   let state = requestTracking.get(tabId);
   if (!state) {
-    state = { requests: new Map(), sessions: new Map(), overflowAt: -Infinity };
+    state = { requests: new Map(), sessions: new Map(), overflowAt: -Infinity, background: new Set() };
     requestTracking.set(tabId, state);
   }
   // Failed enables may be retried before a later action, but never retry the action itself.
@@ -49,13 +49,24 @@ export async function ensureActionNetwork(tabId) {
     .filter(([key]) => key.startsWith(`${tabId}:`)).map(([, sessionId]) => trackNetworkSession(tabId, sessionId))]);
 }
 
-/** Request timing is a readiness hint, never evidence that the requested mutation succeeded. */
-export function actionNetworkState(tabId, since) {
+/**
+ * Starts tracking an attached tab's requests if nothing has. It never attaches (a tab released meanwhile stays
+ * released), and a failed enable is retried only before input.
+ */
+export async function trackRequests(tabId) {
+  if (attached.has(tabId) && !requestTracking.has(tabId)) await ensureActionNetwork(tabId);
+}
+
+/**
+ * Request timing is a readiness hint, never evidence that the requested mutation succeeded. Requests started from
+ * `since` count, except the page's own (noteBackgroundRequests) and any started from `until`, once the agent was idle.
+ */
+export function actionNetworkState(tabId, since, until = Infinity) {
   const state = requestTracking.get(tabId);
   if (!state) return { available: false, pending: 0, quiet: Infinity, failed: 0 };
   let pending = 0, finishedAt = -Infinity, failed = 0, inferred = 0;
   for (const request of state.requests.values()) {
-    if (request.startedAt < since) continue;
+    if (request.startedAt < since || request.startedAt >= until || state.background.has(request.key)) continue;
     const completedAt = request.finishedAt ?? request.bodyObservedAt;
     if (completedAt == null) pending++;
     else finishedAt = Math.max(finishedAt, completedAt);
@@ -66,6 +77,30 @@ export function actionNetworkState(tabId, since) {
   const incomplete = state.overflowAt >= since;
   const available = state.sessions.get("") === true && ![...state.sessions.values()].includes(false) && !incomplete;
   return { available, pending, quiet: Date.now() - finishedAt, failed, inferred, enabling, incomplete };
+}
+
+/**
+ * A request the page started while the agent was idle (`from`..`until`), or one in flight when the agent acted at
+ * `actedAt`, is the page's own: a poll, a heartbeat, a long poll. The same request (method, URL and body) started
+ * after a later action is not waited for. A request the action makes with a new URL or body always is.
+ */
+export function noteBackgroundRequests(tabId, actedAt, from, until) {
+  const state = requestTracking.get(tabId);
+  if (!state || !actedAt) return;
+  if (state.background.size > REQUEST_LIMIT) state.background.clear();
+  for (const request of state.requests.values()) {
+    const completedAt = request.finishedAt ?? request.bodyObservedAt ?? Infinity;
+    if ((request.startedAt < actedAt && completedAt > actedAt) || (request.startedAt >= from && request.startedAt < until))
+      state.background.add(request.key);
+  }
+}
+
+// FNV-1a, so the request's identity is kept without its URL or body.
+function requestKey(request = {}) {
+  let hash = 0x811c9dc5;
+  const text = `${request.method} ${request.url}\n${request.postData ?? ""}`;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+  return hash >>> 0;
 }
 
 // Chrome can omit loadingFinished when page code awaits Fetch headers but never consumes its response body.
@@ -121,6 +156,7 @@ function networkEvent(source, method, params) {
         state.overflowAt = Math.max(state.overflowAt, oldest[1].startedAt);
     }
     state.requests.set(key, { sessionId, frameId: params.frameId, loaderId: params.loaderId, startedAt,
+      key: previous?.key ?? requestKey(params.request),
       bodyAllowed: typeof params.request?.method === "string" && params.request.method.toUpperCase() !== "HEAD",
       redirected: Boolean(params.redirectResponse),
       receivedBytes: 0 });
@@ -159,6 +195,7 @@ function networkEvent(source, method, params) {
     if (request) Object.assign(request, { finishedAt: Date.now(), failed: method === "Network.loadingFailed" });
   } else if (method === "Page.frameNavigated") {
     const frame = params.frame;
+    if (!source.sessionId && !frame.parentId) state.background.clear();
     for (const [id, request] of state.requests) {
       const replaced = !source.sessionId && !frame.parentId
         ? request.loaderId !== frame.loaderId

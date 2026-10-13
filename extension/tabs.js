@@ -1,4 +1,4 @@
-import { attach, cdp, networkIdle, ensureActionNetwork, actionNetworkState } from "./cdp.js";
+import { attach, cdp, networkIdle, ensureActionNetwork, actionNetworkState, noteBackgroundRequests, trackRequests } from "./cdp.js";
 import { removeCursor, show } from "./cursor.js";
 import { BridgeError, sleep } from "./errors.js";
 import { add as addTiming, timed } from "./timing.js";
@@ -321,13 +321,16 @@ export async function settleAround(
   }
 }
 
-// Evaluated in its own isolated world, so the page never sees the observer.
+// Evaluated in its own isolated world, so the page never sees the observer. Its times are milliseconds ago (null when
+// unknown): when the agent acted, when a read first settled that action, and [from, until] windows the agent was idle.
 const SETTLE_WORLD = "SecondCursorSettle";
 const settleContexts = new Map();
-const SETTLE_PROBE = `(() => {
+const SETTLE_PROBE = (times) => `((times) => {
+  const LOG_MS = 30000, BUSY = '[aria-busy="true"],[role="progressbar"]:not([aria-valuenow])';
   let s = globalThis.__secondCursorSettle;
   if (!s || s.doc !== document) {
-    s = { doc: document, last: performance.now(), mutated: false };
+    // Each change is logged as [time, node, kind]; a null node (the document starting, a checkbox) always counts.
+    s = { doc: document, log: [[performance.now(), null, ""]], busy: new WeakMap() };
     // Most attribute changes are left out: animations and timers change them without the content changing. The ones
     // that say what an element is or shows (a menu expanding, a tab selected, a panel unhidden) are how many pages
     // react to a click, with no node added. The agent's own cursor (cursor.js), added when the agent starts work on
@@ -335,27 +338,55 @@ const SETTLE_PROBE = `(() => {
     const cursorOnly = (r) => r.target.id === "second-cursor-overlay" || (r.addedNodes.length + r.removedNodes.length > 0
       && [...r.addedNodes, ...r.removedNodes].every((n) => n.id === "second-cursor-overlay"));
     const changed = (records) => {
-      if (records.every(cursorOnly)) return;
-      s.last = performance.now();
-      s.mutated = true;
+      const now = performance.now(), seen = new Map();
+      for (const r of records) {
+        if (cursorOnly(r)) continue;
+        const node = r.type === "characterData" ? r.target.parentNode : r.target;
+        const kind = r.type === "attributes" ? r.attributeName
+          : [...r.addedNodes, ...r.removedNodes].every((n) => n.nodeType === Node.TEXT_NODE) ? "text" : "tree";
+        const kinds = seen.get(node) ?? new Set();
+        if (!kinds.has(kind)) s.log.push([now, node, kind]);
+        seen.set(node, kinds.add(kind));
+        for (const added of r.addedNodes)
+          if (added.nodeType === Node.ELEMENT_NODE)
+            for (const el of [added, ...added.querySelectorAll(BUSY)]) if (el.matches(BUSY)) s.busy.set(el, now);
+        if (r.attributeName === "aria-busy" && r.target.matches(BUSY)) s.busy.set(r.target, now);
+      }
+      const old = s.log.findIndex(([t]) => t >= now - LOG_MS);
+      s.log.splice(0, old < 0 ? s.log.length : Math.max(old, s.log.length - 5000));
     };
     new MutationObserver(changed).observe(document, { subtree: true, childList: true, characterData: true });
     new MutationObserver(changed).observe(document, { subtree: true, attributeFilter: ["aria-expanded", "aria-selected",
       "aria-checked", "aria-pressed", "aria-current", "aria-hidden", "aria-disabled", "aria-activedescendant", "hidden",
-      "open", "disabled"] });
+      "open", "disabled", "aria-busy"] });
     // Native checkbox/radio checked is a property, not an attribute. Count its committed change as a reaction;
     // counting every text input would incorrectly finish before debounced search results arrive.
     document.addEventListener("change", event => {
-      if (!event.target?.matches?.("input[type=checkbox],input[type=radio]")) return;
-      s.last = performance.now();
-      s.mutated = true;
+      if (event.target?.matches?.("input[type=checkbox],input[type=radio]")) s.log.push([performance.now(), null, "change"]);
     }, true);
     globalThis.__secondCursorSettle = s;
   }
-  return { quiet: performance.now() - s.last, mutated: s.mutated, ready: document.readyState };
-})()`;
+  const now = performance.now(), at = (ago) => (ago == null ? Infinity : now - ago);
+  // A node that changed the same way at least twice while the agent was idle changes on its own (a clock, a carousel,
+  // a poll's counter). Its changes are neither the action's reaction nor a reason the page is not yet quiet.
+  const idle = new Map();
+  for (const [t, node, kind] of s.log)
+    if (node && times.idle.some(([from, until]) => t >= at(from) && t < at(until))) {
+      const kinds = idle.get(node) ?? new Map();
+      idle.set(node, kinds.set(kind, (kinds.get(kind) ?? 0) + 1));
+    }
+  const counted = s.log.filter(([, node, kind]) => !(idle.get(node)?.get(kind) >= 2));
+  // A spinner or busy region the action made (before its read settled) means its result is still coming.
+  const busy = [...document.querySelectorAll(BUSY)].some((el) => s.busy.get(el) >= at(times.acted)
+    && s.busy.get(el) < at(times.read) && el.getClientRects().length > 0);
+  return { quiet: now - (counted.at(-1)?.[0] ?? now - LOG_MS), mutated: counted.some(([, , kind]) => kind !== ""), busy,
+    ready: document.readyState };
+})(${JSON.stringify(times)})`;
 
-async function settleProbe(tabId) {
+async function settleProbe(tabId, { actedAt, settledAt, idle = [] } = {}) {
+  const ago = (at) => (at == null ? null : Date.now() - at);
+  const times = { acted: actedAt ? ago(actedAt) : null, read: ago(settledAt),
+    idle: idle.map(([from, until]) => [ago(from), ago(until)]) };
   for (let retry = 0; retry < 2; retry++) {
     try {
       let contextId = settleContexts.get(tabId);
@@ -368,7 +399,7 @@ async function settleProbe(tabId) {
         settleContexts.set(tabId, contextId);
       }
       const { result, exceptionDetails } = await cdp(tabId, "Runtime.evaluate", {
-        expression: SETTLE_PROBE,
+        expression: SETTLE_PROBE(times),
         contextId,
         returnByValue: true,
       });
@@ -410,7 +441,13 @@ export function setTrackedQuietMs(ms) {
  * happened.
  */
 export function noteAction(tabId, at = Date.now(), load = false) {
-  lastAction.set(tabId, { at: Math.max(at, inputAt.get(tabId) ?? 0), load, reactMs: quickReactions.get(tabId) });
+  at = Math.max(at, inputAt.get(tabId) ?? 0);
+  // The agent was idle from the read that settled its previous action until this input. Input that no read has
+  // settled since (observe=none, a batch, this same input noted twice) keeps the window that preceded it.
+  const previous = lastAction.get(tabId);
+  const idle = !previous ? {} : previous.settledAt != null ? { idleFrom: previous.settledAt, idleUntil: at }
+    : { idleFrom: previous.idleFrom, idleUntil: previous.idleUntil };
+  lastAction.set(tabId, { at, load, reactMs: quickReactions.get(tabId), ...idle });
   quickReactions.delete(tabId);
 }
 
@@ -421,27 +458,35 @@ export function noteAction(tabId, at = Date.now(), load = false) {
  * a load, a page whose network has gone idle has no request left to wait for, so every read stops waiting for one.
  * A document the action started loading counts as such a load, and is waited for until it finishes (at most
  * ACTION_LOAD_MS). Document/XHR/Fetch requests started after input also hold the observation, bounded by that
- * same action deadline. Pre-existing requests do not. Quietness is a readiness hint, not a verified postcondition.
+ * same action deadline. Pre-existing requests do not, nor do the page's own (noteBackgroundRequests). Changes the
+ * page made on its own while the agent was idle do not count either, and a spinner or aria-busy region the action
+ * made holds the read like a request. Quietness is a readiness hint, not a verified postcondition.
  * The first probe of a document starts its clock, so an idle page costs `quietMs` once, and nothing on later reads.
  */
 export async function settled(tabId, { quietMs, timeoutMs = 2000, reactMs = 1200, requestTimeoutMs = ACTION_LOAD_MS } = {}) {
   const began = Date.now();
-  const { at: actedAt = 0, reactMs: quick } = lastAction.get(tabId) ?? {};
-  let { load = false } = lastAction.get(tabId) ?? {};
+  const action = lastAction.get(tabId);
+  const { at: actedAt = 0, reactMs: quick, idleFrom, idleUntil, settledAt } = action ?? {};
+  let { load = false } = action ?? {};
   const reactWithin = Math.min(reactMs, quick ?? reactMs);
   let deadline = began + timeoutMs;
   // Split out the wait for a reaction that has not started from the wait for the page to go quiet.
   let reacting = 0;
   let loading = 0;
   let fetching = 0;
-  let network = actionNetworkState(tabId, actedAt);
+  let busy = 0;
+  // Once a read has settled the action, the agent is idle again, so what the page does from then on is its own.
+  const idle = [[idleFrom, idleUntil], [settledAt, null]].filter(([from]) => from != null);
+  noteBackgroundRequests(tabId, actedAt, idleFrom, idleUntil);
+  const requests = () => actionNetworkState(tabId, actedAt, settledAt);
+  let network = requests();
   const result = (state, reason) => ({ state, ...(reason ? { reason } : {}),
     network: network.available ? "observed" : "unavailable", pending_requests: network.pending,
     ...(network.inferred ? { body_completion_inferred: network.inferred } : {}),
     failed_requests: network.failed, waited_ms: Date.now() - began });
   try {
     while (Date.now() < deadline) {
-      network = actionNetworkState(tabId, actedAt);
+      network = requests();
       if (actedAt && (network.pending || network.enabling)) {
         deadline = Math.max(deadline, actedAt + requestTimeoutMs);
         fetching += 50;
@@ -459,16 +504,22 @@ export async function settled(tabId, { quietMs, timeoutMs = 2000, reactMs = 1200
         }
         navigation.done = true;
       }
-      const state = await settleProbe(tabId);
+      const state = await settleProbe(tabId, { actedAt, settledAt, idle });
       if (!state) return result("unavailable", "The document could not be observed while settling.");
       // CDP events can arrive while the DOM probe is in flight. Recheck before declaring it ready.
-      network = actionNetworkState(tabId, actedAt);
+      network = requests();
       if (actedAt && (network.pending || network.enabling)) continue;
+      if (actedAt && state.busy) {
+        deadline = Math.max(deadline, actedAt + requestTimeoutMs);
+        busy += 50;
+        await sleep(50);
+        continue;
+      }
       const sinceAction = Date.now() - actedAt;
       let awaitingReaction = sinceAction < reactWithin && (!state.mutated || state.quiet >= sinceAction);
       // Retain a bounded reaction window for timers/debounces that have not started a request yet.
       if (awaitingReaction && load && (await networkIdle(tabId).catch(() => false))) awaitingReaction = false;
-      network = actionNetworkState(tabId, actedAt);
+      network = requests();
       if (actedAt && (network.pending || network.enabling)) continue;
       const quietFor = quietMs ?? (network.available && trackedQuietMs != null ? trackedQuietMs : 300);
       if (state.ready === "complete" && state.quiet >= quietFor && network.quiet >= quietFor && !awaitingReaction)
@@ -479,13 +530,19 @@ export async function settled(tabId, { quietMs, timeoutMs = 2000, reactMs = 1200
       if (awaitingReaction) reacting += pause;
       await sleep(pause);
     }
-    network = actionNetworkState(tabId, actedAt);
+    network = requests();
     return result("timed_out", "The readiness deadline expired; the action may still be running. Observe again before retrying a mutation.");
   } finally {
     addTiming(tabId, "settled", Date.now() - began);
     if (reacting) addTiming(tabId, "settled_awaiting_reaction", reacting);
     if (loading) addTiming(tabId, "settled_loading", loading);
     if (fetching) addTiming(tabId, "settled_requests", fetching);
+    if (busy) addTiming(tabId, "settled_busy", busy);
+    if (action && lastAction.get(tabId) === action && action.settledAt == null) {
+      action.settledAt = Date.now();
+      // Requests tracked from now on let the next action tell the page's own requests from the ones it causes.
+      await trackRequests(tabId).catch(() => {});
+    }
   }
 }
 

@@ -66,7 +66,7 @@ function fixture() {
     async action() { await context.api.noteInput(1); context.api.noteAction(1, now); return now; },
     request(id, { age = 0, type = 'Fetch', frameId = 'root', loaderId = 'loader', sessionId, tabId = 1, redirect = false, httpMethod = 'GET' } = {}) {
       send('Network.requestWillBeSent', { requestId: id, type, frameId, loaderId, wallTime: (now - age) / 1000,
-        request: { method: httpMethod },
+        request: { method: httpMethod, url: `/${id}` },
         ...(redirect ? { redirectResponse: {} } : {}) }, { tabId, sessionId });
     },
     response(id, response = {}, source = {}, hasExtraInfo = false) {
