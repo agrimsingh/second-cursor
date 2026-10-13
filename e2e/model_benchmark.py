@@ -29,7 +29,8 @@ def runner_fingerprint():
     for path in [ROOT / "model_benchmark.py", ROOT / "model_efficiency.py", ROOT / "model_sweep.py", ROOT / "best_in_class.py", ROOT / "run.py", ROOT / "start-browser.py",
                  *(ROOT / "benchmarks" / name for name in
                  ("model_adapter.py", "model_host.py", "cursor_model_host.py", "engines.py", "completion_timing.py", "tool_surface.py",
-                  "workspace.html", "workspace_fixtures.py", "workspace_driver.py")),
+                  "workspace.html", "workspace_fixtures.py", "workspace_driver.py",
+                  "flight.html", "flight_fixtures.py", "flight_driver.py")),
                  *(ROOT / "cursor_host" / name for name in ("bridge.mjs", "package.json", "package-lock.json"))]:
         digest.update(path.relative_to(ROOT).as_posix().encode())
         digest.update(b"\0")

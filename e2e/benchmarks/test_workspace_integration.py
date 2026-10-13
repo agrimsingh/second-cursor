@@ -60,7 +60,7 @@ class FakeContext:
 class WorkspaceIntegrationTests(unittest.TestCase):
     def test_regression_and_workspace_tasks_remain_available_to_both_clis(self):
         self.assertEqual(report.DEFAULT_TASKS, ("native_notes", "browser_work_order", "canvas_route", "transient_dialog"))
-        self.assertEqual(report.TASKS, report.DEFAULT_TASKS + report.WORKSPACE_TASKS)
+        self.assertEqual(report.TASKS, report.DEFAULT_TASKS + report.WORKSPACE_TASKS + report.FLIGHT_TASKS)
         self.assertIsNone(report.parser().parse_args(["tasks"]).task)
         self.assertIsNone(pilot.parser().parse_args([]).task)
         for task in report.WORKSPACE_TASKS:
