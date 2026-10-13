@@ -5,10 +5,23 @@ arguments, responses, or runtime safety checks. A one-step batch represents a
 standalone operation; observations and expectations belong to the outer batch.
 The existing scoped engine must still validate every nested action against its
 full original catalog. No task-specific targets or answers are encoded here.
+
+Run as a script, it measures the server's own `toolSurface` presets instead: one disposable test instance per
+preset, read over MCP like a client (initialize, then tools/list), reporting advertised tool count, schema bytes and
+instruction bytes. No browser or GUI is used.
+
+    python3 e2e/benchmarks/tool_surface.py [--app build/SecondCursor.app] [--surface default --surface compact ...]
+
+Output: e2e/artifacts/tool-surface-<ts>/report.md, report.json, transcript.jsonl (every initialize and tools/list).
 """
+import argparse
 import copy
+import datetime
 import hashlib
 import json
+import pathlib
+import sys
+import types
 
 
 READ_TOOLS = frozenset({"get_window_state", "inspect_element", "find_elements", "screenshot", "wait_for"})
@@ -152,3 +165,65 @@ def project_native_catalog(tools, catalog_mode="full"):
                 "schema_reduction_percent": 100 * (1 - len(projected_bytes) / len(original_bytes)),
                 "measurement": "Canonical UTF-8 catalog bytes, not provider token usage"}
     return projected, metadata
+
+
+SERVER_SURFACES = ("default", "full", "discrete", "compact", "repl")
+
+
+def _harness():
+    e2e = str(pathlib.Path(__file__).resolve().parents[1])
+    if e2e not in sys.path:
+        sys.path.insert(0, e2e)
+    import run
+    return run
+
+
+def measure_server_surfaces(surfaces=SERVER_SURFACES, app=None, transcript=None):
+    """What each `toolSurface` preset advertises, read from a live disposable instance per preset. `default` leaves
+    toolSurface unset. tools_list_characters is the e2e/ratchets.json measure (json.dumps of the tool list)."""
+    run = _harness()
+    results = {}
+    for surface in surfaces:
+        overrides = {} if surface == "default" else {"toolSurface": surface}
+        with run.TestInstance(overrides, app=app) as instance:
+            if transcript:
+                transcript.run.current = surface
+                instance.mcp.transcript = transcript
+            instructions = instance.mcp.initialize().get("instructions") or ""
+            tools = instance.mcp.rpc("tools/list")["tools"]
+        results[surface] = {
+            "advertised_tool_count": len(tools), "advertised_tool_names": [tool["name"] for tool in tools],
+            "schema_bytes": len(catalog_bytes(tools)), "tools_list_characters": len(json.dumps(tools)),
+            "instructions_bytes": len(instructions.encode("utf-8")),
+            "per_tool_schema_bytes": {tool["name"]: len(catalog_bytes(tool)) for tool in tools},
+        }
+    return results
+
+
+def main():
+    cli = argparse.ArgumentParser(description="Measure the server's toolSurface presets over MCP.")
+    cli.add_argument("--app", help="App bundle for the test instances (default: SC_E2E_APP, else the installed app)")
+    cli.add_argument("--surface", action="append", choices=SERVER_SURFACES,
+                     help="Preset to measure; repeatable (default: all)")
+    args = cli.parse_args()
+    directory = (pathlib.Path(__file__).resolve().parents[1] / "artifacts"
+                 / f"tool-surface-{datetime.datetime.now():%Y%m%d-%H%M%S}")
+    directory.mkdir(parents=True)
+    run = _harness()
+    transcript = run.Transcript(directory / "transcript.jsonl", types.SimpleNamespace(current=None))
+    results = measure_server_surfaces(tuple(args.surface or SERVER_SURFACES), app=args.app, transcript=transcript)
+    app = str(pathlib.Path(args.app).resolve()) if args.app else str(run.APP_BUNDLE)
+    (directory / "report.json").write_text(json.dumps({"app": app, "surfaces": results}, indent=2) + "\n")
+    lines = [f"# toolSurface presets\n\nApp: `{app}`\n",
+             "| Preset | Tools | Schema bytes | tools/list characters | Instructions bytes |",
+             "| --- | ---: | ---: | ---: | ---: |"]
+    lines += [f"| {name} | {r['advertised_tool_count']} | {r['schema_bytes']} | {r['tools_list_characters']} | "
+              f"{r['instructions_bytes']} |" for name, r in results.items()]
+    lines += [""] + [f"- {name}: {', '.join(r['advertised_tool_names'])}" for name, r in results.items()]
+    (directory / "report.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"\n{directory}")
+
+
+if __name__ == "__main__":
+    main()

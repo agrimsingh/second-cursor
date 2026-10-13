@@ -111,10 +111,23 @@ Second Cursor runs no model of its own; choose one in your connected client. The
 | Sessions (for hosts; callable but not in `tools/list`, like the `session_id`, action `operation_id`, `observation_id` and host `timeout_ms` arguments) | `session`, `bind_target`, `cancel_operation` |
 | Editing | `inspect_element`, `select_text`, `paste` |
 | Extended browser | `browser_instances`, `browser_command` (DOM, dialogs, files, exports, screenshots, history, assets) |
-| Browser REPL (opt-in, `toolSurface: "full"`) | `browser_repl`: persistent JavaScript with a Playwright-compatible `page` ([details](docs/api.md#browser-repl)) |
+| Browser REPL | `browser_repl`: persistent JavaScript with a Playwright-compatible `page`, for a multi-step web flow in one call ([details](docs/api.md#browser-repl)) |
 | Input | `batch` (also as `act`), `click`, `drag`, `type_text`, `set_value`, `press_key`, `scroll`, `perform_action` |
 | Agent display (optional) | `agent_display`, `move_to_agent_display`, `return_window` |
 | Browser | `browser_status`, `browser_tabs`, `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_screenshot`, `browser_close` |
+
+### Tool surface presets
+
+`"toolSurface"` in `config.json` picks what `tools/list` advertises; it is read at startup. Every tool stays callable on every preset, so the SDK and existing clients keep working.
+
+| `toolSurface` | Tools | Schema bytes | For |
+| --- | ---: | ---: | --- |
+| unset (or `"full"`) | 39 | 51,904 | Clients that take the whole catalog |
+| `"discrete"` | 38 | 50,681 | The default without `browser_repl` |
+| `"compact"` | 10 | 17,817 | Clients with tool-count limits or weaker models: `status`, `list_windows`, `launch_app`, `get_window_state`, `find_elements`, `act` (batch for windows and tabs), `operation_status`, `browser_open`, `browser_snapshot`, `browser_repl` |
+| `"repl"` | 1 | 1,224 | `browser_repl` alone, with no server instructions |
+
+`python3 e2e/benchmarks/tool_surface.py --app build/SecondCursor.app` measures each preset over MCP from disposable instances.
 
 ## Safety
 

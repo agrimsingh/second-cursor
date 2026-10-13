@@ -62,7 +62,7 @@ Ways it can fail, written down before the code, each with the design decision th
 18. The action log misses REPL work: each call is logged with its code, and each navigation with its URL.
 19. The page closes under the script: its calls fail with "Target page has been closed"; context.newPage() works.
 20. Turn end loses work: agent tabs stay open at turn end, so the REPL does too; it ends with its session.
-21. toolSurface "repl" advertises only browser_repl, and every tool stays callable.
+21. toolSurface "repl" advertises only browser_repl, and every tool stays callable; "discrete" leaves it out.
 
 Usage:  SC_E2E_APP=build/SecondCursor.app python3 e2e/repl.py [scenario ...]
 Output: e2e/artifacts/<run-id>/ (report.md, results.json, transcript.jsonl, screenshots/)
@@ -545,8 +545,9 @@ def repl_client_gives_up(ctx):
 @scenario
 def repl_surface(ctx):
     """Failure mode 21: toolSurface "repl" lists only browser_repl; every tool stays callable. The default surface
-    leaves browser_repl out, "full" adds it, and it answers on every surface."""
-    with TestInstance({"toolSurface": "repl"}) as inst:
+    ("full" too) lists browser_repl beside the discrete browser tools, "discrete" leaves it out, and it answers on
+    every surface."""
+    with TestInstance({"toolSurface": "repl"}, browser=True) as inst:
         init = inst.mcp.initialize()
         names = [t["name"] for t in inst.mcp.rpc("tools/list")["tools"]]
         ctx.check("tools/list advertises only browser_repl", names == ["browser_repl"], names)
@@ -557,13 +558,18 @@ def repl_surface(ctx):
     with TestInstance() as inst:
         inst.mcp.initialize()
         names = [t["name"] for t in inst.mcp.rpc("tools/list")["tools"]]
-        ctx.check("the default surface lists the discrete browser tools but not browser_repl",
-                  "browser_click" in names and "browser_repl" not in names, names)
+        ctx.check("the default surface lists browser_repl next to the discrete browser tools",
+                  "browser_repl" in names and "browser_click" in names and "act" not in names, names)
+        default = names
+    with TestInstance({"toolSurface": "discrete"}, browser=True) as inst:
+        inst.mcp.initialize()
+        names = [t["name"] for t in inst.mcp.rpc("tools/list")["tools"]]
+        ctx.check('toolSurface "discrete" lists the default surface without browser_repl',
+                  names == [n for n in default if n != "browser_repl"], names)
         result = inst.mcp.rpc("tools/call", {"name": "browser_repl", "arguments": {"code": "2 + 2"}})
         ctx.check("browser_repl still answers there", result["content"][0]["text"] == "4", result)
     names = [t["name"] for t in ctx.mcp.rpc("tools/list")["tools"]]
-    ctx.check('toolSurface "full" lists browser_repl next to the discrete browser tools',
-              "browser_repl" in names and "browser_click" in names and "act" not in names, names)
+    ctx.check('toolSurface "full" lists what the default surface does', names == default, names)
 
 
 if __name__ == "__main__":

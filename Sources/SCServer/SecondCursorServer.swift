@@ -33,7 +33,7 @@ public final class SecondCursorServer: @unchecked Sendable {
         - Custom-drawn apps may stop repainting while on a Space the user is not viewing; trust the accessibility tree over a stale screenshot.
         - Browser tools act on agent-created tabs. Personal tab discovery/claim, history, clipboard, uploads and raw CDP require local user approval.
         - For a web page, start with browser_open: it picks the Chrome profile the user is in, so status and browser_instances are not needed first.
-        - Every turn costs seconds, so make fewer calls: browser_open and browser actions return the tab's outline or a diff, so read it instead of calling browser_snapshot; read text and prices from it, not from screenshots; put steps you already know in one batch with tab_id.
+        - Every turn costs seconds, so make fewer calls: browser_open and browser actions return the tab's outline or a diff, so read it instead of calling browser_snapshot; read text and prices from it, not from screenshots; put steps you already know in one batch with tab_id; run a multi-step web flow (a form, a search with filters, collecting results) as one browser_repl call.
         - Browser operation argument help is available through browser_command(operation=capabilities).
         - Calls may run concurrently; send order-dependent actions (typing, key sequences, button presses) one at a time.
         """

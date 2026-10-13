@@ -38,6 +38,7 @@ class PublicBrowserCatalogTests(unittest.TestCase):
             main.write_text('import Foundation\n'
                 'let catalogs = ["default": ToolCatalog.advertised(surface: nil), '
                 '"full": ToolCatalog.advertised(surface: "full"), '
+                '"discrete": ToolCatalog.advertised(surface: "discrete"), '
                 '"compact": ToolCatalog.advertised(surface: "compact")]\n'
                 'FileHandle.standardOutput.write(try JSONEncoder().encode(catalogs))\n')
             command = ["xcrun", "swiftc", "-I", str(products), "-module-cache-path", str(scratch / "module-cache"),
@@ -100,15 +101,16 @@ class PublicBrowserCatalogTests(unittest.TestCase):
         self.assertIn("window_id", self.tools["batch"]["inputSchema"]["properties"])
         compact = {tool["name"]: tool for tool in self.catalogs["compact"]}
         self.assertEqual(self.tools["batch"]["inputSchema"], compact["act"]["inputSchema"])
-        for surface in self.catalogs.values():
-            self.assertEqual(next(tool for tool in surface if tool["name"] == "browser_command"), self.command)
+        for name, surface in self.catalogs.items():
+            listed = [tool for tool in surface if tool["name"] == "browser_command"]
+            self.assertEqual(listed, [] if name == "compact" else [self.command], name)
 
     def test_browser_postconditions_are_typed_on_every_supported_surface(self):
         inputs = {"browser_click", "browser_type", "browser_press_key", "browser_scroll"}
         for name, surface in self.catalogs.items():
             with self.subTest(surface=name):
                 tools = {tool["name"]: tool for tool in surface}
-                for tool in inputs:
+                for tool in inputs & tools.keys():
                     expect = tools[tool]["inputSchema"]["properties"]["expect"]
                     shapes = expect["anyOf"]
                     self.assertEqual(shapes[1], {"type": "string"})
@@ -129,7 +131,7 @@ class PublicBrowserCatalogTests(unittest.TestCase):
                 self.assertIn("ref", fields)
                 self.assertIn("element_index", fields)
                 self.assertIn("failed/skipped", condition["description"])
-                for unsupported in ("browser_navigate", "browser_command", "browser_open", "browser_snapshot"):
+                for unsupported in {"browser_navigate", "browser_command", "browser_open", "browser_snapshot"} & tools.keys():
                     self.assertNotIn("expect", tools[unsupported]["inputSchema"]["properties"])
                 if "browser_repl" in tools:
                     self.assertNotIn("expect", tools["browser_repl"]["inputSchema"]["properties"])

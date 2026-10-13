@@ -17,9 +17,10 @@ Ways the feature could fail, written down before the code:
 10. find_elements skips the gates reads go through (app approval), or refuses a call without text or role unclearly.
 11. act diverges from batch: different step results, observation, stop_on_error behavior, refusal text, accepted step
     shapes (flat, args object, args as a JSON string), or action log lines.
-12. The compact surface advertises the wrong tools, hides act or find_elements, makes hidden tools uncallable, or gives
-    act a schema that drifts from batch's; /api and /mcp list different tools.
-13. The full surface advertises act, or omits find_elements.
+12. The compact surface advertises the wrong tools (anything but its ten: status, list_windows, launch_app,
+    get_window_state, find_elements, act, operation_status, browser_open, browser_snapshot, browser_repl), makes hidden
+    tools uncallable, or gives act a schema that drifts from batch's; /api and /mcp list different tools.
+13. The full surface advertises act, or omits find_elements or browser_repl.
 14. tools/list grows past its ceiling in ratchets.json, or still lists what only hosts use: session_id, mutation operation_id,
     observation_id or timeout_ms on a tool (wait_for's and browser_repl's timeout_ms are the model's), or session,
     ownership and cancellation tools. Read-only operation_status must expose its required operation_id.
@@ -44,7 +45,8 @@ SCENARIOS.clear()
 
 LINE = re.compile(r'^\[(\d+)\] (AX\w+) "((?:[^"\\]|\\.)*)"')
 FRAME = re.compile(r"\((-?\d+),(-?\d+) (\d+)x(\d+)\)")
-HIDDEN_IN_COMPACT = {"click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "batch"}
+COMPACT_TOOLS = {"status", "list_windows", "launch_app", "get_window_state", "find_elements", "act", "operation_status",
+                 "browser_open", "browser_snapshot", "browser_repl"}
 HOST_TOOLS = {"session", "bind_target", "cancel_operation"}
 HOST_PARAMETERS = {"session_id", "operation_id", "observation_id", "timeout_ms"}
 
@@ -336,7 +338,10 @@ def full_surface(ctx):
     names = {t["name"] for t in ctx.mcp.rpc("tools/list")["tools"]}
     ctx.check("the default surface advertises find_elements", "find_elements" in names, sorted(names))
     ctx.check("and not act", "act" not in names, sorted(names))
-    ctx.check("and still every single-action tool and batch", HIDDEN_IN_COMPACT <= names, sorted(HIDDEN_IN_COMPACT - names))
+    actions = {"click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "batch"}
+    ctx.check("and still every single-action tool and batch", actions <= names, sorted(actions - names))
+    ctx.check("and browser_repl beside the discrete browser tools", {"browser_repl", "browser_click"} <= names,
+              sorted(names))
     ctx.check("/api lists the same tools", api_tool_names(ctx.run.instance) == names if ctx.run.instance else True)
     find = next(t for t in ctx.mcp.rpc("tools/list")["tools"] if t["name"] == "find_elements")
     ctx.check("find_elements is read-only and says it does not re-read the app",
@@ -407,11 +412,7 @@ def compact_surface(ctx):
     ratchet.check(ctx, "tools/list characters, compact surface", len(json.dumps(listed)))
     tools = {t["name"]: t for t in listed}
     names = set(tools)
-    ctx.check("compact advertises act and find_elements", {"act", "find_elements"} <= names, sorted(names))
-    ctx.check("and hides the single-action tools and batch", not (HIDDEN_IN_COMPACT & names), sorted(HIDDEN_IN_COMPACT & names))
-    kept = {"status", "list_windows", "launch_app", "get_window_state", "screenshot", "select_text", "paste",
-            "inspect_element"}
-    ctx.check("everything else stays", kept <= names, sorted(kept - names))
+    ctx.check("compact advertises its ten tools and nothing else", names == COMPACT_TOOLS, sorted(names ^ COMPACT_TOOLS))
     ctx.check("/api lists the same tools as /mcp", api_tool_names(inst) == names, sorted(api_tool_names(inst) ^ names))
     ctx.check("act's schema is batch's", tools.get("act", {}).get("inputSchema") == main_tools["batch"]["inputSchema"])
     ctx.check("act's description presents it as the way to act", "the way to act" in tools.get("act", {}).get("description", ""))

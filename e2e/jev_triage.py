@@ -16,14 +16,14 @@ Arms, each against a fresh test instance:
   jev             Jev drives: each step sends Jev the goal, the page outline from browser_snapshot and the recent
                   clicks, and asks which control to click next (a choice over every ref on the page, plus done and
                   blocked). No task-specific code. jev:N asks for the next N clicks in one call.
-  agent:M         cursor-agent -p with model M and the instance's MCP tools only, on the default surface, which leaves
-                  browser_repl out (as for script and script-jev).
+  agent:M         cursor-agent -p with model M and the instance's MCP tools only, on toolSurface "discrete", which
+                  leaves browser_repl out (as for script and script-jev).
   script:M        The same, plus a shell and the Second Cursor SDK, so M can write and run Node scripts.
   script-jev:M    script:M plus ./jev.mjs (e2e/jev.mjs), which lets those scripts ask Jev for per-item decisions.
   repl:M          cursor-agent -p with model M and one tool, browser_repl (the instance runs with toolSurface "repl"):
                   a persistent JavaScript REPL whose `page` is Playwright-shaped, in the spirit of Aside's browser
                   agent. No skill: its prompt only says that a Playwright page is available.
-  both:M          cursor-agent -p with model M and toolSurface "full": the discrete browser tools and browser_repl; the
+  both:M          cursor-agent -p with model M and the default surface: the discrete browser tools and browser_repl; the
                   prompt names neither, and tool_counts records which it chose.
 The other agent arms get the project skill (.cursor/skills/second-cursor/SKILL.md). Every agent arm opens the page
 itself.
@@ -630,7 +630,7 @@ if __name__ == "__main__":
     for _ in range(repeat):
         for kind, model, lookahead in arms:
             SCENARIOS[:] = [triage(kind, model, lookahead, timeout)]
-            surface = {"toolSurface": "repl"} if kind == "repl" else {"toolSurface": "full"} if kind == "both" else {}
+            surface = {"toolSurface": "repl"} if kind == "repl" else {} if kind == "both" else {"toolSurface": "discrete"}
             trial = run.Run(config_overrides={"approvals": "allow", "appApproval": "off", **surface}, browser=True)
             renamed = trial.dir.with_name(f"triage-{trial.dir.name}-{'live-' if LIVE else ''}"
                                           f"{arm_label(kind, model, lookahead).replace(':', '-')}")

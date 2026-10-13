@@ -45,23 +45,30 @@ enum ToolCatalog {
         return [tool, Tool(name: "act", description: actDescription, inputSchema: tool.inputSchema, annotations: tool.annotations)]
     }
 
-    /// Hidden from tools/list by `toolSurface: "compact"`; they stay callable.
-    static let compactHiddenTools: Set<String> = [
-        "click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_action", "batch",
+    /// Listed by `toolSurface: "compact"`, for clients with tool-count limits or weaker models: act in place of batch
+    /// and the single-action tools, browser_repl for web flows, and what acting on a native window needs.
+    static let compactTools: Set<String> = [
+        "status", "list_windows", "launch_app", "get_window_state", "find_elements", "act", "operation_status",
+        "browser_open", "browser_snapshot", "browser_repl",
     ]
 
-    /// What tools/list shows: the single-action tools and batch, ("compact") act in their place, ("full") browser_repl
-    /// as well, or ("repl") browser_repl alone. Models offered both browser_repl and the discrete browser tools mixed
-    /// them and ran slower than with either, so browser_repl is listed only when asked for.
+    /// What tools/list shows: every tool but act (the default, or "full"), the same without browser_repl
+    /// ("discrete"), `compactTools` ("compact"), or browser_repl alone ("repl"). Models offered browser_repl beside the
+    /// discrete browser tools with no say on which to use mixed the two and ran slower than with either, so their
+    /// descriptions divide the work: browser_repl for multi-step flows, the browser_ tools for single steps.
     /// `expand` is listed only when reads are condensed (`condenseOutlines`), since nothing is hidden otherwise.
     /// Session ownership, retry IDs and deadlines are normally managed by hosts.
     /// Outcome reconciliation stays discoverable because an uncertain result can
     /// require the model to inspect a journaled operation before choosing its next action.
     static func advertised(surface: String?, condensing: Bool = false) -> [Tool] {
-        let hidden: Set<String> = surface == "compact" ? compactHiddenTools.union(["browser_repl"])
-            : surface == "full" ? ["act"] : ["act", "browser_repl"]
-        let listed = surface == "repl" ? tools.filter { $0.name == "browser_repl" }
-            : tools.filter { !hidden.contains($0.name) && !hostTools.contains($0.name) }
+        let listed: [Tool]
+        switch surface {
+        case "repl": listed = tools.filter { $0.name == "browser_repl" }
+        case "compact": listed = tools.filter { compactTools.contains($0.name) }
+        default:
+            let hidden: Set<String> = surface == "discrete" ? ["act", "browser_repl"] : ["act"]
+            listed = tools.filter { !hidden.contains($0.name) && !hostTools.contains($0.name) }
+        }
         return listed.map { tool in
             guard case .object(var schema) = tool.inputSchema, case .object(var properties)? = schema["properties"]
             else { return tool }
@@ -84,7 +91,7 @@ enum ToolCatalog {
             + "were read, without reading again.")
 
     private static let actDescription =
-        "Act on one window: run a list of steps strictly in order, then get one observation after the UI settles. This is the way to act, with one step or many: put every step you already know in one call (pressing a known series of buttons, filling known fields, typing followed by a shortcut), and end the list before any step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet); then look at the observation and send the next list. Each step is a tool name (click, type_text, press_key, set_value, scroll, drag, perform_action, wait) plus that action's arguments. Element indexes come from get_window_state or find_elements and are not refreshed between steps. Pixel steps (x/y) take coordinate_space and stop the list if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the list stops at the first failure. The observation is a diff like get_window_state unless full=true. \(tabBatch)"
+        "Act on one window or agent tab: run a list of steps strictly in order, then get one observation after the UI settles. This is the way to act, with one step or many: put every step you already know in one call (pressing a known series of buttons, filling known fields, typing followed by a shortcut), and end the list before any step whose outcome you need to see first (a menu, dialog, or search results opening, or anything whose element indexes you do not know yet); then look at the observation and send the next list. Each step is a tool name (click, type_text, press_key, set_value, scroll, drag, perform_action, wait) plus that action's arguments. Element indexes come from get_window_state or find_elements and are not refreshed between steps. Pixel steps (x/y) take coordinate_space and stop the list if the window has changed size since you last observed it, because the coordinates would be stale. Each step's result reports ok, route, and error; by default the list stops at the first failure. The observation is a diff like get_window_state unless full=true. \(tabBatch)"
 
     private static let tabBatch =
         "With tab_id instead of window_id, the steps act in that agent tab: browser_click (ref, or x and y), browser_type (text, optional ref and submit), browser_press_key, browser_scroll and wait, with refs from the tab's latest outline (not refreshed between steps, so end the list where a step re-renders what later steps target); the observation is the tab's diff. expect checks once before the batch and waits after its last step: text, or ref with exact value for tabs (element_index with value for windows). Any failed or skipped step makes the expectation failed."
@@ -166,7 +173,7 @@ enum ToolCatalog {
             Tool(
                 name: "find_elements",
                 description:
-                    "Search the window's latest observation for elements by text and/or role, instead of reading a big window's whole outline. Text matches each element's label, value and description, ignoring case: exact matches first, then prefixes, then substrings. The search covers every element of that observation, including ones a truncated outline (max_elements) left out. Returns matching outline lines with [index] and frames, like get_window_state's; use the indexes with act or the other actions. It does not read the app again: it sees the UI as of the latest get_window_state or action observation of this window (observation_id). After the UI changed without an observation (observe=none, or time passing), call get_window_state first. A window this session has not observed yet is read once, and that read becomes its observation.",
+                    "Search the window's latest observation for elements by text and/or role, instead of reading a big window's whole outline. Text matches each element's label, value and description, ignoring case: exact matches first, then prefixes, then substrings. The search covers every element of that observation, including ones a truncated outline (max_elements) left out. Returns matching outline lines with [index] and frames, like get_window_state's; use the indexes with act or the other actions. Native windows only: a page in an agent tab is read with browser_snapshot. It does not read the app again: it sees the UI as of the latest get_window_state or action observation of this window (observation_id). After the UI changed without an observation (observe=none, or time passing), call get_window_state first. A window this session has not observed yet is read once, and that read becomes its observation.",
                 inputSchema: schema([
                     "window_id": windowID,
                     "text": string("Text to look for in labels, values and descriptions."),
@@ -344,7 +351,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_open",
                 description:
-                    "Open a URL in a new background Chrome tab owned by the agent, wait for the page to finish rendering, and return its outline (as browser_snapshot does). Use the returned tab id with the other browser tools. Without browser_id it opens in the Chrome profile the user focused last; call browser_instances only when the page needs a different profile's account.",
+                    "Open a URL in a new background Chrome tab owned by the agent, wait for the page to finish rendering, and return its outline (as browser_snapshot does): read text, prices and refs from it, not from a screenshot or another read. Use the returned tab id with the other browser tools. Without browser_id it opens in the Chrome profile the user focused last; call browser_instances only when the page needs a different profile's account.",
                 inputSchema: schema(["url": string("URL to open.")], required: ["url"])
             ),
             Tool(
@@ -356,7 +363,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_snapshot",
                 description:
-                    "Read an agent tab as a compact accessibility outline; interactive nodes carry [ref] markers for browser_click and browser_type. Waits briefly for content the page is still rendering. Your first read of a tab (browser_open counts) returns the whole outline; later reads return only what changed since your previous read or action (is_diff=true): lines starting with + are new or changed, lines starting with - are gone, and \"(no changes)\" means the page is the same. A large change returns the whole outline again. The browser actions already return this diff, so call this for the whole outline (full=true) or after waiting for the page.",
+                    "Read an agent tab as a compact accessibility outline; interactive nodes carry [ref] markers for browser_click and browser_type. Waits briefly for content the page is still rendering. Your first read of a tab (browser_open counts) returns the whole outline; later reads return only what changed since your previous read or action (is_diff=true): lines starting with + are new or changed, lines starting with - are gone, and \"(no changes)\" means the page is the same. A large change returns the whole outline again. browser_open and the browser actions already return the outline or this diff, so do not call this right after them; call it for the whole outline (full=true) or after waiting for the page.",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
@@ -370,7 +377,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_click",
                 description:
-                    "Click an element in an agent tab by ref from browser_snapshot (preferred), or at x,y CSS pixels in the viewport. Returns what changed on the page once it settles (observation, a diff like browser_snapshot's), so you rarely need to read the tab again.",
+                    "Click an element in an agent tab by ref from browser_snapshot (preferred), or at x,y CSS pixels in the viewport. Returns what changed on the page once it settles (observation, a diff like browser_snapshot's), so there is no need to read the tab after it. Clicks and typing you already know go in one batch with tab_id; a multi-step flow in one browser_repl call.",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
@@ -382,7 +389,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_type",
                 description:
-                    "Type text into the editable element with ref, or the currently focused editable element. Verifies editability and focus before typing. For a native dropdown, use browser_command with operation=select_option. submit=true sends Enter afterwards only if the target retains focus. Returns what changed on the page once it settles (observation, a diff like browser_snapshot's).",
+                    "Type text into the editable element with ref, or the currently focused editable element. Verifies editability and focus before typing. For a native dropdown, use browser_command with operation=select_option. submit=true sends Enter afterwards only if the target retains focus. Returns what changed on the page once it settles (observation, a diff like browser_snapshot's). Fill several known fields in one batch with tab_id.",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
@@ -414,7 +421,7 @@ enum ToolCatalog {
             ),
             Tool(
                 name: "browser_screenshot",
-                description: "Capture a PNG of an agent tab's viewport, even while the tab is in the background.",
+                description: "Capture a PNG of an agent tab's viewport, even while the tab is in the background. Only for what the outline cannot show: text, prices and refs are in the outline every browser call returns.",
                 inputSchema: schema(["tab_id": tabID], required: ["tab_id"]),
                 annotations: .init(readOnlyHint: true)
             ),
@@ -579,7 +586,7 @@ enum ToolCatalog {
         Tool(
             name: "browser_repl",
             description:
-                "Run JavaScript in a persistent REPL: top-level await works, and variables and functions persist between calls. Returns what the code printed and the value of its last expression. `page` is a Playwright-compatible page driving a background Chrome tab (`context` is its browser context). page.snapshot() returns the page's accessibility outline, whose [e123] refs work as page.locator('aria-ref=e123'). There is no page.evaluate: operate pages through locators.",
+                "The fastest way through a multi-step web flow: fill a form, search, filter, page through results and return just the text you need, in one call instead of one per click. A single click or read needs only the browser_ tools. Runs JavaScript in a persistent REPL: top-level await works, and variables and functions persist between calls. Returns what the code printed and the value of its last expression. `page` is a Playwright-compatible page driving its own background Chrome tab (`context` is its browser context), e.g. await page.goto(url); await page.getByLabel('From').fill('SFO'); await page.getByRole('button', {name: 'Search'}).click(); await page.getByRole('main').innerText(). page.snapshot() returns the page's accessibility outline, whose [e123] refs work as page.locator('aria-ref=e123'). There is no page.evaluate: operate pages through locators.",
             inputSchema: schema(["code": string("JavaScript to run.")], required: ["code"])),
         Tool(
             name: "wait_for",
