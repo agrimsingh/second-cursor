@@ -75,6 +75,17 @@ extension ToolRouter {
         }
     }
 
+    /// browser_open continues a task the app's restart or a closed connection interrupted, as task resume would: it
+    /// opens a new tab, so it sends no input to an earlier target or to a page the user may be using, and earlier
+    /// targets still need a fresh read before input. A pause, takeover or cancel, which only the user or host makes,
+    /// still refuses it. Returns the resumed task's id.
+    func resumeInterruptedTask(session: String) async throws -> String? {
+        guard let task = TaskRegistry.shared.snapshot(session: session), task.status == .interrupted else { return nil }
+        let resumed = try TaskRegistry.shared.control(id: task.id, action: .resume)
+        try await syncBrowserTaskControl(task: resumed, action: .resume)
+        return resumed.id
+    }
+
     private func syncBrowserTaskControl(task: SCTaskSnapshot, action: SCTaskControlAction, immediate: Bool = false) async throws {
         guard TaskRegistry.shared.snapshot(id: task.id)?.controlGeneration == task.controlGeneration else { return }
         let drained = TaskRegistry.shared.snapshot(id: task.id)?.inFlightCount == 0

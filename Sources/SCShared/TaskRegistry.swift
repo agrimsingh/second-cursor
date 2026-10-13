@@ -472,6 +472,13 @@ public final class TaskRegistry: @unchecked Sendable {
         if let storageError { throw SCError.notAllowed("Input is blocked because task history is unavailable: \(storageError)") }
         guard !record.controlCleanupPending else { throw SCError.notAllowed("Task control cleanup is still in progress") }
         guard record.snapshot.status.permitsMutation else {
+            if record.snapshot.status == .interrupted {
+                throw SCError.notAllowed(
+                    "Task is interrupted: the app restarted or this session's connection closed before it finished, so "
+                        + "nothing was sent. To work on a page, call browser_open, which opens it in a new tab and continues "
+                        + "the task; to keep using earlier targets, call task with action resume, then read each again "
+                        + "before input")
+            }
             throw SCError.notAllowed("Task is \(record.snapshot.status.rawValue); resume it before sending input")
         }
         if let targetKey, record.snapshot.controlGeneration > 0,
