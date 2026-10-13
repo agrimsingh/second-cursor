@@ -29,7 +29,7 @@ function fixture() {
   };
   class BridgeError extends Error { constructor(code, message) { super(message); this.code = code; } }
   const context = vm.createContext({
-    Date: { now: () => now }, BridgeError, sleep: advance,
+    Date: { now: () => now }, BridgeError, sleep: advance, setTimeout, clearTimeout,
     addTiming: (...args) => timings.push(args), timed: (_tab, _phase, work) => work(),
     removeCursor() {}, show() {},
     chrome: {

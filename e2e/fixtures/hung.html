@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hung page fixture</title>
+</head>
+<body>
+<h1>Runaway script</h1>
+<script>
+  // Shortly after it renders, a script that never yields, so the renderer stops answering anything.
+  setTimeout(() => { for (;;) {} }, 300);
+</script>
+</body>
+</html>

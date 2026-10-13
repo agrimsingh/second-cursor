@@ -20,12 +20,56 @@ const REQUEST_LIMIT = 2048;
 const REQUEST_RETENTION_MS = 30000;
 const SETTLING_REQUEST_TYPES = new Set(["Document", "XHR", "Fetch"]);
 
+// A renderer whose main thread never yields answers no command again: a page script spinning (a retry loop whose
+// fetches fail at once after its tab closed, a runaway loop). Chrome also gives the first new tab of that site the
+// same renderer, which never commits its navigation. A command unanswered for RESPONSIVE_MS gets as long again for
+// a trivial one to come back, so a slow command on a live page still finishes. Keys are `${tabId}:${sessionId}`.
+// A JavaScript dialog also blocks the renderer, and the command that opened it, until it is answered; that is not
+// a hung renderer.
+const RESPONSIVE_MS = 5000;
+const unresponsive = new Set();
+const dialogs = new Set();
+
+function unresponsiveError(tabId) {
+  return Object.assign(new BridgeError("failed", `Tab ${tabId} is not responding: its renderer is stuck in a page script `
+    + "that never yields, so it cannot load or answer anything. Close it with browser_close and open the page again "
+    + "with browser_open."),
+  { unresponsive: true });
+}
+
+function answersWithin(promise, ms) {
+  let timer;
+  return Promise.race([promise.then(() => true, () => true), new Promise(resolve => { timer = setTimeout(resolve, ms, false); })])
+    .finally(() => clearTimeout(timer));
+}
+
+async function send(target, method, params) {
+  const key = `${target.tabId}:${target.sessionId ?? ""}`;
+  if (unresponsive.has(key)) throw unresponsiveError(target.tabId);
+  const command = chrome.debugger.sendCommand(target, method, params);
+  if (await answersWithin(command, RESPONSIVE_MS)) return command;
+  const probe = chrome.debugger.sendCommand(target, "Page.getFrameTree", {});
+  if (await answersWithin(Promise.race([command, probe]), RESPONSIVE_MS) || dialogs.has(target.tabId)) return command;
+  unresponsive.add(key);
+  throw unresponsiveError(target.tabId);
+}
+
+async function expectAnswer(tabId, method) {
+  if (await answersWithin(chrome.debugger.sendCommand({ tabId }, method, {}), RESPONSIVE_MS) || dialogs.has(tabId))
+    return void unresponsive.delete(`${tabId}:`);
+  unresponsive.add(`${tabId}:`);
+  throw unresponsiveError(tabId);
+}
+
+/** Throws unless the attached tab's renderer answers a trivial command within RESPONSIVE_MS. */
+export const requireResponsive = tabId => expectAnswer(tabId, "Page.getFrameTree");
+
 async function trackNetworkSession(tabId, sessionId = "") {
   const state = requestTracking.get(tabId);
   if (!state) return;
   if (state.sessions.has(sessionId)) return state.sessions.get(sessionId);
   const pending = (sessionId
-    ? chrome.debugger.sendCommand({ tabId, sessionId }, "Network.enable", {})
+    ? send({ tabId, sessionId }, "Network.enable", {})
     : ensureDomain(tabId, "Network"))
     .then(() => true, () => false);
   state.sessions.set(sessionId, pending);
@@ -215,12 +259,17 @@ chrome.debugger.onEvent.addListener((source,method,p)=>{
     void trackNetworkSession(source.tabId, p.sessionId);
   }
   if(method === "Target.detachedFromTarget") {
+    unresponsive.delete(`${source.tabId}:${p.sessionId}`);
     for(const [k,v] of frameSessions)if(k.startsWith(`${source.tabId}:`)&&v===p.sessionId)frameSessions.delete(k);
     const state = requestTracking.get(source.tabId);
     state?.sessions.delete(p.sessionId);
     if (state) for (const [key, request] of state.requests) if (request.sessionId === p.sessionId) state.requests.delete(key);
   }
   networkEvent(source, method, p);
+  // A renderer that commits a document is answering again.
+  if (method === "Page.frameNavigated" && !source.sessionId && !p.frame.parentId) unresponsive.delete(`${source.tabId}:`);
+  if (method === "Page.javascriptDialogOpening") dialogs.add(source.tabId);
+  if (method === "Page.javascriptDialogClosed") dialogs.delete(source.tabId);
   if (method === "Page.lifecycleEvent" && !source.sessionId) {
     const frames = lifecycles.get(source.tabId) ?? new Map();
     lifecycles.set(source.tabId, frames);
@@ -231,6 +280,7 @@ chrome.debugger.onEvent.addListener((source,method,p)=>{
 
 function detachedTab(tabId) {
   attached.delete(tabId);
+  dialogs.delete(tabId);
   lifecycles.delete(tabId);
   requestTracking.delete(tabId);
   for (const key of enabled) if (key.startsWith(`${tabId}:`)) enabled.delete(key);
@@ -241,6 +291,7 @@ chrome.debugger.onDetach.addListener(({ tabId }) => detachedTab(tabId));
 chrome.tabs.onRemoved.addListener(tabId => {
   detachedTab(tabId);
   for (const key of isolatedFrameIds) if (key.startsWith(`${tabId}:`)) isolatedFrameIds.delete(key);
+  for (const key of unresponsive) if (key.startsWith(`${tabId}:`)) unresponsive.delete(key);
 });
 
 /** True once the tab's current document has gone 500 ms without a network request in flight. */
@@ -271,7 +322,12 @@ export async function attach(tabId) {
     }
   }
   attached.add(tabId);
-  await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
+  try {
+    await expectAnswer(tabId, "Page.enable");
+  } catch (e) {
+    attached.delete(tabId);
+    throw e;
+  }
   // Enabling also reports the lifecycle events the current document has already reached.
   await chrome.debugger.sendCommand({ tabId }, "Page.setLifecycleEventsEnabled", { enabled: true }).catch(() => {});
   const target = { tabId };
@@ -289,12 +345,13 @@ export async function cdp(tabId, method, params = {}) {
   else if (MUTATING_COMMANDS.has(method)) await requireAgentInput(tabId);
   await attach(tabId);
   try {
-    return await chrome.debugger.sendCommand({ tabId }, method, params);
+    return await send({ tabId }, method, params);
   } catch (e) {
+    if (e.unresponsive) throw e;
     if (/not attached/i.test(e.message)) {
       attached.delete(tabId);
       await attach(tabId);
-      return await chrome.debugger.sendCommand({ tabId }, method, params);
+      return await send({ tabId }, method, params);
     }
     throw new BridgeError("failed", `${method}: ${protocolMessage(e)}`);
   }
@@ -331,12 +388,12 @@ export async function frameCDP(tabId,frameId,method,params={}, { expectedSession
   const sessionId=frameSessions.get(key);
   if (sessionId !== initialSession || (isolatedFrameIds.has(key) && !sessionId && !proveLocalFrame)) throw unavailable();
   try {
-    const result = await chrome.debugger.sendCommand({tabId,...(sessionId?{sessionId}:{})},method,params);
+    const result = await send({tabId,...(sessionId?{sessionId}:{})},method,params);
     if (proveLocalFrame) {
       if (!attached.has(tabId) || frameSessions.get(key) || !Number.isInteger(result?.executionContextId)) throw unavailable();
       isolatedFrameIds.delete(key);
     }
     return result;
   }
-  catch(e){throw new BridgeError("failed",`${method}: ${protocolMessage(e)}`);}
+  catch(e){throw e.unresponsive ? e : new BridgeError("failed",`${method}: ${protocolMessage(e)}`);}
 }

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Long poll fixture</title>
+</head>
+<body>
+<h1>Notifications</h1>
+<p id="status">Waiting for updates</p>
+<script>
+  // A long poll reopened as soon as it answers, like a chat or notification channel. ?hold_ms= sets how long the
+  // server holds each request (FixtureServer caps it at 10 s).
+  const hold = new URLSearchParams(location.search).get("hold_ms") ?? "10000";
+  let updates = 0;
+  (async function longPoll() {
+    for (;;) {
+      await fetch(`late-results.json?delay_ms=${hold}&channel=notifications`, { cache: "no-store" }).catch(() => {});
+      document.getElementById("status").textContent = `Updates received: ${++updates}`;
+    }
+  })();
+</script>
+</body>
+</html>
