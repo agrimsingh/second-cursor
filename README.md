@@ -173,6 +173,7 @@ python3 e2e/cross_app_workflows.py --takeover --seed 73 --rounds 3 # browser -> 
 python3 e2e/cross_app_model.py --takeover --seed 101 --rounds 5 # real Sol 6.1 high decisions, same independent cross-app judges
 node --test sdk/agent-recovery.test.mjs # checkpoint durability and refusal/recovery cases, no GUI
 python3 e2e/browser_reliability.py # freshness, hover, verified form state, settling
+python3 e2e/browser_settle_churn.py # settling on pages that never stop changing (clocks, polls, long polls), to settle-churn.json
 python3 e2e/browser_target_contracts.py # editable focus, iframe/shadow targets, dropdown contracts
 python3 e2e/browser_command_contracts.py # public argument schema and semantic locator contracts
 python3 e2e/browser_role_properties.py # seeded HTML/AX parity and stale-reference action sequences
