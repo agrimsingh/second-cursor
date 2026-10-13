@@ -56,6 +56,16 @@ const MAC_COMMANDS = {
   "Shift+Meta+ArrowLeft": "moveToLeftEndOfLineAndModifySelection", "Shift+Meta+ArrowRight": "moveToRightEndOfLineAndModifySelection",
 };
 
+// Chrome's own key bindings also reach the clipboard without an editing command: Shift+Insert pastes, Ctrl+Insert
+// copies and Shift+Delete cuts.
+function clipboardUse(command, code, modifiers) {
+  if (command === "paste" || (code === "Insert" && modifiers.has("shift"))) return "read";
+  if (["copy", "cut"].includes(command) || (code === "Insert" && modifiers.has("ctrl"))
+      || (code === "Delete" && modifiers.has("shift")))
+    return "write";
+  return undefined;
+}
+
 function mainKey(token, modifiers) {
   const lower = token.toLowerCase();
   if(/^kp_[0-9]$/.test(lower)){const digit=lower.at(-1);return {key:digit,code:`Numpad${digit}`,keyCode:96+Number(digit),text:digit};}
@@ -122,5 +132,6 @@ export function parseChord(chord) {
     modifiers.has("shift") && "Shift", modifiers.has("ctrl") && "Control",
     modifiers.has("alt") && "Alt", modifiers.has("meta") && "Meta", key.code,
   ].filter(Boolean).join("+");
-  return { modifiers: ordered, key, command: MAC_COMMANDS[combo] };
+  const command = MAC_COMMANDS[combo];
+  return { modifiers: ordered, key, command, clipboard: clipboardUse(command, key.code, modifiers) };
 }

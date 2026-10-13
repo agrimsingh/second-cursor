@@ -377,8 +377,16 @@ export async function type(tabId, { ref, text, submit }, guardInput) {
   }
 }
 
-export async function pressKey(tabId, keys, guardInput) {
-  const { modifiers, key, command } = parseChord(keys);
+/** `approvals` are the call's local approvals; only the user's clipboard approval lets a key reach the clipboard. */
+export async function pressKey(tabId, keys, guardInput, approvals = []) {
+  const { modifiers, key, command, clipboard } = parseChord(keys);
+  if (clipboard && !approvals?.includes("clipboard"))
+    throw new BridgeError(
+      "not_allowed",
+      clipboard === "read"
+        ? `${keys} pastes from the system clipboard, which needs the user's approval, so no key was sent; read it with browser_command operation=clipboard action=read (the user is asked), then type the text`
+        : `${keys} writes the system clipboard, which needs the user's approval, so no key was sent; set it with browser_command operation=clipboard action=write and the text (the user is asked)`,
+    );
   show(tabId);
   if (FOCUS_KEYS.has(key.key) && modifiers.every((m) => m.key === "Shift")) expectQuickReaction(tabId, QUICK_REACT_MS);
   const send = async (params) => {

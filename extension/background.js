@@ -144,7 +144,7 @@ const handlers = {
   "tab.pressKey": async (params) => {
     const { tabId, keys } = params;
     await requireAgentTab(tabId);
-    return act(params, guard => pressKey(tabId, keys, guard), { quietMs: INPUT_NAVIGATION_MS });
+    return act(params, guard => pressKey(tabId, keys, guard, params.local_approvals), { quietMs: INPUT_NAVIGATION_MS });
   },
   "tab.scroll": async (params) => {
     const { tabId, direction, amount } = params;

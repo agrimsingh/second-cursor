@@ -170,7 +170,7 @@ final class ToolRouter: Sendable {
                 let mutation = mutating ? try TaskRegistry.shared.beginMutation(session: session, targetKey: taskTarget) : nil
                 let context = ExecutionContext(
                     sessionID: session, observationID: observationID,
-                    browserID: browserID, deadline: deadline,
+                    browserID: browserID, deadline: deadline, operationID: id,
                     browserApprovals: browserApprovals, timings: timings
                 ) { [sessions] in
                     if let mutation { try TaskRegistry.shared.checkMutation(mutation, targetKey: taskTarget) }
@@ -306,7 +306,8 @@ final class ToolRouter: Sendable {
     private func admit(_ name: String, _ args: Arguments) async throws -> WindowOwner? {
         let owner = try await checkGates(name, args)
         if Self.isLogged(name, args) {
-            log.record(ActionLogEntry(tool: name, target: args.logTarget, detail: args.logDetail))
+            let detail = name == "browser_repl" ? BrowserREPL.logDetail(args) : args.logDetail
+            log.record(ActionLogEntry(tool: name, target: args.logTarget, detail: detail))
         }
         return owner
     }

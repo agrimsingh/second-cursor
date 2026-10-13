@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Clipboard fixture</title>
+</head>
+<body>
+<label>Source <textarea id="source" placeholder="empty">SC_CLIPBOARD_E2E_SOURCE</textarea></label>
+<label>Target <textarea id="target" placeholder="empty"></textarea></label>
+<p id="events" aria-label="Clipboard events">none</p>
+<script>
+// Records that a clipboard event fired, never what it carried.
+const events = document.getElementById("events");
+const seen = [];
+for (const type of ["copy", "cut", "paste"])
+  document.addEventListener(type, () => {
+    seen.push(type);
+    events.textContent = seen.join(" ");
+  }, true);
+</script>
+</body>
+</html>

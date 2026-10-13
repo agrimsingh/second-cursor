@@ -16,8 +16,10 @@ Ways it can fail, written down before the code, each with the design decision th
     the limit stops. No script runs between calls, so nothing from the old loop prints into the next call.
  4. Unbounded memory (an array or typed-array loop) swaps the machine. The time-limit callback and every browser
     call compare the process footprint with its value when the call started (so memory another session freed, but
-    the allocator has not returned yet, is blamed on no one); 1 GB more terminates the script and discards the
-    context, and the next call starts fresh with a [system] line saying variables were lost.
+    the allocator has not returned yet, is blamed on no one); 256 MB more terminates the script and discards the
+    context, and the next call starts fresh with a [system] line saying variables were lost. At most 8 contexts are
+    live across sessions; a ninth discards the least recently used idle one, whose next call says so, and when all 8
+    are running code the call is refused rather than queued.
  5. A promise that never settles leaves the call waiting. The call returns at its deadline (timeout_ms, at most 55 s)
     with what was printed so far, up to 1.5 s before the router's own deadline so the output still arrives.
  6. Work outlives the MCP call: a browser action already sent cannot be recalled (as with every tool), but its result
@@ -59,7 +61,10 @@ Ways it can fail, written down before the code, each with the design decision th
     presses wait for a load they start, and every browser call reports the tab's URL.
 17. Dialogs freeze the page: a dialog an action opens is dismissed with a [system] line unless page.on('dialog')
     handles it.
-18. The action log misses REPL work: each call is logged with its code, and each navigation with its URL.
+18. The action log misses REPL work: each call is logged with its code's first 200 characters, length and SHA-256,
+    and the whole code is stored by digest beside the log. Each input or navigation the script sends is its own line,
+    named as the discrete tool would be (browser_click, browser_type, browser_navigate, ...), with the tab, locator,
+    session_id and operation_id; typed text appears only as its length.
 19. The page closes under the script: its calls fail with "Target page has been closed"; context.newPage() works.
 20. Turn end loses work: agent tabs stay open at turn end, so the REPL does too; it ends with its session.
 21. toolSurface "repl" advertises only browser_repl, and every tool stays callable; "discrete" leaves it out.
@@ -120,6 +125,18 @@ def in_thread(fn):
 def repl_lines(start):
     lines = harness.ACTION_LOG.read_text().splitlines()[start:] if harness.ACTION_LOG.exists() else []
     return [json.loads(line) for line in lines if '"browser_repl"' in line]
+
+
+def via_repl_lines(start):
+    """Lines for the input and navigation REPL scripts sent, with their detail decoded."""
+    lines = harness.ACTION_LOG.read_text().splitlines()[start:] if harness.ACTION_LOG.exists() else []
+    entries = [json.loads(line) for line in lines]
+    for entry in entries:
+        try:
+            entry["detail"] = json.loads(entry.get("detail") or "{}")
+        except ValueError:
+            entry["detail"] = {}
+    return [entry for entry in entries if isinstance(entry["detail"], dict) and entry["detail"].get("via") == "browser_repl"]
 
 
 def log_length():
@@ -249,7 +266,7 @@ def repl_limits(ctx):
               first_box["result"][1] == "first" and text == "second" and seconds > 0.6, (seconds, text))
 
     ok, text, _, seconds = repl(ctx, "const hog = []\nfor (;;) hog.push(new Float64Array(1e6).fill(1))", session_id=sid)
-    ctx.check("unbounded memory is stopped", not ok and "memory grew by more than 1 GB" in text and seconds < 20,
+    ctx.check("unbounded memory is stopped", not ok and "memory grew by more than 256 MB" in text and seconds < 20,
               (seconds, text))
     text = value(ctx, "typeof keep", session_id=sid)
     ctx.check("and the next call starts from a fresh context, saying so",
@@ -425,8 +442,9 @@ def repl_playwright(ctx):
         ctx.check("context.newPage() opens a page, and a closed page says so",
                   text == "[ 2, 'Target page has been closed', 1 ]", text)
 
-    navigations = [line for line in repl_lines(log_start) if (line.get("target") or "").endswith("/repl.html")]
-    ctx.check("navigations are in the action log with their URL", navigations, repl_lines(log_start)[:3])
+    navigations = [line for line in via_repl_lines(log_start) if line["tool"] in ("browser_open", "browser_navigate")
+                   and line["detail"].get("url", "").endswith("/repl.html")]
+    ctx.check("navigations are in the action log with their URL", navigations, via_repl_lines(log_start)[:3])
 
 
 @scenario
@@ -540,6 +558,74 @@ def repl_client_gives_up(ctx):
         ok, text, _, seconds = result["result"]
         ctx.check(f"a call that never settles answers within 55 s {label}", not ok and "TimeoutError" in text
                   and 52 < seconds < 55, (round(seconds, 2), text[:120]))
+
+
+@scenario
+def repl_audit(ctx):
+    """Failure mode 18: a script's clicks, typing and key presses are each in the action log, without typed text, and
+    the call's whole code is stored beside the log."""
+    if not ctx.call("browser_status").get("connected"):
+        raise Skip("Chrome extension not connected")
+    sid = ctx.call("session", action="create")["session_id"]
+    ctx.cleanups.append(lambda: ctx.mcp.call("session", action="close", session_id=sid))
+    secret = "audit-typed@example.com"
+    operation_id = f"repl-audit-{int(time.time())}"
+    log_start = log_length()
+    with FixtureServer() as base:
+        code = ("// " + "padding past the 200-character preview " * 6 + "\n"
+                f"await page.goto('{base}/repl.html')\n"
+                f"await page.getByLabel('Email').fill('{secret}')\n"
+                "await page.getByRole('button', { name: 'Save', exact: true }).click()\n"
+                "await page.keyboard.press('Tab')\n"
+                "await page.locator('#status').textContent()")
+        ok, text, _, _ = repl(ctx, code, session_id=sid, operation_id=operation_id)
+        ctx.require("the script ran", ok and text == "Clicked: Save", text)
+    lines = via_repl_lines(log_start)
+    by_tool = {}
+    for line in lines:
+        by_tool.setdefault(line["tool"], []).append(line)
+    ctx.check("the navigation, fill, click and key press are separate lines named as the discrete tools",
+              all(by_tool.get(tool) for tool in ("browser_open", "browser_type", "browser_click", "browser_press_key")),
+              [(line["tool"], line["detail"].get("operation")) for line in lines])
+    fill = (by_tool.get("browser_type") or [{}])[0]
+    ctx.check("the fill line has the tab, locator and text length, not the text",
+              (fill.get("target") or "").startswith("tab_id=") and fill["detail"].get("operation") == "fill"
+              and fill["detail"].get("text_length") == len(secret) and "locator" in fill["detail"]
+              and all(secret not in json.dumps(line) for line in lines), fill)
+    click = (by_tool.get("browser_click") or [{}])[0]
+    ctx.check("the click line names its locator", "Save" in json.dumps(click.get("detail", {}).get("locator")), click)
+    press = (by_tool.get("browser_press_key") or [{}])[0]
+    ctx.check("the key press line names its keys", press.get("detail", {}).get("keys") == "Tab", press)
+    ctx.check("every line carries the session and operation ids",
+              lines and all(line["detail"].get("session_id") == sid and line["detail"].get("operation_id") == operation_id
+                            for line in lines), [line["detail"] for line in lines][:2])
+    ctx.check("lines stay bounded", all(len(json.dumps(line)) < 2500 for line in lines),
+              max((len(json.dumps(line)) for line in lines), default=0))
+
+    calls = [json.loads(line["detail"]) for line in repl_lines(log_start) if line.get("detail", "").startswith("{")]
+    call = next((c for c in calls if c.get("operation_id") == operation_id), {})
+    stored = harness.ACTION_LOG.parent / call.get("code_file", "missing")
+    ctx.check("the call's line has the code's preview, length and SHA-256",
+              call.get("code_chars") == len(code) and len(call.get("code_sha256", "")) == 64
+              and len(call.get("code", "")) <= 201, {k: v for k, v in call.items() if k != "code"})
+    ctx.check("the whole code is stored by its digest, readable only by the user",
+              stored.is_file() and stored.read_text() == code and (stored.stat().st_mode & 0o077) == 0, str(stored))
+
+
+@scenario
+def repl_context_cap(ctx):
+    """Failure mode 4: at most 8 live contexts; a ninth session discards the least recently used idle one."""
+    sids = [ctx.call("session", action="create")["session_id"] for _ in range(9)]
+    for sid in sids:
+        ctx.cleanups.append(lambda sid=sid: ctx.mcp.call("session", action="close", session_id=sid))
+    for index, sid in enumerate(sids):
+        value(ctx, f"const mine = {index}", session_id=sid)
+    second = value(ctx, "mine", session_id=sids[1])
+    ctx.check("a recent session keeps its variables", second == "1", second)
+    first = value(ctx, "typeof mine", session_id=sids[0])
+    ctx.check("the least recently used session was reset, and its next call says so",
+              "[system] The REPL was reset because more than 8 browser_repl sessions were open" in first
+              and first.endswith("undefined"), first)
 
 
 @scenario
