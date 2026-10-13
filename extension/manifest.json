@@ -22,7 +22,9 @@
     "downloads",
     "history",
     "clipboardRead",
-    "clipboardWrite"
+    "clipboardWrite",
+    "identity",
+    "identity.email"
   ],
   "background": {
     "service_worker": "background.js",

@@ -37,6 +37,7 @@ const MIN_RETRY_MS = 500;
 const MAX_RETRY_MS = 15000;
 const SUPERSEDED_RETRY_MS = 60000;
 const HEALTHY_AFTER_MS = 10000;
+const RECONNECT_ALARM = "reconnect";
 
 const observations = new Map();
 function invalidateSession(session) {
@@ -516,13 +517,17 @@ function connect() {
     .then(async (data) => {
       const instance_id = data.instance_id ?? crypto.randomUUID();
       await chrome.storage.local.set({ instance_id });
+      // Chrome has no API for a profile's display name; its signed-in account is what tells profiles apart.
+      const account = await chrome.identity
+        .getProfileUserInfo({ accountStatus: "ANY" })
+        .catch(() => null);
       const ua = navigator.userAgent;
       try {
         current.postMessage({
           type: "hello",
           version: VERSION,
           instance_id,
-          profile_name: data.profile_name ?? "Default",
+          profile_name: data.profile_name ?? (account?.email || "Default"),
           name: ua.includes("Edg/")
             ? "Edge"
             : ua.includes("Chrome/")
@@ -546,6 +551,15 @@ function connect() {
       }
     });
 }
+
+// Chrome stops an idle worker, and a stopped worker's retry timer never fires: without this alarm an extension
+// that lost the app stays disconnected until Chrome restarts. The alarm itself restarts the worker.
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === RECONNECT_ALARM) connect();
+});
+chrome.alarms.get(RECONNECT_ALARM).then((alarm) => {
+  if (!alarm) chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
+});
 
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
