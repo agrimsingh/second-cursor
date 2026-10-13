@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Settle churn fixture</title>
+  <style>
+    body { font: 16px system-ui; margin: 24px; }
+    #grid { display: grid; grid-template-columns: repeat(7, 72px); gap: 4px; }
+    #grid[hidden] { display: none; }
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 3px solid #ccc; border-top-color: #333;
+      border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<header>
+  <p>Local time <span id="clock">--</span> <span class="spinner" aria-hidden="true"></span></p>
+  <div id="carousel" aria-label="Promotions"><p>Promotion 0</p></div>
+  <p id="sync">Fares synced 0 times</p>
+</header>
+<main>
+  <button id="date-field" type="button" aria-expanded="false" aria-controls="grid">Departure date</button>
+  <p id="departure">Departure: not set</p>
+  <div id="grid" role="grid" aria-label="October" hidden></div>
+  <label><input id="policy" type="checkbox"> In policy only</label>
+  <ul id="hotels" aria-label="Hotels">
+    <li data-policy="in">Harbor Inn (in policy)</li>
+    <li data-policy="out">Grand Palace (out of policy)</li>
+    <li data-policy="in">Station Hotel (in policy)</li>
+  </ul>
+  <button id="search" type="button">Search</button>
+  <button id="search-live" type="button">Search live fares</button>
+  <section id="results" aria-label="Results"></section>
+  <button id="counter" type="button">Count</button>
+  <p id="count">Count: 0</p>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const text = (tag, content) => Object.assign(document.createElement(tag), { textContent: content });
+
+  // ?calm leaves the page without background activity, as the static control.
+  if (!new URLSearchParams(location.search).has("calm")) {
+    // Faster than the 300 ms quiet period, like a live clock with tenths, a countdown, or a ticker.
+    setInterval(() => { $("clock").textContent = (performance.now() / 1000).toFixed(1); }, 150);
+    let slide = 0;
+    setInterval(() => $("carousel").replaceChildren(text("p", `Promotion ${++slide}`)), 900);
+    // A constant-URL poll that re-renders, and a long poll that is reopened as soon as it answers.
+    let syncs = 0;
+    setInterval(async () => {
+      await fetch("late-results.json?delay_ms=120&poll=fares", { cache: "no-store" });
+      $("sync").textContent = `Fares synced ${++syncs} times`;
+    }, 500);
+    (async function longPoll() {
+      for (;;) await fetch("late-results.json?delay_ms=6000&channel=updates", { cache: "no-store" }).catch(() => {});
+    })();
+  }
+
+  $("date-field").addEventListener("click", () => {
+    const open = $("date-field").getAttribute("aria-expanded") === "true";
+    $("date-field").setAttribute("aria-expanded", String(!open));
+    $("grid").hidden = open;
+  });
+  for (let day = 13; day <= 26; day++) {
+    const button = text("button", `Oct ${day}`);
+    button.type = "button";
+    button.setAttribute("aria-selected", "false");
+    button.addEventListener("click", () => {
+      for (const other of $("grid").children) other.setAttribute("aria-selected", String(other === button));
+      $("departure").textContent = `Departure: Oct ${day}`;
+      $("date-field").setAttribute("aria-expanded", "false");
+      $("grid").hidden = true;
+    });
+    $("grid").append(button);
+  }
+
+  $("policy").addEventListener("change", () => {
+    for (const hotel of $("hotels").children) hotel.hidden = $("policy").checked && hotel.dataset.policy !== "in";
+  });
+
+  const spinner = (label) => {
+    const progress = text("p", label);
+    progress.setAttribute("role", "progressbar");
+    return progress;
+  };
+  const show = (label, count) => {
+    $("results").replaceChildren(...[1, 2, 3].map((i) => text("p", `${label} ${i} for search ${count}`)));
+    $("results").removeAttribute("aria-busy");
+  };
+  // Results from a request that answers 3 s later, behind a spinner.
+  let searches = 0;
+  $("search").addEventListener("click", async () => {
+    const count = ++searches;
+    $("results").setAttribute("aria-busy", "true");
+    $("results").replaceChildren(spinner("Loading results"));
+    await fetch(`late-results.json?delay_ms=3000&q=${count}`, { cache: "no-store" });
+    show("Fare", count);
+  });
+  // Results pushed 2.5 s later over a channel the network tracker does not wait for (a socket), behind a spinner.
+  let live = 0;
+  $("search-live").addEventListener("click", () => {
+    const count = ++live;
+    $("results").replaceChildren(spinner("Loading live fares"));
+    setTimeout(() => show("Live fare", count), 2500);
+  });
+
+  let counts = 0;
+  $("counter").addEventListener("click", () => { $("count").textContent = `Count: ${++counts}`; });
+</script>
+</body>
+</html>
