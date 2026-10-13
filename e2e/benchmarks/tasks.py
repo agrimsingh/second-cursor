@@ -1,4 +1,5 @@
 """Complete task execution. Imported only by the explicit `tasks` command."""
+import collections
 import json
 import math
 import os
@@ -21,6 +22,8 @@ PROMPTS = {
 RULES = (" Use only your engine's normal computer-control tools. Do not use the shell, filesystem editing, "
          "JavaScript evaluation, or direct HTTP requests to complete the task. Do not change the human's focus, cursor, or Space. "
          "Do not touch any target outside this task. Close only browser tabs that you created when finished.")
+# browser_repl runs JavaScript, so the unqualified rule reads as forbidding the very tool it is offered beside.
+REPL_RULES = RULES.replace("JavaScript evaluation", "JavaScript evaluation in the page")
 MODES = {"browser_work_order": "form", "canvas_route": "canvas", "transient_dialog": "dialog"}
 
 
@@ -87,6 +90,15 @@ def adapter_metrics(events, wall_ms, model):
             "non_tool_ms": max(0, wall_ms - tool_ms) if tool_ms is not None else None,
             "source": "external adapter self-reported intervals, provider usage and cost; harness wall clock",
             "adapter_status": final["status"]}
+
+
+def tool_mix(events):
+    """Which tools the model called: mixed means browser_repl and at least one other tool in the same trial."""
+    names = collections.Counter(event.get("name") for event in events
+                                if event.get("type") == "tool" and event.get("origin") == "model")
+    repl = names.get("browser_repl", 0)
+    return {"calls_by_tool": dict(sorted(names.items())), "repl_calls": repl,
+            "mixed_tools": repl > 0 and sum(names.values()) > repl}
 
 
 class Meter:
@@ -197,6 +209,9 @@ def execute_external(ctx, request, output, args, row):
     metrics = adapter_metrics(events, proc["seconds"] * 1000, args.model)
     final = next(event for event in events if event.get("type") == "result")
     metrics["model_tool_calls"] = final.get("model_tool_calls")
+    metrics.update(tool_mix(events))
+    if final.get("repl_audit") is not None:
+        row["repl_audit"] = final["repl_audit"]
     row["metrics"] = metrics
     if args.model:
         row["adapter_result"] = final
@@ -212,6 +227,9 @@ def execute_external(ctx, request, output, args, row):
         ctx.require("adapter used the pinned catalog mode",
                     final.get("catalog_mode", "full") == request.get("catalog_mode", "full"),
                     final.get("catalog_mode"))
+        ctx.require("adapter used the pinned browser surface",
+                    final.get("browser_surface", "discrete") == request.get("browser_surface", "discrete"),
+                    final.get("browser_surface"))
         if final["status"] == "completed":
             ctx.require("adapter confirms restricted computer-tool isolation",
                         final.get("isolation", {}).get("verified") is True, final.get("isolation"))
@@ -427,12 +445,14 @@ def task_trial(ctx, task, round_number, args, row, output):
                 ctx.call("browser_navigate", tab_id=tid, url=targets["url"])
     request = {"protocol": report.CONTRACT, "task_id": task, "trial": round_number, "track": args.track,
                "native_placement": native_placement(args),
-               "model": args.model, "prompt": (server.prompt if task in WORKSPACE_TASKS or task in FLIGHT_TASKS else PROMPTS[task]) + RULES,
+               "model": args.model, "prompt": (server.prompt if task in WORKSPACE_TASKS or task in FLIGHT_TASKS else PROMPTS[task])
+               + (REPL_RULES if getattr(args, "browser_surface", "discrete") == "repl" else RULES),
                "targets": targets, "timeout_seconds": args.timeout}
     if args.model:
         request.update(model_config=report.model_config_for(args), case_seed=row["case_seed"],
                        observation_mode=getattr(args, "observation_mode", "on-demand"),
                        catalog_mode=getattr(args, "catalog_mode", "full"),
+                       browser_surface=getattr(args, "browser_surface", "discrete"),
                        interface_track=args.interface_track, engine=args.engine, engine_version=args.engine_version,
                        runner_sha256=row["runner_sha256"], browser_visibility="headed" if args.headed_browser else "headless",
                        browser_identity=browser_identity(args))
@@ -546,6 +566,7 @@ def run_tasks(args):
     result.update(execution_profile="model" if args.model else "external-scripted" if args.adapter_command else "scripted",
                   observation_mode=getattr(args, "observation_mode", "on-demand"),
                   catalog_mode=getattr(args, "catalog_mode", "full"),
+                  browser_surface=getattr(args, "browser_surface", "discrete"),
                   model_config=model_config, interface_track=getattr(args, "interface_track", "native-tools"),
                   runner_sha256=runner_sha256,
                   browser_visibility="headed" if getattr(args, "headed_browser", False) else "headless",

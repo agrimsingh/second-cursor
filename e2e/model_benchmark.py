@@ -90,6 +90,8 @@ def parser():
     cli.add_argument("--max-steps", type=int, default=100)
     cli.add_argument("--observation-mode", choices=("on-demand", "upfront"), default="on-demand")
     cli.add_argument("--catalog-mode", choices=("full", "compact"), default="full")
+    cli.add_argument("--browser-surface", choices=report.BROWSER_SURFACES, default="discrete",
+                     help="repl also offers browser_repl beside the discrete browser tools (second-cursor browser tasks only)")
     cli.add_argument("--timeout", type=float, default=300, help="Per-trial solver budget in seconds (default: 300)")
     cli.add_argument("--codex-binary", default=shutil.which("codex") or "codex")
     cli.add_argument("--cua-binary", default=shutil.which("cua-driver") or "cua-driver")
@@ -120,6 +122,9 @@ def build_plan(args):
         raise ValueError("upfront observations require second-cursor and only native_notes")
     if catalog_mode == "compact" and (engines != ["second-cursor"] or args.task != ["native_notes"]):
         raise ValueError("compact catalog requires second-cursor and only native_notes")
+    browser_surface = getattr(args, "browser_surface", "discrete")
+    if browser_surface == "repl" and (engines != ["second-cursor"] or not args.task or "native_notes" in args.task):
+        raise ValueError("the repl browser surface requires second-cursor and explicit browser tasks")
     bundle = pathlib.Path(os.environ.get("SC_E2E_APP", str(pathlib.Path.home() / "Applications/SecondCursor.app")))
     binary = bundle / "Contents/MacOS/SecondCursor"
     if not binary.is_file():
@@ -137,7 +142,8 @@ def build_plan(args):
         for engine in order:
             adapter = [sys.executable, str(ROOT / "benchmarks/model_adapter.py"), "--engine", engine,
                        "--codex-binary", args.codex_binary, "--cua-binary", args.cua_binary,
-                       "--observation-mode", observation_mode, "--catalog-mode", catalog_mode]
+                       "--observation-mode", observation_mode, "--catalog-mode", catalog_mode,
+                       "--browser-surface", browser_surface]
             if host_kind == "cursor-sdk":
                 adapter.extend(["--model-host", host_kind, "--node-binary", args.node_binary])
                 if args.cursor_sdk_root:
@@ -148,7 +154,7 @@ def build_plan(args):
                        "--reasoning-effort", config["reasoning_effort"], "--max-steps", str(args.max_steps),
                        "--timeout", str(args.timeout), "--model-host-version", host_version,
                        "--interface-track", "native-tools", "--observation-mode", observation_mode,
-                       "--catalog-mode", catalog_mode,
+                       "--catalog-mode", catalog_mode, "--browser-surface", browser_surface,
                        "--seed", str(args.seed + index),
                        "--headed-browser", "--native-placement", args.native_placement,
                        "--browser-identity", json.dumps(pinned_browser), "--adapter-browser"]
@@ -162,7 +168,7 @@ def build_plan(args):
                          "command": command})
     metadata = report.metadata()
     return {"model_config": config, "engines": identities, "selected_engines": engines,
-            "observation_mode": observation_mode, "catalog_mode": catalog_mode,
+            "observation_mode": observation_mode, "catalog_mode": catalog_mode, "browser_surface": browser_surface,
             "tasks": tasks, "runs": runs, "runner_sha256": runner_fingerprint(),
             "trial_count": len(runs) * len(tasks), "interface_track": "native-tools",
             "contract": report.CONTRACT, "track": "host-background", "native_placement": args.native_placement,
@@ -180,6 +186,7 @@ def planned_artifact(plan, engine):
             "case_seed_semantics": plan.get("case_seed_semantics", report.case_seed_semantics(plan["tasks"])),
             "observation_mode": plan.get("observation_mode", "on-demand"),
             "catalog_mode": plan.get("catalog_mode", "full"),
+            "browser_surface": plan.get("browser_surface", "discrete"),
             "engine_version": plan["engines"][engine], "model": plan["model_config"]["model"],
             "model_config": copy.deepcopy(plan["model_config"]),
             **{key: copy.deepcopy(plan[key]) for key in ("contract", "track", "native_placement", "interface_track",
@@ -287,6 +294,17 @@ def run_plan(plan):
     for engine, payload in combined.items():
         passed = sum(row["status"] == "PASS" for row in payload["trials"])
         lines.append(f"| {engine} | {passed}/{len(payload['trials'])} | [{engine}.tasks.json]({engine}.tasks.json) |")
+    lines.extend(["", f"Browser surface: `{plan.get('browser_surface', 'discrete')}`. Mixed means browser_repl and another tool in one trial.", "",
+                  "| Engine | Task | Round | Status | Answer correct | Model calls | browser_repl calls | Mixed | Wall s | Tool s | Calls by tool |",
+                  "| --- | --- | ---: | --- | --- | ---: | ---: | --- | ---: | ---: | --- |"])
+    seconds = lambda value: f"{value / 1000:.1f}" if report.finite_number(value) else "unavailable"
+    for engine, payload in combined.items():
+        for row in payload["trials"]:
+            metrics = row.get("metrics", {})
+            by_tool = ", ".join(f"{name} {count}" for name, count in metrics.get("calls_by_tool", {}).items())
+            lines.append(f"| {engine} | {row['task_id']} | {row['trial']} | {row['status']} | {row.get('independent_task_success', 'unavailable')} | "
+                         f"{metrics.get('model_tool_calls', 'unavailable')} | {metrics.get('repl_calls', 'unavailable')} | "
+                         f"{metrics.get('mixed_tools', 'unavailable')} | {seconds(metrics.get('wall_ms'))} | {seconds(metrics.get('tool_ms'))} | {by_tool} |")
     if complete and len(paths) > 1:
         try:
             compared = subprocess.run([sys.executable, str(ROOT / "best_in_class.py"), "compare", *paths],

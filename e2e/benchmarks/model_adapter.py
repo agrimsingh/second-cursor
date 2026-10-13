@@ -13,7 +13,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import best_in_class as report
 from model_benchmark import runner_fingerprint
-from benchmarks.engines import create_engine, UnsupportedEngine, _ok
+from benchmarks.engines import BROWSER_SURFACES, create_engine, UnsupportedEngine, _ok
 from benchmarks.model_host import CodexModelHost, HostConfig
 from benchmarks.tool_surface import CATALOG_MODES, project_native_catalog
 
@@ -90,6 +90,15 @@ def catalog_plan(request, args):
     return mode
 
 
+def surface_plan(request, args):
+    surface = getattr(args, "browser_surface", "discrete")
+    if surface not in BROWSER_SURFACES or request.get("browser_surface", "discrete") != surface:
+        raise ValueError("Adapter browser surface differs from the requested trial profile")
+    if surface == "repl" and (args.engine != "second-cursor" or request["task_id"] == "native_notes"):
+        raise ValueError("The repl browser surface supports only Second Cursor browser trials")
+    return surface
+
+
 def validate_upfront_result(result):
     """A text-only initial prompt cannot silently replace non-text MCP content."""
     if not _ok(result):
@@ -119,6 +128,7 @@ def run_adapter(request, args):
     config = validate_request(request, args.engine, model_host)
     observation_mode, upfront_calls = observation_plan(request, args, config)
     catalog_mode = catalog_plan(request, args)
+    browser_surface = surface_plan(request, args)
     if threading.current_thread() is not threading.main_thread() or signal.getitimer(signal.ITIMER_REAL)[0]:
         raise ValueError("Model adapter requires the main thread and exclusive deadline ownership")
     trace_dir = pathlib.Path(os.environ["SC_BENCH_TRACE_DIR"]).resolve()
@@ -133,7 +143,7 @@ def run_adapter(request, args):
              "isolation": {"verified": False}, "cleanup_errors": [],
              "observation_mode": observation_mode, "prefetch_tool_calls": 0, "model_tool_calls": 0,
              "driver_tool_calls": 0, "host_milestones_ms": {}, "catalog_mode": catalog_mode,
-             "tool_catalog": None}
+             "browser_surface": browser_surface, "tool_catalog": None}
 
     def record(source, event):
         trace.write(json.dumps(redacted({"source": source, **event}), allow_nan=False) + "\n")
@@ -262,6 +272,10 @@ def run_adapter(request, args):
             raise AdapterDeadline("Model host exceeded the remaining trial budget")
         if callback_failure:
             raise ValueError(callback_failure)
+        if browser_surface == "repl":
+            breach = engine.audit_repl()
+            if breach:
+                raise ValueError(f"browser_repl scope breach: {breach}")
         data = host_result.as_dict() if hasattr(host_result, "as_dict") else dataclasses.asdict(host_result)
         record("host_result", data)
         if (not isinstance(data, dict) or data.get("status") not in
@@ -306,6 +320,8 @@ def run_adapter(request, args):
         signal.setitimer(signal.ITIMER_REAL, CLEANUP_TIMEOUT_SECONDS)
         try:
             if engine is not None:
+                if getattr(engine, "repl_audit", None) is not None:
+                    final["repl_audit"] = engine.repl_audit
                 try:
                     engine.close()
                 except (Exception, AdapterInterrupted) as error:
@@ -340,6 +356,7 @@ def main():
     cli.add_argument("--cua-binary", default="cua-driver")
     cli.add_argument("--observation-mode", choices=sorted(OBSERVATION_MODES), default="on-demand")
     cli.add_argument("--catalog-mode", choices=sorted(CATALOG_MODES), default="full")
+    cli.add_argument("--browser-surface", choices=BROWSER_SURFACES, default="discrete")
     args = cli.parse_args()
     try:
         request = json.load(sys.stdin)
