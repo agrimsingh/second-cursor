@@ -3,7 +3,8 @@
 over a disposable instance and its isolated test browser, against two local flight fixtures. Covers the failure modes
 listed above BROWSER_SURFACES in benchmarks/engines.py that a script can provoke: a literal foreign URL is refused
 before the call (1), a fixture navigation passes the action-log and tab audits and its tab is adopted for discrete
-tools (9), and a URL built at run time is caught after the call, fails the trial, and locks the engine (1, 12).
+tools (9), browser_repl drives a tab the trial opened through tab_id and is refused any tab the trial does not own
+(14), and a URL built at run time is caught after the call, fails the trial, and locks the engine (1, 12).
 
     SC_E2E_APP=/abs/path/build/SecondCursor.app python3 e2e/benchmark_repl_scope.py
 """
@@ -13,7 +14,7 @@ import pathlib
 import sys
 
 import run as harness
-from benchmarks.engines import ScopeBreach, ScopeError, _ok, create_engine
+from benchmarks.engines import ScopeBreach, ScopeError, _ok, create_engine, records
 from benchmarks.flight_fixtures import FlightFixture
 
 
@@ -48,6 +49,20 @@ def repl_scope(ctx):
         if audit["tabs_adopted"]:
             snapshot = engine.call("browser_snapshot", {"tab_id": audit["tabs_adopted"][0]})
             ctx.check("discrete tools act on the adopted REPL tab", _ok(snapshot), str(snapshot)[:300])
+
+        opened = engine.call("browser_open", {"url": fixture.url})
+        tab = next(row["tab"]["id"] for row in records(opened) if isinstance(row.get("tab"), dict))
+        result = engine.call("browser_repl", {"code": "page.url()", "tab_id": tab})
+        ctx.check("browser_repl drives the trial's tab through tab_id and passes the audit (14)",
+                  not result.get("isError") and fixture.url in str(result) and engine.breach is None
+                  and len(engine.repl_audit["tabs_adopted"]) == 1, str(result)[:300])
+        try:
+            engine.call("browser_repl", {"code": "page.url()", "tab_id": tab + 1_000_000})
+            refused = None
+        except ScopeError as error:
+            refused = error
+        ctx.check("a tab_id the trial does not own is refused before the call (14)",
+                  refused is not None and not isinstance(refused, ScopeBreach) and engine.breach is None, refused)
 
         host, port = foreign.origin.split("//")[1].split(":")
         built = f"const u = ['http:', '', '{host}:' + {port}, 'fixture.html'].join('/'); await page.goto(u); 'went'"

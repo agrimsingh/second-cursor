@@ -473,6 +473,9 @@ BROWSER_SURFACES = ("discrete", "repl")
 # 11. The lexical check also matches URLs in comments or printed strings: a false refusal the model can recover from.
 # 12. Detection is after the fact. It fails the trial; it does not undo the request.
 # 13. The audit's browser_tabs read is host time inside the REPL arm's wall clock, recorded as repl_audit.audit_ms.
+# 14. browser_repl's tab_id hands it a tab: like every tab_id it must be one this trial owns, and the server takes only
+#     the session's agent tabs. So the repl arm starts from a blank agent tab the host opens, not the claimed initial
+#     tab the discrete arm gets, which browser_repl would refuse.
 REPL_LOGGED_NAVIGATION = {"browser_navigate", "browser_open"}
 REPL_FORBIDDEN_OPERATIONS = {"paste", "clipboard", "upload", "set_input_files", "cdp", "evaluate", "history", "user_tabs", "claim"}
 REPL_URL = re.compile(r"(?i)[a-z][a-z0-9+.-]*://[^\s'\"`<>\\)]*")
@@ -615,20 +618,30 @@ class ScopedEngine:
                 tabs[tab["id"]] = tab
         if len(tabs) != 1 or next(iter(tabs.values())).get("url") != "about:blank":
             raise EngineError("Harness browser requires exactly one initial blank tab")
-        tid = next(iter(tabs))
-        claimed = self._host("browser_command", {"operation": "claim", "tab_id": tid})
-        if not any(row.get("tab", {}).get("id") == tid and row["tab"].get("url") == "about:blank"
-                   for row in records(claimed) if isinstance(row.get("tab"), dict)):
-            raise EngineError("Driver did not confirm the exact fixture tab claim")
+        if self.surface == "repl":
+            # browser_repl's tab_id takes only tabs Second Cursor opened, never a claimed personal tab.
+            bound = self._host("browser_open", {"url": "about:blank"})
+            tid = next((row["tab"]["id"] for row in records(bound) if isinstance(row.get("tab"), dict)
+                        and type(row["tab"].get("id")) is int and row["tab"].get("url") == "about:blank"), None)
+            if tid is None:
+                raise EngineError("Driver did not confirm the fixture's blank agent tab")
+            binding = "agent_opened_blank_tab"
+        else:
+            tid = next(iter(tabs))
+            bound = self._host("browser_command", {"operation": "claim", "tab_id": tid})
+            if not any(row.get("tab", {}).get("id") == tid and row["tab"].get("url") == "about:blank"
+                       for row in records(bound) if isinstance(row.get("tab"), dict)):
+                raise EngineError("Driver did not confirm the exact fixture tab claim")
+            binding = "single_initial_blank_tab_claim"
         self.owned_tabs.add(tid)
         self.context["browser"] = {"tab_id": tid, "url": self.url,
                                    "pid": self.targets["browser_pid"], "window_id": self.targets["browser_window_id"]}
         if self.surface == "repl":
-            # browser_repl's page cannot adopt tab_id; without this its own tab reads as a target outside the task.
-            self.context["browser"]["browser_repl_tab"] = ("browser_repl's page opens its own agent tab in this browser; "
-                                                           "that tab is also permitted on the fixture URL's origin, and the harness closes it.")
-        self.identity["harness_browser"]["tab_binding"] = "single_initial_blank_tab_claim"
-        self.initial_observations.append(claimed)
+            # Without this, a tab browser_repl opens itself reads as a target outside the task.
+            self.context["browser"]["browser_repl_tab"] = ("A tab browser_repl opens itself is also permitted on the "
+                                                           "fixture URL's origin, and the harness closes it.")
+        self.identity["harness_browser"]["tab_binding"] = binding
+        self.initial_observations.append(bound)
 
     def _start_cua(self):
         if self.native:
@@ -728,7 +741,7 @@ class ScopedEngine:
             props.pop("pid", None)
             if name in {"batch", "act"}:
                 props.pop("expect", None)  # Native AX postconditions do not apply to a browser tab.
-            if "tab_id" in props and name != "browser_command":
+            if "tab_id" in props and name not in {"browser_command", "browser_repl"}:
                 schema["required"] = list(dict.fromkeys(schema["required"] + ["tab_id"]))
         if "url" in props:
             props["url"]["enum"] = [self.url]
@@ -940,6 +953,8 @@ class ScopedEngine:
                 raise ScopeError("Accessibility action is not fixture-scoped")
         elif name == "browser_repl":
             self._repl_code(args.get("code"))
+            if "tab_id" in args and (type(args["tab_id"]) is not int or args["tab_id"] not in self.owned_tabs):
+                raise ScopeError("Tab was not opened by this trial")
         else:
             if self.name == "second-cursor" and name != "browser_open":
                 static_help = name == "browser_command" and args.get("operation") == "capabilities" and "tab_id" not in args
