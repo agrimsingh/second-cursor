@@ -83,6 +83,10 @@ enum ToolCatalog {
         }
     }
 
+    static func required(_ name: String) -> [String] {
+        tools.first { $0.name == name }?.inputSchema.objectValue?["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
     private static let hostParameters: Set<String> = ["session_id", "operation_id", "observation_id", "timeout_ms"]
     private static let hostTools: Set<String> = ["session", "bind_target", "cancel_operation"]
 

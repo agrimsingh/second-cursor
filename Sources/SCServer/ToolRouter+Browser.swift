@@ -3,7 +3,11 @@ import MCP
 import SCShared
 
 extension ToolRouter {
-    func runBrowser(_ name: String, _ args: Arguments) async throws -> ToolOutput {
+    /// Other clients' names for our arguments, accepted without being advertised (press_key takes the same).
+    private static let browserAliases: [String: [String: String]] = ["browser_press_key": ["key": "keys"]]
+
+    func runBrowser(_ name: String, _ given: Arguments) async throws -> ToolOutput {
+        let args = given.aliasing(Self.browserAliases[name] ?? [:])
         let expectation = try Self.browserExpectation(args)
         if name == "browser_command", let raw = args.raw["arguments"],
            let nested = Arguments.nestedObject(raw), !(nested["expect"]?.isNull ?? true) {
@@ -20,6 +24,10 @@ extension ToolRouter {
         let observing = ToolCatalog.observingBrowserTools.contains(name)
         let mode = observing ? try Self.observeMode(args) : "none"
         if observing {
+            // The caption counts as dispatch in the operation journal, so a call missing its input is refused first.
+            if let missing = ToolCatalog.required(name).first(where: { args.raw[$0]?.isNull ?? true }) {
+                throw SCError.invalidArgument(Arguments.required(missing))
+            }
             await showCaption(args)
         }
         switch name {
@@ -80,6 +88,10 @@ extension ToolRouter {
             ])
             var json = try JSONSerialization.jsonObject(with: await browser.command("tab.snapshot",params:params)) as? [String:Any] ?? [:]
             condense(&json, tabID: try args.int("tab_id"))
+            if json["is_diff"] as? Bool == true, json["outline"] as? String == "(no changes)" {
+                json["hint"] = "Unchanged since your last read or action of this tab, and actions return this diff "
+                    + "themselves: read again only after waiting, or give the action expect to wait for its change."
+            }
             var images: [Screenshot] = []
             if try args.bool("include_screenshot",default:false) {
                 let shot = try await browser.screenshot(tabID:args.int("tab_id")); images=[shot]; json["screenshot"]=Shape.screenshot(shot)
@@ -121,7 +133,9 @@ extension ToolRouter {
 
         case "browser_screenshot":
             let shot = try await browser.screenshot(tabID: try args.int("tab_id"))
-            return ToolOutput(json: Shape.screenshot(shot), images: [shot])
+            var json = Shape.screenshot(shot)
+            json["hint"] = "Read text and prices from the tab's outline (every browser call returns it), not from this image."
+            return ToolOutput(json: json, images: [shot])
 
         case "browser_close":
             let params = try JSONSerialization.data(withJSONObject: ["tabId": try args.int("tab_id")])
@@ -284,7 +298,7 @@ extension ToolRouter {
                 "Step \(index): with tab_id, tool must be one of browser_click, browser_type, browser_press_key, "
                     + "browser_scroll, wait")
         }
-        let args = Arguments(try stepArguments(raw, index: index, tool: named))
+        let args = Arguments(try stepArguments(raw, index: index, tool: named)).aliasing(browserAliases[tool] ?? [:])
         guard args.raw["expect"]?.isNull ?? true else {
             throw SCError.invalidArgument("Step \(index) (\(tool)): put expect on the batch, not individual steps")
         }
@@ -294,7 +308,7 @@ extension ToolRouter {
         }
         func required(_ key: String) throws -> String {
             guard let value = try args.optionalString(key) else {
-                throw SCError.invalidArgument("Step \(index) (\(tool)): \(key) is required")
+                throw SCError.invalidArgument("Step \(index) (\(tool)): \(Arguments.required(key))")
             }
             return value
         }

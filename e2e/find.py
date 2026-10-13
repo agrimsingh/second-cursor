@@ -26,6 +26,13 @@ Ways the feature could fail, written down before the code:
     ownership and cancellation tools. Read-only operation_status must expose its required operation_id.
 15. A host parameter left out of tools/list stops working: an unlisted session cannot be created or own a tab, an
     operation_id retry clicks again, a superseded observation_id or an expired timeout_ms lets the click through.
+16. A malformed browser_press_key costs the model more turns: `key`, the name press_key and other clients use, is
+    refused; a call without keys says only "keys is required", with no example; or it asks the model to reconcile an
+    operation that never dispatched.
+17. A window tool called with neither window_id nor app by a session working in an agent tab says only that window_id
+    is required, instead of naming the tab and browser_snapshot; or a session that has no tab is told about one.
+18. Redundant reads go unremarked: browser_snapshot right after an action that already returned its diff answers
+    "(no changes)" without saying so, and browser_screenshot does not say the text is in the outline.
 
 Usage:  SC_E2E_APP=build/SecondCursor.app python3 e2e/find.py [scenario ...]
 Output: e2e/artifacts/<run-id>/ (report.md, results.json, transcript.jsonl, screenshots/)
@@ -446,6 +453,38 @@ def compact_surface(ctx):
     ctx.check("find_elements is refused for an unapproved app, like get_window_state",
               denied["find_elements"] and denied["find_elements"] == denied["get_window_state"]
               and "approval" in denied["find_elements"].lower(), denied)
+
+
+@scenario
+def call_guidance(ctx):
+    """Failure modes 16-18."""
+    if not ctx.call("browser_status").get("connected"):
+        raise harness.Skip("Chrome extension not connected")
+    sid = new_session(ctx)
+    plain = refused(ctx, "find_elements", text="Submit", session_id=sid)
+    ctx.check("before it opens a tab, a session's window tool without a window is only told it needs one",
+              plain is not None and "window_id is required" in plain and "agent tab" not in plain, plain)
+    with harness.FixtureServer() as base:
+        opened = ctx.call("browser_open", url=f"{base}/form.html", session_id=sid)
+        tab = opened["tab"]["id"]
+        ctx.cleanups.append(lambda: ctx.mcp.call("browser_close", tab_id=tab, session_id=sid))
+        name = re.search(r'\[(e\d+)\] textbox "Name"', opened["observation"]["outline"])[1]
+        ctx.call("browser_type", tab_id=tab, ref=name, text="Ada", session_id=sid)
+        pressed = ctx.call("browser_press_key", tab_id=tab, key="Enter", session_id=sid)
+        ctx.check("browser_press_key takes key, as press_key does", "Hello, Ada" in pressed["observation"]["outline"],
+                  pressed)
+        missing = refused(ctx, "browser_press_key", tab_id=tab, session_id=sid)
+        ctx.check("one without keys shows what to send", missing is not None and '"keys": "enter"' in missing, missing)
+        ctx.check("and does not ask to reconcile an operation that never dispatched",
+                  missing is not None and "operation_id" not in missing, missing)
+        window = refused(ctx, "find_elements", text="Submit", session_id=sid)
+        ctx.check("a window tool without a window, from a session working in a tab, names the tab and browser_snapshot",
+                  window is not None and f"agent tab {tab}" in window and "browser_snapshot" in window, window)
+        again = ctx.call("browser_snapshot", tab_id=tab, session_id=sid)
+        ctx.check("a read right after an action that already returned its diff says so",
+                  again.get("outline") == "(no changes)" and "actions return this diff" in again.get("hint", ""), again)
+        shot = ctx.call("browser_screenshot", tab_id=tab, session_id=sid)
+        ctx.check("a screenshot says the text is in the outline", "outline" in shot.get("hint", ""), shot.get("hint"))
 
 
 if __name__ == "__main__":

@@ -128,6 +128,7 @@ final class ToolRouter: Sendable {
             do {
                 let resolveStarted = DispatchTime.now().uptimeNanoseconds
                 raw = try await resolveAppTarget(name, raw)
+                try Self.requireWindowTarget(name, raw, session: session)
                 raw = try await resolveBrowserTarget(name, raw)
                 args = Arguments(raw)
                 timings?.add("resolve", ms: Timing.since(resolveStarted))
@@ -216,11 +217,26 @@ final class ToolRouter: Sendable {
                     log.record(
                         ActionLogEntry(tool: name, target: args.logTarget, detail: "refused: \(Self.message(for: error))"))
                 }
-                return Self.failure(error, operationID: mutating ? id : nil)
+                var refusedBeforeDispatch = false
+                if case SCError.invalidArgument = error { refusedBeforeDispatch = operation.state != "dispatched" }
+                return Self.failure(error, operationID: mutating && !refusedBeforeDispatch ? id : nil)
             }
         } catch {
             return Self.failure(error)
         }
+    }
+
+    /// A window tool called with neither window_id nor app, by a session whose latest target is an agent tab, is a
+    /// model reaching for the native tools on a web page.
+    private static func requireWindowTarget(_ name: String, _ raw: [String: Value], session: String) throws {
+        guard ToolCatalog.windowScopedTools.contains(name), raw["window_id"]?.isNull ?? true,
+            raw["tab_id"]?.isNull ?? true, !PauseState.isPaused,
+            let tab = TaskRegistry.shared.snapshot(session: session)?.targets.last?.tabID
+        else { return }
+        throw SCError.invalidArgument(
+            "window_id is required, or pass app: \(name) works on native app windows. This session is working in agent "
+                + "tab \(tab): read it with browser_snapshot (tab_id \(tab)) and act with the browser_ tools or batch "
+                + "with tab_id.")
     }
 
     private static let malformedNested =

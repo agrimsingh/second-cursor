@@ -23,8 +23,13 @@ struct Arguments {
     }
 
     func int(_ key: String) throws -> Int {
-        guard let int = try optionalInt(key) else { throw SCError.invalidArgument("\(key) is required") }
+        guard let int = try optionalInt(key) else { throw SCError.invalidArgument(Self.required(key)) }
         return int
+    }
+
+    static func required(_ key: String) -> String {
+        key == "keys" ? "keys is required: a key or +-separated chord, e.g. \"keys\": \"enter\", \"escape\" or \"cmd+a\""
+            : "\(key) is required"
     }
 
     func int(_ key: String, default fallback: Int) throws -> Int {
@@ -45,7 +50,7 @@ struct Arguments {
     }
 
     func string(_ key: String) throws -> String {
-        guard let string = try optionalString(key) else { throw SCError.invalidArgument("\(key) is required") }
+        guard let string = try optionalString(key) else { throw SCError.invalidArgument(Self.required(key)) }
         return string
     }
 
