@@ -6,19 +6,22 @@ public struct ExecutionContext: @unchecked Sendable {
     public var observationID: String?
     public var browserID: String?
     public var deadline: Date?
+    /// The tool call's operation_id, supplied or generated.
+    public var operationID: String?
     public var browserApprovals: Set<String>
     /// Set when `recordTimings` is on; nil makes every `Timing.measure` a plain call.
     public var timings: CallTimings?
     public var beforeDispatch: @Sendable () throws -> Void
     public init(
         sessionID: String = "legacy", observationID: String? = nil, browserID: String? = nil, deadline: Date? = nil,
-        browserApprovals: Set<String> = [], timings: CallTimings? = nil,
+        operationID: String? = nil, browserApprovals: Set<String> = [], timings: CallTimings? = nil,
         beforeDispatch: @escaping @Sendable () throws -> Void = {}
     ) {
         self.sessionID = sessionID
         self.observationID = observationID
         self.browserID = browserID
         self.deadline = deadline
+        self.operationID = operationID
         self.browserApprovals = browserApprovals
         self.timings = timings
         self.beforeDispatch = beforeDispatch

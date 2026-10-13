@@ -1272,7 +1272,7 @@ async function operate(p, guardObservation) {
     }
     const before = loadsOf(tabId).started;
     if (op === "type") await type(tabId, { text: p.text });
-    else await pressKey(tabId, p.keys);
+    else await pressKey(tabId, p.keys, undefined, p.local_approvals);
     if (p.wait_navigation) await afterInput(tabId, before);
     return ok();
   }

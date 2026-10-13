@@ -1,6 +1,8 @@
+import CryptoKit
 import Darwin
 import Foundation
 import JavaScriptCore
+import MCP
 import SCShared
 
 /// browser_repl: one persistent JavaScriptCore context per session and browser, whose Playwright-shaped `page` and `context`
@@ -9,7 +11,10 @@ import SCShared
 /// covering them are listed in e2e/repl.py.
 final class BrowserREPL: @unchecked Sendable {
     static let outputLimit = 40_000
-    static let memoryBudget: UInt64 = 1 << 30
+    static let memoryBudget: UInt64 = 256 << 20
+    /// Live contexts across sessions and browsers; past it the least recently used idle one is discarded.
+    static let maxContexts = 8
+    static let codeDirectory = SCPaths.logsDir.appendingPathComponent("repl-code", isDirectory: true)
 
     static let actsAs: Set<String> = Set(Session.methods.compactMap { methodTools[$0] })
         .union(Session.operations.compactMap { BrowserPolicy.discreteTool[$0] })
@@ -26,11 +31,72 @@ final class BrowserREPL: @unchecked Sendable {
         let sessionID: String
         let browserID: String
     }
-    private var sessions: [SessionKey: Session] = [:]
+    private struct Entry {
+        let session: Session
+        var calls = 0
+        var lastUsed = Date()
+    }
+    private var sessions: [SessionKey: Entry] = [:]
+    private var evicted: Set<SessionKey> = []
 
     init(browser: BrowserControlling, log: ActionLog) {
         self.browser = browser
         self.log = log
+    }
+
+    /// The call's action-log detail. The line keeps the code's first 200 characters with its length and SHA-256;
+    /// the whole code is stored once per digest in `codeDirectory`, so a line stays short however long the script.
+    static func logDetail(_ args: Arguments) -> String? {
+        guard let code = (try? args.optionalString("code")) ?? nil else { return args.logDetail }
+        let digest = SHA256.hash(data: Data(code.utf8)).map { String(format: "%02x", $0) }.joined()
+        let file = codeDirectory.appendingPathComponent("\(digest).js")
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: file.path) {
+            try? fm.createDirectory(at: codeDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            fm.createFile(atPath: file.path, contents: Data(code.utf8), attributes: [.posixPermissions: 0o600])
+        }
+        var raw = args.raw
+        raw["code_sha256"] = .string(digest)
+        raw["code_chars"] = .int(code.count)
+        raw["code_file"] = .string("repl-code/\(digest).js")
+        return Arguments(raw).logDetail
+    }
+
+    /// The line a script's input or navigation writes, as the discrete tool doing the same work would log it.
+    /// Typed text is logged by its length only.
+    fileprivate static func actionEntry(_ method: String, _ params: [String: Any], context: ExecutionContext)
+        -> ActionLogEntry
+    {
+        let operation = params["operation"] as? String
+        let tool = method == "extended"
+            ? operation.flatMap { BrowserPolicy.discreteTool[$0] } ?? "browser_command" : methodTools[method] ?? method
+        var detail: [String: Any] = ["via": "browser_repl", "session_id": context.sessionID]
+        detail["operation_id"] = context.operationID
+        for (key, value) in params where !["tabId", "report_url", "text", "prompt_text"].contains(key) {
+            detail[key] = bounded(value)
+        }
+        for key in ["text", "prompt_text"] {
+            if let text = params[key] as? String { detail["\(key)_length"] = text.count }
+        }
+        let encoded = (try? JSONSerialization.data(withJSONObject: detail, options: [.sortedKeys, .withoutEscapingSlashes]))
+            .map { String(decoding: $0, as: UTF8.self) } ?? "{}"
+        let target = (params["tabId"] as? Int).map { "tab_id=\($0)" }
+            ?? (params["url"] as? String).map { "url=\(bounded($0))" }
+        return ActionLogEntry(
+            tool: tool, target: target, detail: encoded.count > 2000 ? String(encoded.prefix(2000)) + "…" : encoded)
+    }
+
+    private static func bounded(_ value: Any, depth: Int = 0) -> Any {
+        switch value {
+        case let text as String: return text.count > 200 ? String(text.prefix(200)) + "…" : text
+        case let list as [Any]:
+            guard depth < 6 else { return "…" }
+            return list.prefix(20).map { bounded($0, depth: depth + 1) } + (list.count > 20 ? ["… \(list.count - 20) more"] : [])
+        case let object as [String: Any]:
+            guard depth < 6 else { return "…" }
+            return object.mapValues { bounded($0, depth: depth + 1) }
+        default: return value
+        }
     }
 
     func run(code: String, session id: String, deadline: Date) async throws -> ToolOutput {
@@ -43,20 +109,39 @@ final class BrowserREPL: @unchecked Sendable {
         var context = Execution.context
         if context.browserID == nil {
             let metadata = (try? JSONSerialization.jsonObject(with: await browser.instances())) as? [String: Any]
-            let ids = (metadata?["browsers"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
-            guard ids.count == 1 else {
-                if ids.isEmpty { throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected") }
+            let browsers = metadata?["browsers"] as? [[String: Any]] ?? []
+            if browsers.isEmpty { throw SCError.browserUnavailable("the Second Cursor Chrome extension is not connected") }
+            guard let preferred = browsers.first(where: { $0["default"] as? Bool == true })?["id"] as? String else {
                 throw SCError.invalidArgument("Multiple browsers connected; provide browser_id from browser_instances")
             }
-            context.browserID = ids[0]
+            context.browserID = preferred
         }
         let key = SessionKey(sessionID: id, browserID: context.browserID!)
-        let session = lock.withLock {
-            if let session = sessions[key] { return session }
-            let session = Session(id: id, browser: browser, log: log)
-            sessions[key] = session
-            return session
+        let session = try lock.withLock { () throws -> Session in
+            if sessions[key] == nil {
+                if sessions.count >= Self.maxContexts {
+                    guard let idle = sessions.filter({ $0.value.calls == 0 })
+                        .min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key
+                    else {
+                        throw SCError.actionFailed(
+                            "browser_repl is already running code in \(Self.maxContexts) sessions; wait for one to "
+                                + "finish, or close a session you no longer need (session action=close)")
+                    }
+                    sessions.removeValue(forKey: idle)?.session.close()
+                    if evicted.count >= 256, let any = evicted.first { evicted.remove(any) }
+                    evicted.insert(idle)
+                }
+                let notice = evicted.remove(key) == nil ? nil
+                    : "The REPL was reset because more than \(Self.maxContexts) browser_repl sessions were open and "
+                        + "this one was used least recently; variables and pages from earlier calls are gone (their "
+                        + "tabs stay open)."
+                sessions[key] = Entry(session: Session(id: id, browser: browser, log: log, notice: notice))
+            }
+            sessions[key]!.calls += 1
+            sessions[key]!.lastUsed = Date()
+            return sessions[key]!.session
         }
+        defer { lock.withLock { if sessions[key]?.session === session { sessions[key]!.calls -= 1 } } }
         // Answer before the router's deadline, so what the code printed still reaches the client.
         let margin = min(1.5, max(0, deadline.timeIntervalSinceNow) * 0.2)
         context.observationID = nil
@@ -68,14 +153,15 @@ final class BrowserREPL: @unchecked Sendable {
 
     func close(session id: String) {
         let closed = lock.withLock {
-            sessions.keys.filter { $0.sessionID == id }.compactMap { sessions.removeValue(forKey: $0) }
+            evicted = evicted.filter { $0.sessionID != id }
+            return sessions.keys.filter { $0.sessionID == id }.compactMap { sessions.removeValue(forKey: $0)?.session }
         }
         for session in closed { session.close() }
     }
 
     /// For the client's `notifications/cancelled`: ends the call that request started.
     func cancel(requestID: String) {
-        for session in lock.withLock({ Array(sessions.values) }) { session.cancel(requestID: requestID) }
+        for entry in lock.withLock({ Array(sessions.values) }) { entry.session.cancel(requestID: requestID) }
     }
 }
 
@@ -170,10 +256,11 @@ private final class Session: @unchecked Sendable {
     private var closed = false
     private var notice: String?
 
-    init(id: String, browser: BrowserControlling, log: ActionLog) {
+    init(id: String, browser: BrowserControlling, log: ActionLog, notice: String? = nil) {
         self.id = id
         self.browser = browser
         self.log = log
+        self.notice = notice
         queue = DispatchQueue(label: "dev.secondcursor.repl")
     }
 
@@ -320,7 +407,7 @@ private final class Session: @unchecked Sendable {
         }
         if resetNeeded {
             teardown()
-            notice = "The REPL was reset after memory grew by more than 1 GB in one call; variables and pages from "
+            notice = "The REPL was reset after memory grew by more than 256 MB in one call; variables and pages from "
                 + "earlier calls are gone (their tabs stay open)."
         }
     }
@@ -422,9 +509,6 @@ private final class Session: @unchecked Sendable {
         guard let body = try? JSONSerialization.data(withJSONObject: params) else {
             return refuse("Could not encode the browser call")
         }
-        if method == "tabs.open" || method == "tab.navigate", let url = params["url"] as? String {
-            log.record(ActionLogEntry(tool: "browser_repl", target: "url=\(url)", detail: method))
-        }
         let id = nextID
         nextID += 1
         pending[id] = Pending(resolve: resolve, reject: reject, call: call)
@@ -438,6 +522,8 @@ private final class Session: @unchecked Sendable {
         let mutates = ["tabs.open", "tabs.close", "tab.navigate"].contains(method)
             || (method == "extended" && !["inspect", "query", "wait", "screenshot"].contains(operation ?? "")
                 && !(operation == "dialog" && params["accept"] == nil))
+        let entry = mutates ? BrowserREPL.actionEntry(method, params, context: context) : nil
+        let log = self.log
         Task {
             let result: Result<Data, Error>
             do {
@@ -450,6 +536,7 @@ private final class Session: @unchecked Sendable {
                         try TaskRegistry.shared.checkMutation(session: context.sessionID,
                             targetKey: targetKey)
                     }
+                    if let entry { log.record(entry) }
                     let data = try await browser.command(method, params: body)
                     if let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
                         let openedTab = (json["tab"] as? [String: Any])?["id"] as? Int
@@ -525,7 +612,7 @@ private final class Watchdog: @unchecked Sendable {
             case .deadline:
                 return "TimeoutError: stopped at the call's time limit while running synchronous code."
             case .memory:
-                return "Stopped: memory grew by more than 1 GB during this call. The REPL was reset; variables and pages "
+                return "Stopped: memory grew by more than 256 MB during this call. The REPL was reset; variables and pages "
                     + "from earlier calls are gone (their tabs stay open)."
             case .closed:
                 return "The session was closed."
