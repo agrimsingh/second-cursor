@@ -200,12 +200,13 @@ public final class TimingLog: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dev.secondcursor.timinglog")
     public init() {}
 
-    public func record(tool: String, ms: Double, ok: Bool, phases: [String: Double]) {
+    public func record(tool: String, ms: Double, ok: Bool, phases: [String: Double], error: String? = nil) {
         let rounded = phases.mapValues { ($0 * 10).rounded() / 10 }
-        let entry: [String: Any] = [
+        var entry: [String: Any] = [
             "time": ISO8601DateFormatter().string(from: Date()), "tool": tool, "ms": (ms * 10).rounded() / 10, "ok": ok,
             "phases": rounded,
         ]
+        if let error { entry["error"] = String(error.prefix(500)) }
         queue.async {
             guard let line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
             let url = SCPaths.timingLogURL

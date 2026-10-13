@@ -53,7 +53,11 @@ final class ToolRouter: Sendable {
         let timings = CallTimings()
         let started = DispatchTime.now().uptimeNanoseconds
         let result = await route(called, arguments, timings: timings)
-        timingLog.record(tool: called, ms: Timing.since(started), ok: result.isError != true, phases: timings.phasesMS)
+        let error = result.isError == true ? result.content.lazy.compactMap { content -> String? in
+            if case .text(let text, _, _) = content { return text }
+            return nil
+        }.first : nil
+        timingLog.record(tool: called, ms: Timing.since(started), ok: result.isError != true, phases: timings.phasesMS, error: error)
         return result
     }
 
