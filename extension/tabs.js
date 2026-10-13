@@ -549,9 +549,10 @@ export async function settled(tabId, { quietMs, timeoutMs = 2000, reactMs = 1200
 export async function listTabs(session = null) {
   const tabs = [];
   for (const id of [...(await agentTabSet())]) {
-    if (session && (await ownership())[id]?.session !== session) continue;
+    const owner = (await ownership())[id];
+    if (session && owner?.session !== session) continue;
     const tab = await chrome.tabs.get(id).catch(() => null);
-    if (tab) tabs.push(describe(tab));
+    if (tab) tabs.push(isClaim(owner) ? { ...describe(tab), claimed: true } : describe(tab));
     else await updateAgentTabs((set) => set.delete(id));
   }
   return tabs;

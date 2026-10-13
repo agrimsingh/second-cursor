@@ -99,7 +99,8 @@ final class BrowserREPL: @unchecked Sendable {
         }
     }
 
-    func run(code: String, session id: String, deadline: Date) async throws -> ToolOutput {
+    /// `tabID` binds `page` to that tab before the code runs.
+    func run(code: String, session id: String, deadline: Date, tabID: Int? = nil) async throws -> ToolOutput {
         guard JSC.setLimit != nil else {
             throw SCError.actionFailed(
                 "browser_repl needs JavaScriptCore's execution time limit, which this version of macOS does not export")
@@ -107,7 +108,9 @@ final class BrowserREPL: @unchecked Sendable {
         // A Page retains a numeric Chrome tab id. Pin the selected browser before looking up its JS context so
         // switching profiles cannot silently redirect an old Page to a different tab with the same numeric id.
         var context = Execution.context
-        if context.browserID == nil { context.browserID = try await browser.selectInstance(tabID: nil) }
+        if context.browserID == nil { context.browserID = try await browser.selectInstance(tabID: tabID) }
+        var adopted: Adopted?
+        if let tabID { adopted = try await adoptable(tabID, context: context) }
         let key = SessionKey(sessionID: id, browserID: context.browserID!)
         let session = try lock.withLock { () throws -> Session in
             if sessions[key] == nil {
@@ -138,9 +141,32 @@ final class BrowserREPL: @unchecked Sendable {
         let margin = min(1.5, max(0, deadline.timeIntervalSinceNow) * 0.2)
         context.observationID = nil
         let outcome = await session.submit(
-            code: code, deadline: deadline.addingTimeInterval(-margin), context: context, client: ClientRequest.current)
+            code: code, deadline: deadline.addingTimeInterval(-margin), context: context, client: ClientRequest.current,
+            adopt: adopted)
         if outcome.failed { throw SCError.actionFailed(outcome.text) }
         return ToolOutput(json: ["output": outcome.text], images: outcome.images, text: outcome.text)
+    }
+
+    /// The tab and its URL, if Second Cursor opened it for this session in the pinned browser. The extension lists
+    /// only the session's agent tabs, and marks the user's tabs the session claimed with approval, which stay with
+    /// the browser_ tools. The read does not count as the call's dispatch, so a refusal says nothing was sent.
+    private func adoptable(_ tabID: Int, context: ExecutionContext) async throws -> Adopted {
+        let read = ExecutionContext(sessionID: context.sessionID, browserID: context.browserID, deadline: context.deadline)
+        let data = try await Execution.$context.withValue(read) {
+            try await browser.command("tabs.list", params: Data("{}".utf8))
+        }
+        let tabs = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["tabs"] as? [[String: Any]] ?? []
+        guard let tab = tabs.first(where: { $0["id"] as? Int == tabID }) else {
+            throw SCError.invalidArgument(
+                "Tab \(tabID) is not an agent tab of this session in this browser; tab_id takes a tab this session "
+                    + "opened with browser_open, or that one of its pages opened")
+        }
+        guard tab["claimed"] as? Bool != true else {
+            throw SCError.invalidArgument(
+                "Tab \(tabID) is the user's own tab, claimed with approval; browser_repl drives only tabs Second "
+                    + "Cursor opened, so use the browser_ tools on it")
+        }
+        return Adopted(id: tabID, url: tab["url"] as? String ?? "about:blank")
     }
 
     func close(session id: String) {
@@ -163,12 +189,18 @@ private struct Outcome {
     var failed: Bool
 }
 
+private struct Adopted {
+    let id: Int
+    let url: String
+}
+
 private final class Call {
     let cancellationID = UUID()
     let code: String
     let deadline: Date
     let context: ExecutionContext
     let requestID: String?
+    let adopt: Adopted?
     let continuation: CheckedContinuation<Outcome, Never>
     let started = Date()
     var output = Output()
@@ -176,13 +208,14 @@ private final class Call {
     var finished = false
 
     init(
-        code: String, deadline: Date, context: ExecutionContext, requestID: String?,
+        code: String, deadline: Date, context: ExecutionContext, requestID: String?, adopt: Adopted?,
         continuation: CheckedContinuation<Outcome, Never>
     ) {
         self.code = code
         self.requestID = requestID
         self.deadline = deadline
         self.context = context
+        self.adopt = adopt
         self.continuation = continuation
     }
 }
@@ -247,6 +280,9 @@ private final class Session: @unchecked Sendable {
     private var resetNeeded = false
     private var closed = false
     private var notice: String?
+    /// The tabs this session's scripts may address: those its pages opened and those passed as tab_id. Outlives
+    /// a reset, like the tabs themselves.
+    private var tabs: Set<Int> = []
 
     init(id: String, browser: BrowserControlling, log: ActionLog, notice: String? = nil) {
         self.id = id
@@ -256,10 +292,13 @@ private final class Session: @unchecked Sendable {
         queue = DispatchQueue(label: "dev.secondcursor.repl")
     }
 
-    func submit(code: String, deadline: Date, context: ExecutionContext, client: ClientRequest?) async -> Outcome {
+    func submit(code: String, deadline: Date, context: ExecutionContext, client: ClientRequest?, adopt: Adopted?)
+        async -> Outcome
+    {
         await withCheckedContinuation { continuation in
             let call = Call(
-                code: code, deadline: deadline, context: context, requestID: client?.id, continuation: continuation)
+                code: code, deadline: deadline, context: context, requestID: client?.id, adopt: adopt,
+                continuation: continuation)
             queue.async { self.enqueue(call) }
             after(deadline.timeIntervalSinceNow) { self.expire(call) }
             let callID = call.cancellationID
@@ -342,7 +381,12 @@ private final class Session: @unchecked Sendable {
             self.notice = nil
         }
         context?.exception = nil
-        enter { _ = runner?.invokeMethod("run", withArguments: [call.code]) }
+        var arguments: [Any] = [call.code]
+        if let adopt = call.adopt {
+            tabs.insert(adopt.id)
+            arguments += [adopt.id, adopt.url]
+        }
+        enter { _ = runner?.invokeMethod("run", withArguments: arguments) }
         if call === current, let exception = context?.exception {
             context?.exception = nil
             finish(call, "Internal error in browser_repl: \(exception)", failed: true)
@@ -494,6 +538,9 @@ private final class Session: @unchecked Sendable {
                 return refuse("browser_repl does not offer the \(operation ?? "unnamed") operation")
             }
         }
+        if params["tabId"] != nil, !((params["tabId"] as? Int).map(tabs.contains) ?? false) {
+            return refuse("browser_repl drives only its own pages and the tab passed as tab_id")
+        }
         for key in ["local_approvals", "session_id", "deadline", "observation_id", "files"] { params[key] = nil }
         if let wait = params["timeout_ms"] as? Double {
             params["timeout_ms"] = Int(max(0, min(wait, call.deadline.timeIntervalSinceNow * 1000)))
@@ -548,14 +595,19 @@ private final class Session: @unchecked Sendable {
             } catch {
                 result = .failure(error)
             }
-            self.queue.async { self.complete(id, result, image: image) }
+            self.queue.async { self.complete(id, result, image: image, opens: method == "tabs.open") }
         }
     }
 
-    private func complete(_ id: Int, _ result: Result<Data, Error>, image: Bool) {
+    private func complete(_ id: Int, _ result: Result<Data, Error>, image: Bool, opens: Bool) {
         guard let entry = pending.removeValue(forKey: id), entry.call === current else { return }
         switch result {
         case .success(var data):
+            if opens, let tab = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["tab"]
+                as? [String: Any], let opened = tab["id"] as? Int
+            {
+                tabs.insert(opened)
+            }
             // The PNG stays on this side; the script gets a handle it can return as the cell's value.
             if image, var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                 let encoded = json.removeValue(forKey: "data") as? String, let png = Data(base64Encoded: encoded)

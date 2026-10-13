@@ -355,7 +355,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_open",
                 description:
-                    "Open a URL in a new background Chrome tab owned by the agent, wait for the page to finish rendering, and return its outline (as browser_snapshot does): read text, prices and refs from it, not from a screenshot or another read. Use the returned tab id with the other browser tools. Without browser_id it opens in the Chrome profile the user focused last; call browser_instances only when the page needs a different profile's account.",
+                    "Open a URL in a new background Chrome tab owned by the agent, wait for the page to finish rendering, and return its outline (as browser_snapshot does): read text, prices and refs from it, not from a screenshot or another read. Use the returned tab id with the other browser tools, or browser_repl for several steps. Without browser_id it opens in the Chrome profile the user focused last; call browser_instances only when the page needs a different profile's account.",
                 inputSchema: schema(["url": string("URL to open.")], required: ["url"])
             ),
             Tool(
@@ -590,8 +590,8 @@ enum ToolCatalog {
         Tool(
             name: "browser_repl",
             description:
-                "The fastest way through a multi-step web flow: fill a form, search, filter, page through results and return just the text you need, in one call instead of one per click. A single click or read needs only the browser_ tools. Runs JavaScript in a persistent REPL: top-level await works, and variables and functions persist between calls. Returns what the code printed and the value of its last expression. `page` is a Playwright-compatible page driving its own background Chrome tab (`context` is its browser context), e.g. await page.goto(url); await page.getByLabel('From').fill('SFO'); await page.getByRole('button', {name: 'Search'}).click(); await page.getByRole('main').innerText(). page.snapshot() returns the page's accessibility outline, whose [e123] refs work as page.locator('aria-ref=e123'). There is no page.evaluate: operate pages through locators.",
-            inputSchema: schema(["code": string("JavaScript to run.")], required: ["code"])),
+                "The fastest way through a multi-step web flow: fill a form, search, filter, page through results and return just the text you need, in one call instead of one per click. A single click or read needs only the browser_ tools. A persistent JavaScript REPL with top-level await. Returns what the code printed and its last expression's value. `page` is a Playwright-compatible page on the agent tab you pass as tab_id, else on its own background tab (`context` is its browser context), e.g. await page.goto(url); await page.getByLabel('From').fill('SFO'); await page.getByRole('button', {name: 'Search'}).click(); await page.getByRole('main').innerText(). page.snapshot() returns the page's accessibility outline, whose [e123] refs work as page.locator('aria-ref=e123'). There is no page.evaluate: operate pages through locators.",
+            inputSchema: schema(["code": string("JavaScript to run."), "tab_id": tabID], required: ["code"])),
         Tool(
             name: "wait_for",
             description:

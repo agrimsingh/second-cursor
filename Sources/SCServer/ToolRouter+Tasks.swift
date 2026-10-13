@@ -134,6 +134,8 @@ extension ToolRouter {
         if name.hasPrefix("browser_") || isTabBatch(name, args) {
             if name == "browser_command", let operation = try? args.optionalString("operation"),
                ["claim", "release", "retain"].contains(operation) { return nil }
+            // browser_repl checks each of its actions against its tab, so the script's own read can satisfy a resume.
+            if name == "browser_repl" { return nil }
             if let id = try? args.optionalInt("tab_id"), let browserID = try? args.optionalString("browser_id") {
                 return SCTaskTarget.browserKey(browserID: browserID, tabID: id)
             }
