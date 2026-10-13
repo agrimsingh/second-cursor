@@ -37,8 +37,49 @@ Returning too early (the read misses what the action caused):
 - A JavaScript dialog blocks the page's script; the action answers before any read (unchanged).
 - Lazy images and fonts load after the click; images are not waited for (unchanged).
 
+Ways settling can fail for a fast client (one that acts as soon as it reads, or batches actions), written before the
+change that learns churn from every idle window (and a load's own settle) for the document's lifetime, and stops
+waiting on a request 5 s old once the action's change has rendered and the page has been still for 1 s:
+
+Returning too late:
+- Each idle window (read settled to next input) is shorter than a churn period, so the last window alone never sees
+  a clock or carousel change twice; every read waits out its 2 s cap, or 10 s once any request extended the deadline
+  (settle_fast_churn_clicks: no think time).
+- The page's long poll was opened before its requests were tracked (during browser_open's load), so the first tracked
+  instance is the one it reopens during an action, counted as the action's request until it answers or the 10 s cap
+  (settle_fast_churn_clicks: the fixture's 6 s long poll).
+- The page reopens a channel or fires a request after every input with a new URL each time (a cursor, an event id),
+  so no request identity ever repeats and each action waits for it until the 10 s cap (settle_fast_reopened_channel;
+  the Navan date click: a request never seen before started at the input and answered 10.0 s later).
+- The request outlives the action's change but the page never goes quiet (churn not yet learned), so nothing shows
+  the reaction is over; the read falls back to the 10 s cap, never earlier.
+- An infinite animation unrelated to loading starts with the action (a pulsing badge, a custom blinking caret) and is
+  taken for a spinner, so the request is still waited for until the cap, never earlier.
+- EventSource, WebSocket and sendBeacon requests are not tracked at all; keepalive fetches and streamed responses
+  are tracked like any fetch, and a stream that never ends is a long poll here (released like one).
+
+Returning too early:
+- The action's results come from a slow request behind a spinner without aria-busy or a progressbar role, animated
+  only by CSS (settle_fast_slow_result: a 5 s request behind a CSS spinner, while a channel reopens on every input).
+- The action shows nothing until its slow request answers (settle_fast_slow_result: 5 s, nothing rendered meanwhile).
+- The action's loading state does not animate through CSS or Web Animations (a static "Searching..." text, a GIF or
+  SMIL spinner): its request, pending 5 s while the page has been still for 1 s, is taken for the page's own and the
+  read returns showing the loading state (a named risk; settling reports outlived_requests, so a client can read
+  again).
+- Results stream in batches more than 1 s apart over one request with no animated loader; the read returns after
+  the first batch that lands 5 s or more into the request.
+- The real result needs a request the page starts only after a slow one answers; releasing the slow one returns
+  before the second starts (as finishing it 300 ms earlier always could).
+- Learned churn is remembered for the document's lifetime: a node that changed the same way twice while the agent
+  was idle (rows rendered lazily after a read, a container a load filled twice) never counts again, so an action
+  whose only change is to it shows no reaction; a pending request is then never released (no counted reaction), and
+  without one the read waits the reaction window.
+- A browser_navigate whose shell renders and then waits on a boot request without an animated loader returns after
+  5 s with the shell (browser_open tracks no request before its read).
+
 Usage: SC_E2E_APP=build/SecondCursor.app python3 e2e/browser_settle_churn.py [scenario ...] [--rounds N]
-       [--think S]   seconds of model think time between reading the page and acting on it (default 1.5)
+       [--think S]   seconds of model think time between reading the page and acting on it (default 1.5; the
+                     settle_fast_* scenarios always act at once)
 SC_E2E_EXTENSION=DIR measures a saved baseline extension. Writes settle-churn.json with every ext.settled sample.
 """
 import json
@@ -75,10 +116,10 @@ def ref(outline, role, label):
     return match[1]
 
 
-def timed_click(ctx, tab, target, label):
+def timed_click(ctx, tab, target, label, think=None):
     """Clicks after a think pause, returning the observation's outline and recording the call's ext.settled."""
     instance = ctx.run.instance
-    time.sleep(THINK)
+    time.sleep(THINK if think is None else think)
     start = len(instance.timings()) if instance else 0
     began = time.perf_counter()
     result = ctx.call("browser_click", tab_id=tab, ref=target)
@@ -173,6 +214,56 @@ def settle_churn_live_search(ctx):
                   f"Live fare 1 for search {i}" in observed and "Loading live fares" not in observed,
                   observed[-800:])
     check_median(ctx, "churn: live search, results pushed after 2.5 s", 2400, 4000)
+
+
+def date_rounds(ctx, tab, prefix, rounds):
+    """Opens the date picker, reads it and picks a date, then toggles the checkbox, all without think time."""
+    for i in range(rounds):
+        outline = ctx.call("browser_snapshot", tab_id=tab, full=True)["outline"]
+        opened, _ = timed_click(ctx, tab, ref(outline, "button", "Departure date"), f"{prefix}: open date picker", 0)
+        ctx.require(f"{prefix} round {i + 1}: the date grid opened", 'button "Oct 14"' in opened, opened[-800:])
+        outline = ctx.call("browser_snapshot", tab_id=tab, full=True)["outline"]
+        day = 14 + i % 12
+        observed, _ = timed_click(ctx, tab, ref(outline, "button", f"Oct {day}"), f"{prefix}: click a date", 0)
+        ctx.check(f"{prefix} round {i + 1}: the date click's own observation shows Departure: Oct {day}",
+                  f"Departure: Oct {day}" in observed, observed[-800:])
+        observed, _ = timed_click(ctx, tab, ref(outline, "checkbox", "In policy only"), f"{prefix}: checkbox", 0)
+        line = next((l for l in observed.splitlines() if 'checkbox "In policy only"' in l
+                     and not l.lstrip().startswith("-")), "")
+        ctx.check(f"{prefix} round {i + 1}: the observation shows the checkbox checked={i % 2 == 0}",
+                  bool(re.search(r"\bchecked\b", line)) is (i % 2 == 0), observed[-800:])
+
+
+@scenario
+def settle_fast_churn_clicks(ctx):
+    tab = open_tab(ctx)
+    date_rounds(ctx, tab, "fast churn", ROUNDS * 2)
+    for label in ("open date picker", "click a date", "checkbox"):
+        check_median(ctx, f"fast churn: {label}", 0, 1000)
+
+
+@scenario
+def settle_fast_reopened_channel(ctx):
+    tab = open_tab(ctx, "?reopen")
+    date_rounds(ctx, tab, "fast reopen", ROUNDS)
+    for label in ("open date picker", "click a date", "checkbox"):
+        check_median(ctx, f"fast reopen: {label}", 0, 6000)
+
+
+@scenario
+def settle_fast_slow_result(ctx):
+    tab = open_tab(ctx, "?reopen")
+    outline = ctx.call("browser_snapshot", tab_id=tab, full=True)["outline"]
+    spinner, silent = ref(outline, "button", "Search, CSS spinner"), ref(outline, "button", "Search, no indicator")
+    for i in range(1, ROUNDS + 1):
+        observed, _ = timed_click(ctx, tab, spinner, "fast: results after 5 s behind a CSS spinner", 0)
+        ctx.check(f"spinner search {i}: its own observation has the results, not the spinner",
+                  f"Spun fare 1 for search {i}" in observed and "Finding fares" not in observed, observed[-800:])
+        observed, _ = timed_click(ctx, tab, silent, "fast: results after 5 s, nothing shown meanwhile", 0)
+        ctx.check(f"silent search {i}: its own observation has the results",
+                  f"Silent fare 1 for search {i}" in observed, observed[-800:])
+    check_median(ctx, "fast: results after 5 s behind a CSS spinner", 4900, 6500)
+    check_median(ctx, "fast: results after 5 s, nothing shown meanwhile", 4900, 6500)
 
 
 if __name__ == "__main__":

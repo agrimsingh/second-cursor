@@ -30,6 +30,8 @@
   </ul>
   <button id="search" type="button">Search</button>
   <button id="search-live" type="button">Search live fares</button>
+  <button id="search-spun" type="button">Search, CSS spinner</button>
+  <button id="search-silent" type="button">Search, no indicator</button>
   <section id="results" aria-label="Results"></section>
   <button id="counter" type="button">Count</button>
   <p id="count">Count: 0</p>
@@ -38,8 +40,20 @@
   const $ = (id) => document.getElementById(id);
   const text = (tag, content) => Object.assign(document.createElement(tag), { textContent: content });
 
+  const params = new URLSearchParams(location.search);
+  // ?reopen: every input reopens a channel with a new cursor (a long poll resumed from the last event id, an analytics
+  // call with a fresh id), so no two of its requests are the same. It answers 10 s later.
+  if (params.has("reopen")) {
+    let cursor = 0, channel;
+    document.addEventListener("pointerdown", () => {
+      channel?.abort();
+      channel = new AbortController();
+      fetch(`late-results.json?delay_ms=10000&channel=events&cursor=${++cursor}`, { cache: "no-store",
+        signal: channel.signal }).catch(() => {});
+    }, true);
+  }
   // ?calm leaves the page without background activity, as the static control.
-  if (!new URLSearchParams(location.search).has("calm")) {
+  if (!params.has("calm")) {
     // Faster than the 300 ms quiet period, like a live clock with tenths, a countdown, or a ticker.
     setInterval(() => { $("clock").textContent = (performance.now() / 1000).toFixed(1); }, 150);
     let slide = 0;
@@ -101,6 +115,22 @@
     const count = ++live;
     $("results").replaceChildren(spinner("Loading live fares"));
     setTimeout(() => show("Live fare", count), 2500);
+  });
+  // Results from a 5 s request behind a spinner only CSS animates: no aria-busy, no progressbar role.
+  let spun = 0;
+  $("search-spun").addEventListener("click", async () => {
+    const count = ++spun;
+    $("results").replaceChildren(text("p", "Finding fares"), Object.assign(document.createElement("span"),
+      { className: "spinner" }));
+    await fetch(`late-results.json?delay_ms=5000&spun=${count}`, { cache: "no-store" });
+    show("Spun fare", count);
+  });
+  // Results from a 5 s request, with nothing shown meanwhile.
+  let silent = 0;
+  $("search-silent").addEventListener("click", async () => {
+    const count = ++silent;
+    await fetch(`late-results.json?delay_ms=5000&silent=${count}`, { cache: "no-store" });
+    show("Silent fare", count);
   });
 
   let counts = 0;

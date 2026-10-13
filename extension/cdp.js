@@ -104,23 +104,25 @@ export async function trackRequests(tabId) {
 /**
  * Request timing is a readiness hint, never evidence that the requested mutation succeeded. Requests started from
  * `since` count, except the page's own (noteBackgroundRequests) and any started from `until`, once the agent was idle.
+ * Unfinished ones started before `outlivedBefore` are counted as outlived instead of pending.
  */
-export function actionNetworkState(tabId, since, until = Infinity) {
+export function actionNetworkState(tabId, since, until = Infinity, outlivedBefore = -Infinity) {
   const state = requestTracking.get(tabId);
-  if (!state) return { available: false, pending: 0, quiet: Infinity, failed: 0 };
-  let pending = 0, finishedAt = -Infinity, failed = 0, inferred = 0;
+  if (!state) return { available: false, pending: 0, outlived: 0, quiet: Infinity, failed: 0 };
+  let pending = 0, outlived = 0, finishedAt = -Infinity, failed = 0, inferred = 0;
   for (const request of state.requests.values()) {
     if (request.startedAt < since || request.startedAt >= until || state.background.has(request.key)) continue;
     const completedAt = request.finishedAt ?? request.bodyObservedAt;
-    if (completedAt == null) pending++;
-    else finishedAt = Math.max(finishedAt, completedAt);
+    if (completedAt != null) finishedAt = Math.max(finishedAt, completedAt);
+    else if (request.startedAt < outlivedBefore) outlived++;
+    else pending++;
     if (request.failed) failed++;
     if (request.finishedAt == null && request.bodyObservedAt != null) inferred++;
   }
   const enabling = [...state.sessions.values()].some(value => typeof value !== "boolean");
   const incomplete = state.overflowAt >= since;
   const available = state.sessions.get("") === true && ![...state.sessions.values()].includes(false) && !incomplete;
-  return { available, pending, quiet: Date.now() - finishedAt, failed, inferred, enabling, incomplete };
+  return { available, pending, outlived, quiet: Date.now() - finishedAt, failed, inferred, enabling, incomplete };
 }
 
 /**
