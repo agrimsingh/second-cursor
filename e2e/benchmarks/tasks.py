@@ -22,6 +22,8 @@ PROMPTS = {
 RULES = (" Use only your engine's normal computer-control tools. Do not use the shell, filesystem editing, "
          "JavaScript evaluation, or direct HTTP requests to complete the task. Do not change the human's focus, cursor, or Space. "
          "Do not touch any target outside this task. Close only browser tabs that you created when finished.")
+# browser_repl runs JavaScript, so the unqualified rule reads as forbidding the very tool it is offered beside.
+REPL_RULES = RULES.replace("JavaScript evaluation", "JavaScript evaluation in the page")
 MODES = {"browser_work_order": "form", "canvas_route": "canvas", "transient_dialog": "dialog"}
 
 
@@ -443,7 +445,8 @@ def task_trial(ctx, task, round_number, args, row, output):
                 ctx.call("browser_navigate", tab_id=tid, url=targets["url"])
     request = {"protocol": report.CONTRACT, "task_id": task, "trial": round_number, "track": args.track,
                "native_placement": native_placement(args),
-               "model": args.model, "prompt": (server.prompt if task in WORKSPACE_TASKS or task in FLIGHT_TASKS else PROMPTS[task]) + RULES,
+               "model": args.model, "prompt": (server.prompt if task in WORKSPACE_TASKS or task in FLIGHT_TASKS else PROMPTS[task])
+               + (REPL_RULES if getattr(args, "browser_surface", "discrete") == "repl" else RULES),
                "targets": targets, "timeout_seconds": args.timeout}
     if args.model:
         request.update(model_config=report.model_config_for(args), case_seed=row["case_seed"],
