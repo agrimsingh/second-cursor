@@ -9,6 +9,15 @@ Second Cursor reads and operates Mac apps in the background: the user's cursor, 
 
 Use it when the task needs a real app (Calculator, TextEdit, Notes, Mail, Slack, a Chrome tab the agent opens). Prefer a file, CLI or API when one does the job; a UI is the slow path.
 
+## Web pages go through browser tools
+
+For any task on a web page (Google Docs, Sheets, Gmail, a site), use the browser tools, never the desktop tools on the user's Chrome window, even when the page is already open there:
+
+- `browser_open` the page's URL in your own background tab. It has the user's logins, and you get the page's DOM and screenshots. The user's clicks and typing in their own windows do not interrupt it. On the user's Chrome window, web apps that draw their own content (Docs, Sheets, Figma) are mostly missing from the outline, and every touch by the user stops you.
+- If the user names a tab they have open, claim it with `browser_command` `operation: "claim"` instead of reopening it.
+- `browser_instances` names each connected Chrome profile by its signed-in account. With more than one, pass `browser_id` for the profile signed in to the page's account.
+- If `browser_status` says the extension is not connected, or no instance is signed in to the account the page needs, stop and ask the user to install or enable the Second Cursor extension in that Chrome profile. Do not fall back to driving their Chrome window.
+
 If tools fail with "not running" or permission errors, run `SecondCursor doctor` (the binary is `~/Applications/SecondCursor.app/Contents/MacOS/SecondCursor`) and report what it says. Never ask the user to click or switch apps for you.
 
 ## Observe, then act
@@ -27,7 +36,9 @@ To find one element in a big window (a button, field or row), call `find_element
 
 A full read of a big window or page can come condensed: long lists keep their first rows, and the rest collapse into `… N lines hidden (expand "r3")` lines. Hidden elements stay actionable by index or ref, and `find_elements` searches them. To read a hidden part, pass its id as `expand` to the same read tool instead of reading again.
 
-Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`, and on tabs those open (a result's `events` names them).
+Keyboard shortcuts (`press_key`, e.g. `cmd+a`) are often the fastest route in pro apps. Browser tools act only on tabs the agent opened with `browser_open`, tabs those open (a result's `events` names them), and tabs it claimed.
+
+If an action is refused because the user is using the app, do not wait in a loop. For a web page, switch to the browser tools. For another app, tell the user what you are waiting for, and read the window again once they stop.
 
 When `browser_repl` is listed, use it for multi-step work in a browser tab (going through a list, filling a form, repeating an action per row): one script with a Playwright-compatible `page` loops over the page's controls in a call, where discrete browser tools take one call per click. Read the page again after actions that change it (a list that reorders, pages, or gains items), and handle the errors it throws: a covered or ambiguous target is refused, never clicked blindly.
 

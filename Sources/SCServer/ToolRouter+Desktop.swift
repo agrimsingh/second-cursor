@@ -463,8 +463,24 @@ extension ToolRouter {
         if let base = snapshot.diffBase { json["diff_base"] = base }
         if let scope = snapshot.scope { json["scope"] = scope }
         if let label = snapshot.scopeLabel { json["scope"] = label }
-        if let hint = snapshot.hint { json["hint"] = hint }
+        let browserHint = snapshot.isDiff ? nil : await browserWindowHint(snapshot.window)
+        let hints = [snapshot.hint, browserHint].compactMap { $0 }
+        if !hints.isEmpty { json["hint"] = hints.joined(separator: " ") }
         return json
+    }
+
+    /// Driving the user's own browser window is the slow, contended path for a web page, and an agent that is not
+    /// told so takes it: the page's custom-drawn content is missing from this tree, and every touch by the user stops it.
+    private func browserWindowHint(_ window: WindowInfo) async -> String? {
+        guard BrowserStatus.hostsExtension(bundleID: window.bundleID) else { return nil }
+        if await browser.status().connected {
+            return "This is the user's own browser window. For work on a web page, open the page in your own tab with "
+                + "browser_open (browser_instances names each Chrome profile's account; pass browser_id for the one "
+                + "signed in to the page's account): you get its DOM and screenshots, and the user's input does not interrupt you."
+        }
+        return "This is the user's own browser window, and the Second Cursor extension is not connected in any Chrome "
+            + "profile. For work on a web page, ask the user to install or enable the extension in the profile this "
+            + "window uses, instead of driving this window: its page content is incomplete here and the user's input stops you."
     }
 
     private static let screenshotScales = ScreenshotScales()

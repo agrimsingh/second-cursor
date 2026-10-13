@@ -427,6 +427,14 @@ public struct BrowserStatus: Codable, Sendable, Equatable {
         self.connected = connected
         self.extensionVersion = extensionVersion
     }
+
+    /// Apps whose windows the Second Cursor extension can serve: the browsers `BrowserSetup.browserPaths` registers
+    /// its native host for. Prefixes cover each browser's beta, dev and canary channels.
+    public static func hostsExtension(bundleID: String?) -> Bool {
+        guard let id = bundleID?.lowercased() else { return false }
+        return ["com.google.chrome", "org.chromium.chromium", "com.brave.browser", "com.microsoft.edgemac"]
+            .contains { id.hasPrefix($0) }
+    }
 }
 
 public struct BrowserTab: Codable, Sendable, Equatable {

@@ -400,7 +400,13 @@ def chrome_hidden_page_hint(ctx):
             time.sleep(0.5)
             shown = ctx.call("get_window_state", window_id=wid, full=True, include_screenshot=False)
         ctx.check("once the cover is gone, the page is back in the tree", "Click me" in shown["tree"], shown["tree"][:600])
-        ctx.check("and the read carries no hint", "hint" not in shown, shown.get("hint"))
+        shown_hint = shown.get("hint", "")
+        ctx.check("and the read no longer says the page is paused", "covered" not in shown_hint, shown_hint)
+        ctx.check("but a full read of the user's browser window routes web pages to an agent tab",
+                  "user's own browser window" in shown_hint
+                  and ("browser_open" in shown_hint or "extension is not connected" in shown_hint), shown_hint)
+        diff = ctx.call("get_window_state", window_id=wid, include_screenshot=False)
+        ctx.check("and a diff read does not repeat it", "hint" not in diff, diff.get("hint"))
 
 
 @scenario

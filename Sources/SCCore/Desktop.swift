@@ -1120,7 +1120,8 @@ public final class Desktop: DesktopControlling, @unchecked Sendable {
             throw SCError.actionFailed("Stale observation; read get_window_state again before acting")
         }
         if let tree = storedTree(for: wid), HumanInputMonitor.shared.state.inputSequence(for: tree.pid) > tree.inputSequence {
-            throw SCError.notAllowed("The user interacted with this app since observation. Read get_window_state again after they yield before acting.")
+            throw SCError.notAllowed("The user interacted with this app since observation. Read get_window_state again after they yield before acting."
+                + NativeSafety.webPageAdvice(tree.pid))
         }
         if let tree = storedTree(for: wid), tree.snapshotID != nil,
            let window = try? resolver.resolve(pid: tree.pid, wid: wid) {
