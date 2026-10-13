@@ -200,13 +200,19 @@ public final class TimingLog: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dev.secondcursor.timinglog")
     public init() {}
 
-    public func record(tool: String, ms: Double, ok: Bool, phases: [String: Double], error: String? = nil) {
+    public func record(
+        tool: String, ms: Double, ok: Bool, phases: [String: Double], error: String? = nil, session: String? = nil
+    ) {
         let rounded = phases.mapValues { ($0 * 10).rounded() / 10 }
+        // Milliseconds, so e2e/session_report.py can tell concurrent calls from back-to-back ones.
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var entry: [String: Any] = [
-            "time": ISO8601DateFormatter().string(from: Date()), "tool": tool, "ms": (ms * 10).rounded() / 10, "ok": ok,
+            "time": formatter.string(from: Date()), "tool": tool, "ms": (ms * 10).rounded() / 10, "ok": ok,
             "phases": rounded,
         ]
         if let error { entry["error"] = String(error.prefix(500)) }
+        if let session { entry["session_id"] = session }
         queue.async {
             guard let line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
             let url = SCPaths.timingLogURL
