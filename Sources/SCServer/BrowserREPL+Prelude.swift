@@ -518,6 +518,9 @@ extension BrowserREPL {
   const internals = new WeakMap();
   const images = new WeakMap();
   const pages = [];
+  const byTab = new Map();
+  // Set only by adopt, for the Page it constructs next; scripts cannot reach it, so no Page takes a tab id from them.
+  let adopting = null;
 
   class Locator {
     #page; #chain; #desc;
@@ -720,6 +723,7 @@ extension BrowserREPL {
   const READS = new Set(["tab.snapshot", "tabs.list", "query", "inspect"]);
   class Page {
     #tab = null;
+    #tabId = null;
     #url = "about:blank";
     #closed = false;
     #timeout = 5000;
@@ -727,11 +731,19 @@ extension BrowserREPL {
     #listeners = new Map();
     constructor() {
       pages.push(this);
+      if (adopting) {
+        [this.#tabId, this.#url] = [adopting.id, adopting.url];
+        this.#tab = Promise.resolve(adopting.id);
+        byTab.set(adopting.id, this);
+        adopting = null;
+      }
       const self = this;
       const ready = (url = "about:blank") => {
         if (this.#closed) return Promise.reject(new Error("Target page has been closed"));
         this.#tab ??= call("tabs.open", { url }).then((r) => {
           this.#url = r.tab?.url || url;
+          this.#tabId = r.tab.id;
+          byTab.set(r.tab.id, this);
           return r.tab.id;
         }, (error) => {
           this.#tab = null;
@@ -848,7 +860,7 @@ extension BrowserREPL {
         up: notAvailable("mouse.up", ""),
       }, "mouse"));
     }
-    [INSPECT]() { return `Page ${this.#url}${this.#closed ? " (closed)" : ""}`; }
+    [INSPECT]() { return `Page ${this.#url}${this.#tabId === null ? "" : ` (tab ${this.#tabId})`}${this.#closed ? " (closed)" : ""}`; }
     #command(operation, args) { return internals.get(this).command(operation, args); }
     #locator(steps, desc) { return new Locator(this, steps, desc); }
     context() { return context; }
@@ -993,13 +1005,20 @@ extension BrowserREPL {
   const context = new BrowserContext();
   global.context = context;
   global.page = new Page();
+  const adopt = (id, url) => {
+    const known = byTab.get(id);
+    if (known && !known.isClosed()) return known;
+    adopting = { id, url };
+    return new Page();
+  };
 
   // One hop later: unhandled rejections are reported once the microtask queue drains, after the cell settles.
   const finish = (ok, text, image = -1) => host.sleep(0, () => host.done(ok, capped(text), image), () => {});
   return freeze({
-    run(code) {
+    run(code, tabId, url) {
       let compiled, promise;
       try {
+        if (tabId !== undefined) global.page = adopt(tabId, url);
         compiled = compile(String(code));
         if (!compiled.kept) print("[system] This cell ran without keeping its declarations for later calls.");
         promise = compiled.fn.call(global, global);

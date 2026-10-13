@@ -628,6 +628,227 @@ def repl_context_cap(ctx):
               and first.endswith("undefined"), first)
 
 
+def agent_tabs(ctx, sid):
+    return {tab["id"]: tab for tab in ctx.call("browser_tabs", session_id=sid)["tabs"]}
+
+
+def refusal(ctx, code, **args):
+    """The text of a browser_repl call that must fail; a call that succeeds is returned as SUCCEEDED <text>."""
+    ok, text, _, _ = repl(ctx, code, **args)
+    return f"SUCCEEDED {text}" if ok else text
+
+
+@scenario
+def repl_adopt(ctx):
+    """browser_repl's tab_id: the REPL drives an agent tab the session already holds (one from browser_open), so
+    choosing the REPL never means choosing a different tab. Ways it can fail, written down before the code:
+    A1. A model holding a tab id from browser_open cannot hand it to the REPL, or the REPL opens a second tab for it:
+        tab_id makes `page` that tab without navigating or reloading it (a field filled before keeps its value), opens
+        no tab, and `page` stays bound to it in later calls.
+    A2. Another MCP session's agent tab is adopted: refused before any of the code runs, saying which tabs it takes;
+        that tab is untouched.
+    A3. The user's own tab, which Second Cursor did not open, is adopted: refused the same way.
+    A4. A personal tab this session claimed with the user's approval is adopted: refused, naming the browser_ tools;
+        the REPL drives only tabs Second Cursor opened (browser_open, or a page one of them opened).
+    A5. A closed or unknown tab id is adopted: refused.
+    A6. Code reaches a tab it was not given: no REPL API takes a raw tab id (new page.constructor(id) opens its own
+        tab), and the server refuses a tab the session's REPL neither opened nor was handed.
+    A7. The adopted tab is driven in the REPL's default browser profile instead of its own: tab_id picks the profile
+        that owns the tab, as the browser_ tools do, and each profile keeps its own REPL context (repl_adopt_profile).
+    A8. The adopted page skips a gate: a paused task refuses the call; after resume the REPL's own read of the tab
+        clears the fresh-observation rule, and nothing else does; a clipboard chord still needs the user's approval and
+        nothing reaches the page; each input is its own action-log line with via=browser_repl, the adopted tab and the
+        session; the call's own line names tab_id and stores the code.
+    A9. The REPL closes a tab it adopted: a memory reset and the session's REPL context being discarded leave it open;
+        only page.close() closes it.
+    A10. Passing the same tab again makes a second Page: it is the same Page, listed once by context.pages().
+    A11. A tab the REPL opened is out of reach of the browser_ tools: a printed page shows its tab id, which
+        browser_snapshot takes in the same session and refuses in another.
+    A12. The model never learns it can: browser_repl's schema takes tab_id, and its description and browser_open's
+        say to pass the id.
+    """
+    if not ctx.call("browser_status").get("connected"):
+        raise Skip("Chrome extension not connected")
+    tools = {t["name"]: t for t in ctx.mcp.rpc("tools/list")["tools"]}
+    ctx.check("A12: browser_repl's schema takes tab_id", "tab_id" in tools["browser_repl"]["inputSchema"]["properties"],
+              sorted(tools["browser_repl"]["inputSchema"]["properties"]))
+    ctx.check("A12: its description says how to drive a tab you hold",
+              "tab_id" in tools["browser_repl"]["description"], tools["browser_repl"]["description"])
+    ctx.check("A12: browser_open's description points its tab id at browser_repl",
+              "browser_repl" in tools["browser_open"]["description"], tools["browser_open"]["description"])
+
+    sid = ctx.call("session", action="create")["session_id"]
+    other = ctx.call("session", action="create")["session_id"]
+    ctx.cleanups.append(lambda: [ctx.mcp.call("session", action="close", session_id=s) for s in (sid, other)])
+    with FixtureServer() as base:
+        tab = ctx.call("browser_open", url=f"{base}/form.html", session_id=sid, observe="none")["tab"]["id"]
+        ctx.call("browser_command", tab_id=tab, session_id=sid, operation="fill", locator={"label": "Name"}, text="Ada")
+        before = agent_tabs(ctx, sid)
+        log_start = log_length()
+        operation_id = f"repl-adopt-{int(time.time())}"
+        text = value(ctx, "[page.url().endsWith('/form.html'), await page.getByLabel('Name').inputValue()]",
+                     session_id=sid, tab_id=tab, operation_id=operation_id)
+        ctx.check("A1: tab_id makes page the tab, unreloaded: the field filled before keeps its value",
+                  text == "[ true, 'Ada' ]", text)
+        ctx.check("A1: and no tab was opened", set(agent_tabs(ctx, sid)) == set(before), (sorted(before), text))
+        text = value(ctx, "await page.getByRole('button', { name: 'Submit' }).click()\n"
+                          "await page.locator('#greeting').textContent()", session_id=sid)
+        ctx.check("A1: page stays bound to the tab in a later call without tab_id", text == "Hello, Ada", text)
+        outline = ctx.call("browser_snapshot", tab_id=tab, session_id=sid, full=True)["outline"]
+        ctx.check("A1: and the click happened in that tab", "Hello, Ada" in outline, outline[:300])
+
+        lines = [line for line in via_repl_lines(log_start) if line["tool"] == "browser_click"]
+        ctx.check("A8: the click through the adopted page is its own line, with the tab and session",
+                  len(lines) == 1 and lines[0].get("target") == f"tab_id={tab}"
+                  and lines[0]["detail"].get("session_id") == sid, lines)
+        calls = [line for line in repl_lines(log_start) if line.get("tool") == "browser_repl"]
+        first = json.loads(calls[0]["detail"]) if calls else {}
+        ctx.check("A8: the call's own line names tab_id and stores its code",
+                  calls and calls[0].get("target") == f"tab_id={tab}" and first.get("operation_id") == operation_id
+                  and (harness.ACTION_LOG.parent / first.get("code_file", "missing")).is_file(), calls[:1])
+
+        globals_text = value(ctx, "globalThis.adopted = page; context.pages().filter((p) => p === page).length",
+                             session_id=sid)
+        text = value(ctx, "[page === adopted, context.pages().filter((p) => p === page).length]",
+                     session_id=sid, tab_id=tab)
+        ctx.check("A10: passing the same tab again keeps the same Page, listed once",
+                  globals_text == "1" and text == "[ true, 1 ]", (globals_text, text))
+
+        foreign = ctx.call("browser_open", url=f"{base}/form.html", session_id=other, observe="none")["tab"]["id"]
+        text = refusal(ctx, "globalThis.ran = true; await page.getByLabel('Name').fill('hijacked')",
+                       session_id=sid, tab_id=foreign)
+        ctx.check("A2: another session's agent tab is refused, saying which tabs browser_repl takes",
+                  "not an agent tab of this session" in text, text)
+        ctx.check("A2: none of the refused code ran", value(ctx, "typeof ran", session_id=sid) == "undefined")
+        outline = ctx.call("browser_snapshot", tab_id=foreign, session_id=other, full=True)["outline"]
+        ctx.check("A2: and the other session's tab is untouched", "hijacked" not in outline
+                  and "Hello, stranger" in outline, outline[:300])
+
+        users = [t for t in ctx.call("browser_command", session_id=sid, operation="user_tabs")["tabs"]
+                 if not t.get("is_agent_tab")]
+        ctx.require("the test browser has a tab Second Cursor did not open", users, users)
+        personal = users[0]["id"]
+        text = refusal(ctx, "await page.title()", session_id=sid, tab_id=personal)
+        ctx.check("A3: the user's own tab is refused", "not an agent tab of this session" in text, text)
+        ctx.call("browser_command", tab_id=personal, session_id=sid, operation="claim")
+        try:
+            text = refusal(ctx, "await page.title()", session_id=sid, tab_id=personal)
+            ctx.check("A4: a personal tab the session claimed with approval is refused, naming the browser_ tools",
+                      "claimed" in text and "browser_" in text, text)
+        finally:
+            ctx.call("browser_command", tab_id=personal, session_id=sid, operation="release")
+
+        gone = ctx.call("browser_open", url=f"{base}/form.html", session_id=sid, observe="none")["tab"]["id"]
+        ctx.call("browser_close", tab_id=gone, session_id=sid)
+        text = refusal(ctx, "await page.title()", session_id=sid, tab_id=gone)
+        ctx.check("A5: a closed tab is refused", "not an agent tab of this session" in text, text)
+        text = refusal(ctx, "await page.title()", session_id=sid, tab_id=987654321)
+        ctx.check("A5: an unknown tab id is refused", "not an agent tab of this session" in text, text)
+
+        text = value(ctx, f"const forged = new page.constructor({foreign})\n"
+                          "const forgedTitle = await forged.title()\nconst forgedURL = forged.url()\n"
+                          "await forged.close();\n[forgedURL, forgedTitle.includes('form')]", session_id=sid)
+        ctx.check("A6: a Page constructed with a tab id opens its own blank tab, not that tab",
+                  text == "[ 'about:blank', false ]", text)
+
+        text = value(ctx, f"const own = await context.newPage()\nawait own.goto('{base}/form.html')\nown",
+                     session_id=sid)
+        match = re.search(r"\(tab (\d+)\)", text)
+        ctx.require("A11: a printed page shows its tab id", match, text)
+        own = int(match.group(1))
+        outline = ctx.call("browser_snapshot", tab_id=own, session_id=sid, full=True)["outline"]
+        ctx.check("A11: browser_snapshot reads the REPL's tab in the same session", "Hello, stranger" in outline,
+                  outline[:200])
+        try:
+            ctx.call("browser_snapshot", tab_id=own, session_id=other)
+            error = None
+        except harness.ToolError as e:
+            error = str(e)
+        ctx.check("A11: and is refused in another session", error and "another session" in error, error)
+        value(ctx, "await own.close()", session_id=sid)
+
+        clip = ctx.call("browser_open", url=f"{base}/clipboard.html", session_id=sid, observe="none")["tab"]["id"]
+        text = refusal(ctx, "await page.locator('#target').click(); await page.keyboard.press('Meta+V')",
+                       session_id=sid, tab_id=clip)
+        ctx.check("A8: a clipboard chord through an adopted page still needs the user's approval",
+                  "operation=clipboard" in text and "no key was sent" in text, text)
+        empty = ctx.call("browser_command", tab_id=clip, session_id=sid, operation="query",
+                         locator={"selector": "#target:placeholder-shown"})["count"]
+        events = ctx.call("browser_command", tab_id=clip, session_id=sid, operation="inspect",
+                          locator={"selector": "#events"})["text"]
+        ctx.check("A8: and nothing reached the page", empty == 1 and events == "none", (empty, events))
+
+        ctx.call("task", action="pause", session_id=sid)
+        try:
+            text = refusal(ctx, "await page.getByLabel('Name').fill('paused')", session_id=sid, tab_id=tab)
+            ctx.check("A8: a paused task refuses the call", "paused" in text, text)
+        finally:
+            ctx.call("task", action="resume", session_id=sid)
+        text = refusal(ctx, "await page.getByLabel('Name').fill('stale')", session_id=sid, tab_id=tab)
+        ctx.check("A8: after resume, input before a fresh read of the tab is refused", "read target" in text, text)
+        text = value(ctx, "await page.snapshot(); await page.getByLabel('Name').fill('fresh')\n"
+                          "await page.getByLabel('Name').inputValue()", session_id=sid, tab_id=tab)
+        ctx.check("A8: and the REPL's own read of the adopted tab clears it", text == "fresh", text)
+
+        ok, text, _, _ = repl(ctx, "const hog = []\nfor (;;) hog.push(new Float64Array(1e6).fill(1))",
+                              session_id=sid, tab_id=tab)
+        ctx.check("A9: a memory reset ends the call", not ok and "memory grew" in text, text)
+        ctx.check("A9: and leaves the adopted tab open", tab in agent_tabs(ctx, sid), sorted(agent_tabs(ctx, sid)))
+        value(ctx, "'re-adopted'", session_id=sid, tab_id=tab)
+        crowd = [ctx.call("session", action="create")["session_id"] for _ in range(8)]
+        ctx.cleanups.append(lambda: [ctx.mcp.call("session", action="close", session_id=s) for s in crowd])
+        for s in crowd:
+            value(ctx, "1", session_id=s)
+        text = value(ctx, "page.url()", session_id=sid)
+        ctx.check("A9: the session's REPL context was discarded",
+                  "[system] The REPL was reset because more than 8" in text, text)
+        ctx.check("A9: and the adopted tab is still open", tab in agent_tabs(ctx, sid), sorted(agent_tabs(ctx, sid)))
+        text = value(ctx, "await page.close(); page.isClosed()", session_id=sid, tab_id=tab)
+        ctx.check("A9: page.close() on the adopted page closes the tab",
+                  text == "true" and tab not in agent_tabs(ctx, sid), text)
+
+
+@scenario
+def repl_adopt_profile(ctx):
+    """Failure mode A7 of repl_adopt, with two browser profiles connected to one disposable instance: tab_id drives
+    the tab in the profile that owns it, not in the default, and a profile that does not own it refuses it."""
+    with TestInstance({"toolSurface": "full"}, browser=True) as inst, FixtureServer() as base:
+        second = harness.load_start_browser().launch(sc_home=inst.home, app=inst.app)
+        ctx.cleanups.append(second.stop)
+        deadline = time.time() + 45
+        while len(inst.mcp.call("browser_instances")[0].get("browsers", [])) < 2 and time.time() < deadline:
+            time.sleep(0.5)
+        ids = [b["id"] for b in inst.mcp.call("browser_instances")[0].get("browsers", [])]
+        ctx.require("two browser profiles are connected", len(ids) == 2, ids)
+        home, away = ids
+
+        def call(tool, **args):
+            return inst.mcp.call(tool, **args)[0]
+
+        def run(code, **args):
+            result = inst.mcp.rpc("tools/call", {"name": "browser_repl", "arguments": {"code": code, **args}})
+            text = result["content"][0]["text"] if result.get("content") else ""
+            return f"ERROR {text}" if result.get("isError") else text
+
+        near = call("browser_open", url=f"{base}/repl.html", browser_id=home, observe="none")["tab"]["id"]
+        far = near
+        while far == near:
+            far = call("browser_open", url=f"{base}/form.html", browser_id=away, observe="none")["tab"]["id"]
+        start = len(inst.action_log.read_text().splitlines()) if inst.action_log.exists() else 0
+        ctx.check("the default profile's REPL context keeps its own variables",
+                  run("const where = 'home'; where", browser_id=home) == "home")
+        text = run("[await page.title(), typeof where]", tab_id=far)
+        ctx.check("A7: tab_id without browser_id drives the tab in the profile that owns it, in that profile's context",
+                  text == "[ 'Second Cursor fixture — form', 'undefined' ]", text)
+        lines = [json.loads(line) for line in inst.action_log.read_text().splitlines()[start:]]
+        call_line = next((line for line in lines if line.get("tool") == "browser_repl"
+                          and line.get("target") == f"tab_id={far}"), {})
+        ctx.check("A7: the call is logged against the owning profile",
+                  json.loads(call_line.get("detail") or "{}").get("browser_id") == away, call_line)
+        text = run("await page.title()", tab_id=far, browser_id=home)
+        ctx.check("A7: a profile that does not own the tab refuses it", "not an agent tab of this session" in text, text)
+
+
 @scenario
 def repl_surface(ctx):
     """Failure mode 21: toolSurface "repl" lists only browser_repl; every tool stays callable. The default surface

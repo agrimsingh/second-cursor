@@ -34,7 +34,7 @@ extension ToolRouter {
         case "browser_repl":
             return try await repl.run(
                 code: args.string("code"), session: Execution.context.sessionID,
-                deadline: Execution.context.deadline ?? Date().addingTimeInterval(60))
+                deadline: Execution.context.deadline ?? Date().addingTimeInterval(60), tabID: args.optionalInt("tab_id"))
         case "browser_instances":
             return ToolOutput(json: (try? JSONSerialization.jsonObject(with: await browser.instances())) as? [String:Any] ?? [:])
         case "browser_command":
