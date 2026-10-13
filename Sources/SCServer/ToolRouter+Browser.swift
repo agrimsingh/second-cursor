@@ -30,6 +30,12 @@ extension ToolRouter {
             }
             await showCaption(args)
         }
+        // A script acts on any of its tabs, and other input may land without the session being shown its effect.
+        if name == "browser_repl" {
+            sessions.forgetBrowserReads(session: Execution.context.sessionID)
+        } else if Self.mutates(name, args), let tab = try args.optionalInt("tab_id") {
+            sessions.noteBrowserRead(nil, tab: Self.tabKey(tab), session: Execution.context.sessionID)
+        }
         switch name {
         case "browser_repl":
             return try await repl.run(
@@ -71,27 +77,26 @@ extension ToolRouter {
             if var observation = json["observation"] as? [String: Any], let tab = (json["tab"] as? [String: Any])?["id"] as? Int {
                 condense(&observation, tabID: tab)
                 json["observation"] = observation
+                noteActed(observation, tabID: tab, action: name)
             }
             return ToolOutput(json: json)
 
         case "browser_navigate":
             let tab = try await browser.navigate(tabID: try args.int("tab_id"), url: try args.string("url"))
-            return await observed([:], base: ["tab": Shape.tab(tab)], tabID: try args.int("tab_id"), mode: mode)
+            return await observed([:], base: ["tab": Shape.tab(tab)], tabID: try args.int("tab_id"), mode: mode, action: name)
 
         case "browser_snapshot":
-            if let expanded = try expandedParts(args, target: "tab:\(try args.int("tab_id"))", noun: "tab") {
+            let tab = try args.int("tab_id")
+            if let expanded = try expandedParts(args, target: "tab:\(tab)", noun: "tab") {
                 return ToolOutput(json: ["outline": expanded.text, "expanded": expanded.ids, "is_diff": false])
             }
+            let full = try args.bool("full", default: false), structured = try args.bool("structured", default: false)
             let params = try JSONSerialization.data(withJSONObject: [
-                "tabId": args.int("tab_id"), "full": args.bool("full", default: false),
-                "structured": args.bool("structured", default: false),
+                "tabId": tab, "full": full, "structured": structured, "report_unchanged": true,
             ])
             var json = try JSONSerialization.jsonObject(with: await browser.command("tab.snapshot",params:params)) as? [String:Any] ?? [:]
-            condense(&json, tabID: try args.int("tab_id"))
-            if json["is_diff"] as? Bool == true, json["outline"] as? String == "(no changes)" {
-                json["hint"] = "Unchanged since your last read or action of this tab, and actions return this diff "
-                    + "themselves: read again only after waiting, or give the action expect to wait for its change."
-            }
+            condense(&json, tabID: tab)
+            noteRead(&json, tabID: tab, shorten: full && !structured)
             var images: [Screenshot] = []
             if try args.bool("include_screenshot",default:false) {
                 let shot = try await browser.screenshot(tabID:args.int("tab_id")); images=[shot]; json["screenshot"]=Shape.screenshot(shot)
@@ -108,7 +113,7 @@ extension ToolRouter {
             } else {
                 throw SCError.invalidArgument("Pass ref, or both x and y")
             }
-            return await observed(try await acted("tab.click", params, mode, expectation: expectation), tabID: try args.int("tab_id"), mode: mode)
+            return await observed(try await acted("tab.click", params, mode, expectation: expectation), tabID: try args.int("tab_id"), mode: mode, action: name)
 
         case "browser_type":
             var params: [String: Any] = [
@@ -116,20 +121,20 @@ extension ToolRouter {
                 "submit": try args.bool("submit", default: false),
             ]
             params["ref"] = try args.optionalString("ref")
-            return await observed(try await acted("tab.type", params, mode, expectation: expectation), tabID: try args.int("tab_id"), mode: mode)
+            return await observed(try await acted("tab.type", params, mode, expectation: expectation), tabID: try args.int("tab_id"), mode: mode, action: name)
 
         case "browser_press_key":
             let reply = try await acted(
                 "tab.pressKey", ["tabId": try args.int("tab_id"), "keys": try args.string("keys")], mode,
                 expectation: expectation)
-            return await observed(reply, tabID: try args.int("tab_id"), mode: mode)
+            return await observed(reply, tabID: try args.int("tab_id"), mode: mode, action: name)
 
         case "browser_scroll":
             let reply = try await acted("tab.scroll", [
                 "tabId": try args.int("tab_id"), "direction": try args.direction().rawValue,
                 "amount": max(try args.int("amount", default: 3), 1),
             ], mode, expectation: expectation)
-            return await observed(reply, tabID: try args.int("tab_id"), mode: mode)
+            return await observed(reply, tabID: try args.int("tab_id"), mode: mode, action: name)
 
         case "browser_screenshot":
             let shot = try await browser.screenshot(tabID: try args.int("tab_id"))
@@ -192,6 +197,7 @@ extension ToolRouter {
     /// pause gate and gets its own action log line, like a native batch's.
     func runTabBatch(_ args: Arguments) async throws -> ToolOutput {
         let tabID = try args.int("tab_id")
+        sessions.noteBrowserRead(nil, tab: Self.tabKey(tabID), session: Execution.context.sessionID)
         guard args.raw["window_id"]?.isNull ?? true else {
             throw SCError.invalidArgument("Pass tab_id or window_id, not both: a batch acts in one tab or one window")
         }
@@ -288,7 +294,7 @@ extension ToolRouter {
         }
         events += reply["events"] as? [Any] ?? []
         if !events.isEmpty { reply["events"] = events }
-        return await observed(reply, base: base, tabID: tabID, mode: mode, full: full)
+        return await observed(reply, base: base, tabID: tabID, mode: mode, full: full, action: "batch")
     }
 
     private static func tabStep(_ raw: [String: Value], index: Int, tabID: Int) throws -> TabStep {
@@ -428,7 +434,16 @@ extension ToolRouter {
     /// keeps the tree. An extension that did not read in the action's message (one from before observe, or an action a
     /// dialog interrupted) is asked for the read separately.
     private func observed(
-        _ reply: [String: Any], base: [String: Any] = Shape.ok, tabID: Int, mode: String, full: Bool = false
+        _ reply: [String: Any], base: [String: Any] = Shape.ok, tabID: Int, mode: String, full: Bool = false,
+        action: String
+    ) async -> ToolOutput {
+        let output = await readAfter(reply, base: base, tabID: tabID, mode: mode, full: full)
+        noteActed(output.json["observation"] as? [String: Any], tabID: tabID, action: action)
+        return output
+    }
+
+    private func readAfter(
+        _ reply: [String: Any], base: [String: Any], tabID: Int, mode: String, full: Bool
     ) async -> ToolOutput {
         var json = base
         if let events = reply["events"] { json["events"] = events }
@@ -475,6 +490,64 @@ extension ToolRouter {
             json["observation_error"] = Self.message(for: error)
             return ToolOutput(json: json)
         }
+    }
+
+    static func tabKey(_ tabID: Int) -> String { "\(Execution.context.browserID ?? ""):\(tabID)" }
+
+    /// Records the observation an action's (or browser_open's) result carried. An unchanged diff of the snapshot the
+    /// session held leaves the whole outline it got still current; any other diff leaves it holding only diffs.
+    private func noteActed(_ observation: [String: Any]?, tabID: Int, action: String) {
+        let key = Self.tabKey(tabID), session = Execution.context.sessionID
+        guard let observation, let id = observation["snapshot_id"] as? String else {
+            sessions.noteBrowserRead(nil, tab: key, session: session)
+            return
+        }
+        let last = sessions.browserRead(tab: key, session: session)
+        let wholeAt: Date? = observation["is_diff"] as? Bool != true ? Date()
+            : observation["outline"] as? String == "(no changes)" && observation["diff_base"] as? String == last?.snapshotID
+                ? last?.wholeAt : nil
+        sessions.noteBrowserRead(.init(snapshotID: id, wholeAt: wholeAt, action: action), tab: key, session: session)
+    }
+
+    /// A read of a page unchanged since the observation the session last received of it, with no input since, says so
+    /// and names the one call that waits for a change. From the third such read in a row, a full=true read of a whole
+    /// outline the session got in the last 30 s answers "(no changes)" against it rather than resending it: each poll
+    /// cost the client the page again, while a script that reads twice to parse, or a client that dropped the outline
+    /// from its context long ago, still gets it whole.
+    private func noteRead(_ json: inout [String: Any], tabID: Int, shorten: Bool) {
+        let key = Self.tabKey(tabID), session = Execution.context.sessionID
+        let last = sessions.browserRead(tab: key, session: session)
+        let unchanged = json.removeValue(forKey: "unchanged_since") as? String
+        let diff = json["is_diff"] as? Bool == true
+        var wholeAt: Date? = diff ? nil : Date()
+        var repeats = 0
+        if let last, unchanged != nil, unchanged == last.snapshotID {
+            repeats = last.repeats + 1
+            if shorten, !diff, last.repeats >= 2, let at = last.wholeAt, Date().timeIntervalSince(at) < 30 {
+                json["outline"] = "(no changes)"
+                json["is_diff"] = true
+                json["diff_base"] = last.snapshotID
+                wholeAt = at
+            } else if diff {
+                wholeAt = last.wholeAt
+            }
+            json["hint"] = Self.unchangedHint(last, tabID: tabID)
+        } else if diff, json["outline"] as? String == "(no changes)" {
+            json["hint"] = "Unchanged since your last read or action of this tab, and actions return this diff "
+                + "themselves: read again only after waiting, or give the action expect to wait for its change."
+        }
+        if let id = json["snapshot_id"] as? String {
+            sessions.noteBrowserRead(.init(snapshotID: id, wholeAt: wholeAt, action: nil, repeats: repeats), tab: key, session: session)
+        }
+    }
+
+    private static func unchangedHint(_ last: Sessions.BrowserRead, tabID: Int) -> String {
+        let wait = "Wait in one call instead of reading again: browser_command operation=wait, tab_id=\(tabID), "
+            + "arguments={\"locator\":{\"text\":\"<expected text>\",\"exact\":false},\"state\":\"attached\"} returns once "
+            + "that text shows (up to 10 s)."
+        guard let action = last.action else { return "Unchanged since your read \(last.snapshotID), with no action since. \(wait)" }
+        return "Unchanged since the \(action) result's observation \(last.snapshotID), and actions return this diff "
+            + "themselves, so no read is needed right after one. \(wait)"
     }
 
     /// Only reads are condensed: an action's observation shows what the action revealed, which can sit in a part the

@@ -157,7 +157,7 @@ const handlers = {
   },
 };
 
-async function tabSnapshot({ tabId, session_id, full, structured }, settle = true, guard = async () => {}) {
+async function tabSnapshot({ tabId, session_id, full, structured, report_unchanged }, settle = true, guard = async () => {}) {
     await guard();
     await requireAgentTab(tabId);
     // The page runs no script, and so cannot be read, until its dialog is answered.
@@ -207,6 +207,7 @@ async function tabSnapshot({ tabId, session_id, full, structured }, settle = tru
         status: current ? "current" : "changed_during_capture" },
       is_diff,
       diff_base: is_diff ? previous.id : null,
+      ...(report_unchanged && previous?.outline === snapshot.outline ? { unchanged_since: previous.id } : {}),
     };
 }
 
