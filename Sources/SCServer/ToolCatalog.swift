@@ -367,7 +367,7 @@ enum ToolCatalog {
             Tool(
                 name: "browser_snapshot",
                 description:
-                    "Read an agent tab as a compact accessibility outline; interactive nodes carry [ref] markers for browser_click and browser_type. Waits briefly for content the page is still rendering. Your first read of a tab (browser_open counts) returns the whole outline; later reads return only what changed since your previous read or action (is_diff=true): lines starting with + are new or changed, lines starting with - are gone, and \"(no changes)\" means the page is the same. A large change returns the whole outline again. browser_open and the browser actions already return the outline or this diff, so do not call this right after them; call it for the whole outline (full=true) or after waiting for the page.",
+                    "Read an agent tab as a compact accessibility outline; interactive nodes carry [ref] markers for browser_click and browser_type. Waits briefly for content the page is still rendering. Your first read of a tab (browser_open counts) returns the whole outline; later reads return only what changed since your previous read or action (is_diff=true): lines starting with + are new or changed, lines starting with - are gone, and \"(no changes)\" means the page is the same. A large change returns the whole outline again. browser_open and the browser actions already return the outline or this diff, so do not call this right after them; call it for the whole outline (full=true) or after browser_command operation=wait.",
                 inputSchema: schema(
                     [
                         "tab_id": tabID,
@@ -479,7 +479,7 @@ enum ToolCatalog {
                 if expectingBrowserTools.contains(tool.name) { props["expect"] = browserExpect }
                 if tool.name == "browser_snapshot" {
                     props["full"] = boolean(
-                        "Return the whole outline instead of a diff from your previous read of this tab.", default: false)
+                        "Return the whole outline instead of a diff; a third unchanged read in a row answers (no changes).", default: false)
                 }
                 if !["status", "list_apps", "list_windows", "browser_instances", "browser_status"].contains(tool.name) {
                     props["session_id"] = string("Explicit session; omit for compatibility clients.")

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Late fare search</title>
+</head>
+<body>
+  <h1>Flights</h1>
+  <label>From <input id="from" value="SFO"></label>
+  <label>To <input id="to" value="JFK"></label>
+  <button id="search" type="button">Search</button>
+  <p id="status">Enter a route and search</p>
+  <ul id="results"></ul>
+  <fieldset id="filters"><legend>Airlines</legend></fieldset>
+  <nav id="footer" aria-label="More"></nav>
+  <script>
+    // A page the size of a real fare search, so a small change reads as a diff and a whole read costs something.
+    for (const airline of ["United", "Alaska", "Delta", "JetBlue", "American", "Southwest", "Spirit", "Frontier",
+                           "Hawaiian", "Sun Country", "Air Canada", "WestJet", "Lufthansa", "British Airways",
+                           "Air France", "KLM", "Emirates", "Qatar", "Singapore", "Cathay Pacific"]) {
+      const label = document.createElement("label");
+      label.append(Object.assign(document.createElement("input"), { type: "checkbox", checked: true }), ` ${airline}`);
+      document.getElementById("filters").append(label, document.createElement("br"));
+    }
+    for (const link of ["Trips", "Expenses", "Travel policy", "Loyalty programs", "Saved travelers", "Help center",
+                        "Privacy", "Terms", "Accessibility", "Contact support"])
+      document.getElementById("footer").append(Object.assign(document.createElement("a"), { href: "#", textContent: link }), " ");
+  </script>
+  <script>
+    // Fares render from a timer, which an action's settling does not wait for without a spinner, so the click
+    // returns while the page says Searching, like a fare search that takes many seconds. ?after_ms= sets how late.
+    const after = Number(new URLSearchParams(location.search).get("after_ms") ?? 6000);
+    const status = document.getElementById("status");
+    const results = document.getElementById("results");
+    let searches = 0;
+    document.getElementById("search").addEventListener("click", () => {
+      const search = ++searches;
+      status.textContent = "Searching for flights";
+      results.replaceChildren();
+      setTimeout(() => {
+        status.textContent = `3 flights found (search ${search})`;
+        for (const fare of ["$212 United", "$238 Alaska", "$254 Delta"])
+          results.append(Object.assign(document.createElement("li"), { textContent: `${fare} (search ${search})` }));
+      }, after);
+    });
+  </script>
+</body>
+</html>

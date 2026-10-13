@@ -214,7 +214,9 @@ export async function requireAgentTab(tabId, session = null) {
   if (!(await agentTabSet()).has(tabId)) {
     throw new BridgeError(
       "not_allowed",
-      `Tab ${tabId} is not a Second Cursor tab; only tabs opened with browser_open, or opened by such a tab, can be driven`,
+      `Tab ${tabId} is not a Second Cursor tab, or no longer is (a closed tab, or one from before the extension reloaded): `
+        + "to work on its page, open it again with browser_open, one call that returns the page. Only tabs opened with "
+        + "browser_open, or opened by such a tab, can be driven",
     );
   }
   const owner = (await ownership())[tabId];
@@ -234,7 +236,7 @@ export async function requireAgentTab(tabId, session = null) {
     return await chrome.tabs.get(tabId);
   } catch {
     await updateAgentTabs((set) => set.delete(tabId));
-    throw new BridgeError("invalid_argument", `Tab ${tabId} no longer exists`);
+    throw new BridgeError("invalid_argument", `Tab ${tabId} no longer exists; open its page again with browser_open`);
   }
 }
 

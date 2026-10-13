@@ -58,6 +58,16 @@ final class Sessions: @unchecked Sendable {
         var at = Date()
     }
 
+    /// The latest observation of an agent tab a session received: its snapshot, when the session last got that page's
+    /// whole outline (nil when it holds only diffs of it), the tool whose result carried it if an action's did, and how
+    /// many reads in a row before it found the page unchanged.
+    struct BrowserRead {
+        let snapshotID: String
+        let wholeAt: Date?
+        let action: String?
+        var repeats = 0
+    }
+
     private let lock = NSLock()
     private let claimIdleSeconds: TimeInterval
     private let retentionSeconds: TimeInterval
@@ -68,6 +78,7 @@ final class Sessions: @unchecked Sendable {
     private var nativeInFlight: Set<UUID> = []
     private var displayMutation: DisplayMutationLease?
     private var observed: [String: [UInt32: ObservedWindow]] = [:]
+    private var browserReads: [String: [String: BrowserRead]] = [:]
     private var operations: [String: Operation] = [:]
     // FIFO queues make expiry and payload eviction amortized O(1), without sorting history.
     private var completed: [(id: String, generation: UUID, expires: Date)] = []
@@ -253,7 +264,29 @@ final class Sessions: @unchecked Sendable {
     }
 
     func forgetObservations(session: String) {
-        locked { observed[session] = nil }
+        locked {
+            observed[session] = nil
+            browserReads[session] = nil
+        }
+    }
+
+    func browserRead(tab: String, session: String) -> BrowserRead? {
+        locked { browserReads[session]?[tab] }
+    }
+
+    /// nil forgets the tab's, after input whose effect the session has not been shown.
+    func noteBrowserRead(_ read: BrowserRead?, tab: String, session: String) {
+        locked {
+            var reads = browserReads[session] ?? [:]
+            reads[tab] = read
+            // The cap bounds sessions that never end a turn; a forgotten tab only loses its short answers.
+            if reads.count > 64, let any = reads.keys.first(where: { $0 != tab }) { reads[any] = nil }
+            browserReads[session] = reads
+        }
+    }
+
+    func forgetBrowserReads(session: String) {
+        locked { browserReads[session] = nil }
     }
 
     func close(_ id: String) throws {
@@ -266,6 +299,7 @@ final class Sessions: @unchecked Sendable {
             }
             if id != "legacy" { live.remove(id) }
             observed[id] = nil
+            browserReads[id] = nil
             // Already dispatched app IPC cannot be recalled. Keep its claim until finish so another
             // session cannot type into the same window while the closing session's input is still landing.
             owners = owners.filter { $0.value.session != id || $0.value.inFlight > 0 }

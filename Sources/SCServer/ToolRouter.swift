@@ -127,6 +127,7 @@ final class ToolRouter: Sendable {
                 return Self.success(ToolOutput(json: try sessions.info(id, session: session)))
             }
             var admitted = false
+            var started = false
             let gatesStarted = DispatchTime.now().uptimeNanoseconds
             do {
                 let resolveStarted = DispatchTime.now().uptimeNanoseconds
@@ -167,6 +168,10 @@ final class ToolRouter: Sendable {
                 let taskTarget = Self.targetKey(name, args)
                 let observationID = try args.optionalString("observation_id")
                 let browserID = try args.optionalString("browser_id")
+                let resumedTask = name == "browser_open" ? try await resumeInterruptedTask(session: session) : nil
+                // The new tab's own read counts under the resumed generation, so it takes input without another read.
+                let observedGeneration = resumedTask == nil
+                    ? readGeneration : TaskRegistry.shared.snapshot(session: session)?.controlGeneration
                 let mutation = mutating ? try TaskRegistry.shared.beginMutation(session: session, targetKey: taskTarget) : nil
                 let context = ExecutionContext(
                     sessionID: session, observationID: observationID,
@@ -176,6 +181,7 @@ final class ToolRouter: Sendable {
                     if let mutation { try TaskRegistry.shared.checkMutation(mutation, targetKey: taskTarget) }
                     if name != "status" { try sessions.dispatch(operation, target: target) }
                 }
+                started = true
                 let output = try await Self.withTimeout(seconds: max(0.001, deadline.timeIntervalSinceNow), tool: name)
                 {
                     do {
@@ -192,8 +198,9 @@ final class ToolRouter: Sendable {
                         }
                         Self.annotateOutcome(&result, mutating: mutating)
                         if suppliedID != nil || mutating { result.json["operation_id"] = id }
+                        if let resumedTask { result.json["resumed_task"] = resumedTask }
                         self.noteObservation(name, args, owner: owner, output: result, session: session)
-                        self.noteTaskObservation(name, args, result: result, session: session, generation: readGeneration)
+                        self.noteTaskObservation(name, args, result: result, session: session, generation: observedGeneration)
                         self.sessions.finish(operation, result: result, error: nil)
                         if let mutation { TaskRegistry.shared.finishMutation(mutation, verifiedSummary: Self.verifiedSummary(result, tool: name)) }
                         return result
@@ -220,8 +227,8 @@ final class ToolRouter: Sendable {
                     log.record(
                         ActionLogEntry(tool: name, target: args.logTarget, detail: "refused: \(Self.message(for: error))"))
                 }
-                var refusedBeforeDispatch = false
-                if case SCError.invalidArgument = error { refusedBeforeDispatch = operation.state != "dispatched" }
+                var refusedBeforeDispatch = !started
+                if case SCError.invalidArgument = error { refusedBeforeDispatch = refusedBeforeDispatch || operation.state != "dispatched" }
                 return Self.failure(error, operationID: mutating && !refusedBeforeDispatch ? id : nil)
             }
         } catch {
