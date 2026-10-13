@@ -1,4 +1,4 @@
-import { attach, cdp, networkIdle, ensureActionNetwork, actionNetworkState, noteBackgroundRequests, trackRequests } from "./cdp.js";
+import { attach, cdp, networkIdle, ensureActionNetwork, actionNetworkState, noteBackgroundRequests, requireResponsive, trackRequests } from "./cdp.js";
 import { removeCursor, show } from "./cursor.js";
 import { BridgeError, sleep } from "./errors.js";
 import { add as addTiming, timed } from "./timing.js";
@@ -321,6 +321,24 @@ export async function settleAround(
   }
 }
 
+/** settleAround for a load, failing as soon as the attached tab's renderer stops answering: that load never ends. */
+async function settleLoad(tabId, action, options) {
+  const load = settleAround(tabId, action, options);
+  let loading = true;
+  const watch = (async () => {
+    while (loading) {
+      await requireResponsive(tabId);
+      await sleep(500);
+    }
+  })();
+  watch.catch(() => {});
+  try {
+    return await Promise.race([load, watch.then(() => load)]);
+  } finally {
+    loading = false;
+  }
+}
+
 // Evaluated in its own isolated world, so the page never sees the observer. Its times are milliseconds ago (null when
 // unknown): when the agent acted, when a read first settled that action, and [from, until] windows the agent was idle.
 const SETTLE_WORLD = "SecondCursorSettle";
@@ -557,9 +575,7 @@ export async function listTabs(session = null) {
   return tabs;
 }
 
-export async function openTab(rawUrl, session = "legacy") {
-  await requireSessionInput(session);
-  const url = normalizeUrl(rawUrl);
+async function createTab(url, session) {
   const windowId = await targetWindowId();
   await requireSessionInput(session);
   const tab =
@@ -571,8 +587,32 @@ export async function openTab(rawUrl, session = "legacy") {
   await saveOwnership();
   await chrome.tabs.update(tab.id, { autoDiscardable: false }).catch(() => {});
   await timed(tab.id, "group", () => addToGroup(tab));
-  await timed(tab.id, "load", () => settleAround(tab.id, async () => {}, { quietMs: 0, timeoutMs: 20000 }));
-  await attach(tab.id);
+  return tab;
+}
+
+export async function openTab(rawUrl, session = "legacy") {
+  await requireSessionInput(session);
+  const url = normalizeUrl(rawUrl);
+  let tab;
+  for (let attempt = 0; !tab; attempt++) {
+    const began = Date.now();
+    const created = await createTab(url, session);
+    try {
+      await attach(created.id);
+      await timed(created.id, "load", () => settleLoad(created.id, async () => {}, { quietMs: 0, timeoutMs: 20000 }));
+      tab = created;
+    } catch (error) {
+      // Chrome gives the first new tab of a site a renderer stuck in a page script (see cdp.js), once: the tab never
+      // commits, and a new tab gets a new renderer. A page that committed and then hung would only hang again.
+      const committed = (await chrome.tabs.get(created.id).catch(() => null))?.url;
+      if (!error.unresponsive || committed) throw error;
+      closing.add(created.id);
+      await chrome.tabs.remove(created.id).catch(() => {});
+      await updateAgentTabs((set) => set.delete(created.id));
+      addTiming(created.id, "unresponsive_tab_replaced", Date.now() - began);
+      if (attempt) throw error;
+    }
+  }
   show(tab.id, session);
   noteAction(tab.id, Date.now(), true);
   await settled(tab.id, { quietMs: 500, timeoutMs: 6000, reactMs: 1500 });
@@ -584,7 +624,7 @@ export async function navigateTab(tabId, rawUrl) {
   const url = normalizeUrl(rawUrl);
   await noteInput(tabId);
   const at = Date.now();
-  await settleAround(tabId, async () => {
+  await settleLoad(tabId, async () => {
     await requireAgentInput(tabId);
     return chrome.tabs.update(tabId, { url });
   }, {

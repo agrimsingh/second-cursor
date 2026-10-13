@@ -12,7 +12,7 @@ function fixture() {
   const event = name => ({ addListener(listener) { listeners[name] = listener; } });
   class BridgeError extends Error { constructor(code, message) { super(message); this.code = code; } }
   const context = vm.createContext({
-    BridgeError,
+    BridgeError, setTimeout, clearTimeout,
     requireAgentInput: async () => { await state.inputGuard?.(); },
     requireAgentTab: async () => {},
     chrome: {
