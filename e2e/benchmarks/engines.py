@@ -623,6 +623,10 @@ class ScopedEngine:
         self.owned_tabs.add(tid)
         self.context["browser"] = {"tab_id": tid, "url": self.url,
                                    "pid": self.targets["browser_pid"], "window_id": self.targets["browser_window_id"]}
+        if self.surface == "repl":
+            # browser_repl's page cannot adopt tab_id; without this its own tab reads as a target outside the task.
+            self.context["browser"]["browser_repl_tab"] = ("browser_repl's page opens its own agent tab in this browser; "
+                                                           "that tab is also permitted on the fixture URL's origin, and the harness closes it.")
         self.identity["harness_browser"]["tab_binding"] = "single_initial_blank_tab_claim"
         self.initial_observations.append(claimed)
 
